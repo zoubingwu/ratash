@@ -2,8 +2,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::panic::{self, AssertUnwindSafe, PanicHookInfo};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -635,6 +635,7 @@ pub struct BackgroundCommandDispatcher {
     cancellations: Arc<Mutex<CancellationRegistry>>,
     stopping: Arc<AtomicBool>,
     wake: Arc<Mutex<Option<RuntimeWaker>>>,
+    worker_wait_returns: Arc<AtomicU64>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -711,6 +712,7 @@ impl BackgroundCommandDispatcher {
         let cancellations = Arc::new(Mutex::new(CancellationRegistry::new()));
         let stopping = Arc::new(AtomicBool::new(false));
         let wake = Arc::new(Mutex::new(None));
+        let worker_wait_returns = Arc::new(AtomicU64::new(0));
         let mut workers: Vec<JoinHandle<()>> = Vec::with_capacity(worker_count);
         for index in 0..worker_count {
             let receiver = Arc::clone(&work_receiver);
@@ -718,6 +720,7 @@ impl BackgroundCommandDispatcher {
             let cancellations = Arc::clone(&cancellations);
             let worker_stopping = Arc::clone(&stopping);
             let worker_wake = Arc::clone(&wake);
+            let worker_wait_returns = Arc::clone(&worker_wait_returns);
             let worker_sources = sources.clone();
             let worker = thread::Builder::new()
                 .name(format!("hopash-tui-command-{index}"))
@@ -728,11 +731,15 @@ impl BackgroundCommandDispatcher {
                         &cancellations,
                         &worker_stopping,
                         &worker_wake,
+                        &worker_wait_returns,
                         &worker_sources,
                     );
                 })
                 .map_err(|_| {
                     stopping.store(true, Ordering::Release);
+                    for _ in 0..workers.len() {
+                        let _ = sender.try_send(WorkerMessage::Stop);
+                    }
                     for worker in workers.drain(..) {
                         let _ = worker.join();
                     }
@@ -749,8 +756,15 @@ impl BackgroundCommandDispatcher {
             cancellations,
             stopping,
             wake,
+            worker_wait_returns,
             workers,
         })
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn worker_wait_return_count(&self) -> u64 {
+        self.worker_wait_returns.load(Ordering::Acquire)
     }
 }
 
@@ -842,17 +856,18 @@ fn command_worker(
     cancellations: &Arc<Mutex<CancellationRegistry>>,
     stopping: &AtomicBool,
     wake: &Arc<Mutex<Option<RuntimeWaker>>>,
+    worker_wait_returns: &AtomicU64,
     sources: &StatusInterfaceSources,
 ) {
     while !stopping.load(Ordering::Acquire) {
         let message = match receiver.lock() {
-            Ok(receiver) => receiver.recv_timeout(Duration::from_millis(25)),
+            Ok(receiver) => receiver.recv(),
             Err(_) => return,
         };
+        worker_wait_returns.fetch_add(1, Ordering::Relaxed);
         let work = match message {
             Ok(WorkerMessage::Run(work)) => work,
-            Ok(WorkerMessage::Stop) | Err(RecvTimeoutError::Disconnected) => return,
-            Err(RecvTimeoutError::Timeout) => continue,
+            Ok(WorkerMessage::Stop) | Err(_) => return,
         };
         if work.cancellation.is_cancelled() {
             remove_cancellation(cancellations, work.task_id, work.request_id);

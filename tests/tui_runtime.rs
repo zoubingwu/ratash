@@ -732,6 +732,40 @@ fn successful_mutation_dispatches_a_refreshed_full_snapshot() {
 }
 
 #[test]
+fn idle_background_command_workers_block_until_work_or_shutdown() {
+    let sources = StatusInterfaceSources {
+        snapshots: Arc::new(FakeSnapshots::successful(snapshot(0))),
+        events: Arc::new(FakeEvents::default()),
+        commands: Arc::new(ImmediateCommands),
+    };
+    let mut dispatcher =
+        BackgroundCommandDispatcher::new(sources).expect("fixture command workers should start");
+    let waker = RuntimeWaker::default();
+    dispatcher.install_waker(waker.clone());
+    let checkpoint = waker.checkpoint();
+
+    dispatcher
+        .submit(Command::FetchProxyGroup {
+            request_id: RequestId(94),
+            connection_generation: 6,
+            group: "Automatic".to_owned(),
+        })
+        .expect("fixture work should enter the bounded queue");
+    waker.wait(checkpoint, Some(Duration::from_secs(1)));
+    dispatcher
+        .try_next()
+        .expect("result queue should remain open")
+        .expect("fixture work should complete");
+    let completed_waits = dispatcher.worker_wait_return_count();
+    assert!(completed_waits >= 1);
+
+    thread::sleep(Duration::from_millis(100));
+
+    assert_eq!(dispatcher.worker_wait_return_count(), completed_waits);
+    dispatcher.shutdown();
+}
+
+#[test]
 fn background_dispatcher_loads_one_proxy_group_without_a_full_snapshot() {
     let order = Arc::new(Mutex::new(Vec::new()));
     let mut view = snapshot(0);
