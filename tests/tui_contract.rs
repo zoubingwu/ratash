@@ -48,6 +48,71 @@ fn all_four_pages_render_their_primary_content() {
 }
 
 #[test]
+fn proxy_rows_without_stable_node_ids_are_visible_and_read_only() {
+    let mut state = connected_state();
+    state.page = Page::Proxies;
+    state.proxies.rows = vec![ProxyRow {
+        group: "Automatic".to_owned(),
+        node_id: None,
+        name: "Missing member".to_owned(),
+        node_type: "missing".to_owned(),
+        available: false,
+        selected: false,
+        delay_ms: None,
+        sampled_at_unix_ms: None,
+    }];
+    state.proxies.selected = 0;
+
+    let (text, map) = render_with_backend(&state, 100, 30);
+    state.publish_interaction_map(map);
+
+    assert!(text.contains("Missing member"));
+    assert!(text.contains("unavailable"));
+    assert_eq!(
+        input_to_intent(&state, TerminalInput::Key(KeyInput::Enter)),
+        None
+    );
+    assert!(
+        state
+            .interaction_map()
+            .expect("rendered state should publish interactions")
+            .interactions
+            .iter()
+            .all(|interaction| !matches!(interaction.intent, UiIntent::SelectNode { .. }))
+    );
+}
+
+#[test]
+fn rendering_replaces_terminal_control_characters_in_external_text() {
+    let mut state = connected_state();
+    state
+        .status
+        .as_mut()
+        .expect("connected fixture should have status")
+        .active_profile
+        .as_mut()
+        .expect("connected fixture should have an active Profile")
+        .name = "Profile\u{1b}X".to_owned();
+    state.proxies.rows[0].name = "Node\u{1b}X".to_owned();
+    state.profiles.rows[0].name = "Stored\u{1b}X".to_owned();
+    state.logs.records[0].message = "Log\u{1b}X".to_owned();
+    state.toast = Some("Toast\u{1b}X".to_owned());
+
+    for (page, expected) in [
+        (Page::Overview, "Profile?X"),
+        (Page::Proxies, "Node?X"),
+        (Page::Profiles, "Stored?X"),
+        (Page::Logs, "Log?X"),
+    ] {
+        state.page = page;
+        let (text, _) = render_with_backend(&state, 100, 30);
+        assert!(text.contains(expected), "{page:?} should sanitize its text");
+        assert!(text.contains("Toast?X"));
+        assert!(!text.contains('\u{1b}'));
+    }
+}
+
+#[test]
 fn minimum_size_view_reports_required_and_current_dimensions() {
     let state = AppState::new();
     let area = Rect::new(0, 0, 70, 20);
@@ -858,7 +923,7 @@ fn status_snapshot() -> StatusSnapshot {
 fn proxy(name: &str, selected: bool) -> ProxyRow {
     ProxyRow {
         group: "Automatic".to_owned(),
-        node_id: NodeRecordId::for_core(name),
+        node_id: Some(NodeRecordId::for_core(name)),
         name: name.to_owned(),
         node_type: "Shadowsocks".to_owned(),
         available: true,

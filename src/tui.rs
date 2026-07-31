@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Write};
@@ -124,7 +125,7 @@ pub struct ConnectionState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProxyRow {
     pub group: String,
-    pub node_id: NodeRecordId,
+    pub node_id: Option<NodeRecordId>,
     pub name: String,
     pub node_type: String,
     pub available: bool,
@@ -874,7 +875,11 @@ fn activate_selected(state: &mut AppState) -> Vec<Command> {
     match state.page {
         Page::Proxies => filtered_proxies(&state.proxies)
             .get(state.proxies.selected)
-            .map(|row| (row.group.clone(), row.node_id.clone()))
+            .and_then(|row| {
+                row.node_id
+                    .clone()
+                    .map(|node_id| (row.group.clone(), node_id))
+            })
             .map_or_else(Vec::new, |(group, node_id)| {
                 issue_node_selection(state, group, node_id)
             }),
@@ -1165,9 +1170,11 @@ fn selected_intent(state: &AppState) -> Option<UiIntent> {
     match state.page {
         Page::Proxies => filtered_proxies(&state.proxies)
             .get(state.proxies.selected)
-            .map(|row| UiIntent::SelectNode {
-                group: row.group.clone(),
-                node_id: row.node_id.clone(),
+            .and_then(|row| {
+                row.node_id.clone().map(|node_id| UiIntent::SelectNode {
+                    group: row.group.clone(),
+                    node_id,
+                })
             }),
         Page::Profiles => filtered_profiles(&state.profiles)
             .get(state.profiles.selected)
@@ -1406,6 +1413,9 @@ fn interaction_map(
                     .take(available_rows)
                     .enumerate()
                 {
+                    let Some(node_id) = row.node_id.clone() else {
+                        continue;
+                    };
                     interactions.push(Interaction {
                         area: Rect::new(
                             list.x.saturating_add(1),
@@ -1415,7 +1425,7 @@ fn interaction_map(
                         ),
                         intent: UiIntent::SelectNode {
                             group: row.group.clone(),
-                            node_id: row.node_id.clone(),
+                            node_id,
                         },
                     });
                 }
@@ -1532,6 +1542,18 @@ fn render_overview(state: &AppState, area: Rect, buffer: &mut Buffer) {
         .split(area);
     let connection = connection_label(state.connection);
     let body = if let Some(status) = &state.status {
+        let active_profile = status.active_profile.as_ref().map_or_else(
+            || Cow::Borrowed("-"),
+            |profile| terminal_safe(&profile.name),
+        );
+        let primary_group = status
+            .primary_proxy_group
+            .as_deref()
+            .map_or_else(|| Cow::Borrowed("-"), terminal_safe);
+        let current_node = status
+            .selected_node
+            .as_ref()
+            .map_or_else(|| Cow::Borrowed("-"), |node| terminal_safe(&node.name));
         format!(
             "Connection: {connection}\nSupervisor: {:?}\nCore: {:?}\nTUN: {}\nActive Profile: {}\nPrimary Group: {}\nCurrent Node: {}\nLatency: {}\nConnections: {}\nUptime: {}s",
             status.supervisor.lifecycle,
@@ -1541,15 +1563,9 @@ fn render_overview(state: &AppState, area: Rect, buffer: &mut Buffer) {
             } else {
                 "inactive"
             },
-            status
-                .active_profile
-                .as_ref()
-                .map_or("-", |profile| profile.name.as_str()),
-            status.primary_proxy_group.as_deref().unwrap_or("-"),
-            status
-                .selected_node
-                .as_ref()
-                .map_or("-", |node| node.name.as_str()),
+            active_profile,
+            primary_group,
+            current_node,
             status
                 .latency
                 .as_ref()
@@ -1593,8 +1609,10 @@ fn render_proxies(state: &AppState, regions: &LayoutRegions, buffer: &mut Buffer
         Style::default()
     };
     let search_width = search_area.width.saturating_sub(32) as usize;
-    let mut search_text = format!("/{}", state.proxies.filter);
-    search_text.truncate(search_width);
+    let search_text = format!("/{}", terminal_safe(&state.proxies.filter))
+        .chars()
+        .take(search_width)
+        .collect::<String>();
     let mut spans = vec![Span::styled(
         format!("{search_text:<search_width$}"),
         search_style,
@@ -1632,7 +1650,10 @@ fn render_proxies(state: &AppState, regions: &LayoutRegions, buffer: &mut Buffer
                 .map_or_else(|| "not_sampled".to_owned(), |delay| format!("{delay}ms"));
             let item = ListItem::new(format!(
                 "{marker} {:<14} {:<20} {:<12} {:<11} {delay}",
-                row.group, row.name, row.node_type, availability
+                terminal_safe(&row.group),
+                terminal_safe(&row.name),
+                terminal_safe(&row.node_type),
+                availability
             ));
             if offset + index == state.proxies.selected {
                 item.style(selected_style(state.focus == Focus::Content))
@@ -1672,10 +1693,15 @@ fn render_profiles(state: &AppState, regions: &LayoutRegions, buffer: &mut Buffe
             } else {
                 ""
             };
-            let error = row.error.as_deref().unwrap_or("-");
+            let error = row
+                .error
+                .as_deref()
+                .map_or_else(|| Cow::Borrowed("-"), terminal_safe);
             let item = ListItem::new(format!(
                 "{marker} {:<24} {:<6}{pending} next={} error={error}",
-                row.name, freshness, row.next_refresh_at_unix_ms
+                terminal_safe(&row.name),
+                freshness,
+                row.next_refresh_at_unix_ms
             ));
             if offset + index == state.profiles.selected {
                 item.style(selected_style(state.focus == Focus::Content))
@@ -1758,7 +1784,7 @@ fn render_logs(state: &AppState, regions: &LayoutRegions, buffer: &mut Buffer) {
                 record.timestamp_unix_ms,
                 log_level_title(record.level),
                 log_source_title(record.source),
-                record.message
+                terminal_safe(&record.message)
             ))
         })
         .collect::<Vec<_>>();
@@ -1781,7 +1807,7 @@ fn render_search(title: &str, value: &str, focused: bool, area: Rect, buffer: &m
     } else {
         Style::default()
     };
-    Paragraph::new(format!("/{value}"))
+    Paragraph::new(format!("/{}", terminal_safe(value)))
         .style(style)
         .block(Block::default().borders(Borders::ALL).title(title))
         .render(area, buffer);
@@ -1793,10 +1819,9 @@ fn render_footer(state: &AppState, area: Rect, buffer: &mut Buffer) {
     } else {
         ""
     };
-    let toast = state
-        .toast
-        .as_ref()
-        .map_or_else(String::new, |message| format!(" · {message}"));
+    let toast = state.toast.as_ref().map_or_else(String::new, |message| {
+        format!(" · {}", terminal_safe(message))
+    });
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -1836,13 +1861,15 @@ fn render_modal(modal: &Modal, area: Rect, buffer: &mut Buffer) {
     Clear.render(area, buffer);
     let (title, body) = match modal {
         Modal::Help => (
-            "Keyboard and mouse help",
-            "1-4 pages · Tab/Shift+Tab focus · arrows or j/k move\nEnter activates · / searches · s sorts nodes · p pauses logs · f follows logs\nLogs: a/d/i/w/e selects All/Debug/Info/Warn/Error\nEsc closes · q quits when no input or modal owns focus\n\nMouse: click tabs, controls, search, Profile, or Node; wheel scrolls.",
+            Cow::Borrowed("Keyboard and mouse help"),
+            Cow::Borrowed(
+                "1-4 pages · Tab/Shift+Tab focus · arrows or j/k move\nEnter activates · / searches · s sorts nodes · p pauses logs · f follows logs\nLogs: a/d/i/w/e selects All/Debug/Info/Warn/Error\nEsc closes · q quits when no input or modal owns focus\n\nMouse: click tabs, controls, search, Profile, or Node; wheel scrolls.",
+            ),
         ),
-        Modal::Message { title, body } => (title.as_str(), body.as_str()),
+        Modal::Message { title, body } => (terminal_safe(title), terminal_safe_multiline(body)),
     };
-    Paragraph::new(body)
-        .block(Block::default().borders(Borders::ALL).title(title))
+    Paragraph::new(body.as_ref())
+        .block(Block::default().borders(Borders::ALL).title(title.as_ref()))
         .render(area, buffer);
     let close = Rect::new(
         area.x.saturating_add(area.width.saturating_sub(10)),
@@ -1873,6 +1900,35 @@ fn selected_style(focused: bool) -> Style {
     } else {
         Style::default().fg(Color::Cyan)
     }
+}
+
+fn terminal_safe(value: &str) -> Cow<'_, str> {
+    terminal_safe_with_newlines(value, false)
+}
+
+fn terminal_safe_multiline(value: &str) -> Cow<'_, str> {
+    terminal_safe_with_newlines(value, true)
+}
+
+fn terminal_safe_with_newlines(value: &str, allow_newlines: bool) -> Cow<'_, str> {
+    if value
+        .chars()
+        .all(|character| !character.is_control() || (allow_newlines && character == '\n'))
+    {
+        return Cow::Borrowed(value);
+    }
+    Cow::Owned(
+        value
+            .chars()
+            .map(|character| {
+                if character.is_control() && !(allow_newlines && character == '\n') {
+                    '?'
+                } else {
+                    character
+                }
+            })
+            .collect(),
+    )
 }
 
 fn connection_label(connection: ConnectionState) -> &'static str {

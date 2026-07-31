@@ -25,4 +25,5 @@ pub mod state;
 pub mod telemetry;
 pub mod transaction;
 pub mod tui;
+pub mod tui_runtime;
 pub mod validator;

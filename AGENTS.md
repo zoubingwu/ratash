@@ -68,6 +68,7 @@
 - `src/scheduler.rs` owns deterministic bounded Profile Refresh and Active Profile Delay Probe scheduling state.
 - `src/telemetry.rs` owns generation-scoped latest values, fixed traffic history, and the bounded Core Log ring.
 - `src/tui.rs` owns the Ratatui view model, reducer, input mapping, pure rendering, fair event inbox, and reversible Crossterm terminal session.
+- `src/tui_runtime.rs` owns pre-terminal bootstrap, bounded background command dispatch, reconnect timing, live status and log intake, the coalesced event loop, signal handling, and the Ratatui/Crossterm runner.
 - `src/constants.rs` centralizes versioned product intervals, capacities, terminal limits, and input-size boundaries.
 - `src/digest.rs` is the internal SHA-256 helper shared by stable identities, immutable storage, and compiler policies.
 - `src/cli/command.rs` defines the public Clap command tree and maps parsed commands to typed invocations.
