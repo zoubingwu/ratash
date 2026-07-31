@@ -490,6 +490,7 @@ fn error_code_name(code: ErrorCode) -> &'static str {
         ErrorCode::RuleAmbiguous => "rule_ambiguous",
         ErrorCode::RuleAlreadyExists => "rule_already_exists",
         ErrorCode::PolicyTargetNotFound => "policy_target_not_found",
+        ErrorCode::ProfileFieldUnsupported => "profile_field_unsupported",
         ErrorCode::TunPermissionDenied => "tun_permission_denied",
         ErrorCode::CoreUnavailable => "core_unavailable",
         ErrorCode::ExternalOperationFailed => "external_operation_failed",

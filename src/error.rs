@@ -19,6 +19,7 @@ pub enum ErrorCode {
     RuleAmbiguous,
     RuleAlreadyExists,
     PolicyTargetNotFound,
+    ProfileFieldUnsupported,
     TunPermissionDenied,
     CoreUnavailable,
     ExternalOperationFailed,
@@ -45,7 +46,8 @@ impl ErrorCode {
             | Self::RuleNotFound
             | Self::RuleAmbiguous
             | Self::RuleAlreadyExists
-            | Self::PolicyTargetNotFound => ProcessExitCode::DomainConflict,
+            | Self::PolicyTargetNotFound
+            | Self::ProfileFieldUnsupported => ProcessExitCode::DomainConflict,
             Self::TunPermissionDenied
             | Self::CoreUnavailable
             | Self::ExternalOperationFailed

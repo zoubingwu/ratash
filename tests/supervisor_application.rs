@@ -949,6 +949,37 @@ fn first_profile_add_commits_rules_runtime_probes_and_reopens_from_persistence()
 }
 
 #[test]
+fn profile_add_reports_the_stable_error_for_an_unsupported_catalog_field() {
+    let harness = Harness::new("unsupported-profile-field");
+    harness.source.push(Ok(FetchedProfile {
+        body: b"unsupported-top-level-field: true\n".to_vec(),
+        metadata_name: Some("Unsupported".to_owned()),
+    }));
+    let supervisor = harness.open();
+
+    let error = supervisor
+        .execute(ApplicationOperation::ProfileAdd {
+            subscription_url: SubscriptionUrl::parse(
+                "https://example.test/unsupported-profile.yaml",
+            )
+            .expect("the URL should be valid"),
+        })
+        .expect_err("the unsupported Profile field should be rejected");
+
+    assert_eq!(
+        error.code,
+        hopash::error::ErrorCode::ProfileFieldUnsupported
+    );
+    assert_eq!(
+        error.message,
+        "The Profile contains a field unsupported by the bundled Mihomo version"
+    );
+    assert!(!error.retryable);
+    assert_eq!(harness.transactions.apply_count.load(Ordering::Relaxed), 0);
+    assert!(profile_list(&supervisor).is_empty());
+}
+
+#[test]
 fn restart_recompiles_for_the_new_core_session_and_restores_runtime_state() {
     let harness = Harness::new("restart-session");
     harness.core.state.lock().expect("the Core lock").view = two_node_proxy_view();

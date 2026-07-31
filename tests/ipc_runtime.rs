@@ -306,6 +306,30 @@ fn structured_application_errors_preserve_selector_candidates() {
 }
 
 #[test]
+fn profile_field_unsupported_error_round_trips_over_ipc() {
+    let socket = TempSocket::new("unsupported-profile-field");
+    let source_error = ApplicationError::new(
+        ErrorCode::ProfileFieldUnsupported,
+        "The Profile contains a field unsupported by the bundled Mihomo version",
+        false,
+    );
+    let mut server = IpcServer::start(
+        socket.path(),
+        Arc::new(QueuedClient::new(vec![Err(source_error.clone())])),
+        Arc::new(AllowPeer),
+        test_server_config(),
+    )
+    .expect("server should start");
+
+    let error = IpcClient::new(socket.path())
+        .execute(ApplicationOperation::ProfileList)
+        .expect_err("the stable Profile error should cross the transport");
+
+    assert_eq!(error, source_error);
+    server.shutdown().expect("server should stop cleanly");
+}
+
+#[test]
 fn runtime_apply_failure_details_round_trip_over_ipc() {
     let socket = TempSocket::new("runtime-apply-error");
     let source_error = ApplicationError::new(

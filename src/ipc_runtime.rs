@@ -1308,6 +1308,7 @@ fn parse_error_code(code: &str) -> Option<ErrorCode> {
         "rule_ambiguous" => ErrorCode::RuleAmbiguous,
         "rule_already_exists" => ErrorCode::RuleAlreadyExists,
         "policy_target_not_found" => ErrorCode::PolicyTargetNotFound,
+        "profile_field_unsupported" => ErrorCode::ProfileFieldUnsupported,
         "tun_permission_denied" => ErrorCode::TunPermissionDenied,
         "core_unavailable" => ErrorCode::CoreUnavailable,
         "external_operation_failed" => ErrorCode::ExternalOperationFailed,

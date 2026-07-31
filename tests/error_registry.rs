@@ -33,6 +33,10 @@ fn public_error_codes_map_to_stable_process_exit_classes() {
             ProcessExitCode::DomainConflict,
         ),
         (
+            ErrorCode::ProfileFieldUnsupported,
+            ProcessExitCode::DomainConflict,
+        ),
+        (
             ErrorCode::ExternalOperationFailed,
             ProcessExitCode::ExternalOperationFailure,
         ),
