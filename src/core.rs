@@ -76,6 +76,8 @@ impl fmt::Debug for OwnerSessionProof {
 pub struct OwnerSession {
     pub proof: OwnerSessionProof,
     pub protocol_version: u16,
+    pub owner_generation: u64,
+    pub endpoint: CoreControlEndpoint,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -189,9 +191,11 @@ pub struct ForwardedCoreLogBatch {
 pub enum CoreRuntimeErrorKind {
     Authentication,
     ProtocolMismatch,
+    TunPermissionDenied,
     InvalidBundle,
     ProcessIdentityMismatch,
     Apply,
+    ReloadTimeout,
     Readiness,
     Unavailable,
 }
@@ -227,11 +231,15 @@ impl fmt::Display for CoreRuntimeError {
         formatter.write_str(match self.kind {
             CoreRuntimeErrorKind::Authentication => "Core runtime authentication failed",
             CoreRuntimeErrorKind::ProtocolMismatch => "Core runtime protocol mismatch",
+            CoreRuntimeErrorKind::TunPermissionDenied => {
+                "TUN capability is unavailable for the Managed Core"
+            }
             CoreRuntimeErrorKind::InvalidBundle => "Core runtime bundle is invalid",
             CoreRuntimeErrorKind::ProcessIdentityMismatch => {
                 "Managed Core process identity mismatch"
             }
             CoreRuntimeErrorKind::Apply => "Core Runtime Apply failed",
+            CoreRuntimeErrorKind::ReloadTimeout => "Managed Core reload timed out",
             CoreRuntimeErrorKind::Readiness => "Managed Core readiness check failed",
             CoreRuntimeErrorKind::Unavailable => "Core runtime service is unavailable",
         })

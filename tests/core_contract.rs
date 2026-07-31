@@ -422,6 +422,8 @@ impl CoreRuntime for FakeCoreRuntime {
                 "session-secret",
             ),
             protocol_version: request.protocol_version,
+            owner_generation: 1,
+            endpoint: CoreControlEndpoint::new("/fixture/core.sock", "core-secret"),
         })
     }
 
