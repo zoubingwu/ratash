@@ -1674,9 +1674,14 @@ impl Supervisor {
                 )
             })
             .unwrap_or_default();
-        let _ = state
+        if state
             .probes
-            .reset(generation, nodes, self.clock.now_unix_ms());
+            .reset(generation, nodes, self.clock.now_unix_ms())
+            .is_err()
+        {
+            state.probes.deactivate();
+            state.degraded = true;
+        }
     }
 
     fn restore_active_selections(&self, state: &mut SupervisorState) {

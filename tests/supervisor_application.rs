@@ -679,6 +679,42 @@ fn two_node_proxy_view() -> ProxyView {
     }
 }
 
+fn oversized_proxy_view() -> ProxyView {
+    let nodes = (0..=hopash::constants::MAX_ACTIVE_NODES)
+        .map(|index| {
+            let name = format!("node-{index}");
+            let record_id = NodeRecordId::for_core(&name);
+            (
+                record_id.clone(),
+                ProxyNode {
+                    record_id,
+                    name: name.clone(),
+                    proxy_type: "Shadowsocks".to_owned(),
+                    availability: Availability::Available,
+                    core_internal: false,
+                    source: NodeSource::Core { proxy_name: name },
+                },
+            )
+        })
+        .collect();
+    ProxyView {
+        schema_version: 1,
+        order_source: ProxyViewOrderSource::EffectiveConfiguration,
+        provider_state: ProviderState::Ready,
+        groups: vec![ProxyGroup {
+            name: "Main".to_owned(),
+            proxy_type: "Selector".to_owned(),
+            availability: Availability::Available,
+            selectable: true,
+            core_internal: false,
+            selected_name: None,
+            members: Vec::new(),
+        }],
+        nodes,
+        providers: Vec::new(),
+    }
+}
+
 fn duplicate_node_name_proxy_view() -> ProxyView {
     let first = NodeRecordId::for_provider("provider-a", "shared");
     let second = NodeRecordId::for_provider("provider-b", "shared");
@@ -1053,6 +1089,32 @@ fn status_reports_applying_while_a_transaction_owns_authoritative_state() {
         panic!("status should return Status")
     };
     assert_eq!(status.apply_state, hopash::domain::ApplyState::Applying);
+}
+
+#[test]
+fn oversized_active_node_set_deactivates_probes_and_marks_degraded_state() {
+    let harness = Harness::new("oversized-probe-set");
+    harness.queue_profile("Primary", "node-a");
+    harness.core.state.lock().expect("the Core lock").view = oversized_proxy_view();
+    let supervisor = harness.open();
+
+    add_profile(&supervisor, "https://example.test/primary.yaml");
+    assert!(
+        supervisor
+            .take_due_probes()
+            .expect("the disabled Probe Scheduler should remain available")
+            .is_empty()
+    );
+    let ApplicationOutput::Status(status) = supervisor
+        .execute(ApplicationOperation::GetStatus)
+        .expect("status should remain available")
+    else {
+        panic!("status should return Status")
+    };
+    assert_eq!(
+        status.supervisor.lifecycle,
+        hopash::domain::SupervisorLifecycle::Degraded
+    );
 }
 
 #[test]
