@@ -74,6 +74,51 @@ fn committed_state_round_trips_multiple_profiles_and_private_metadata() {
 }
 
 #[test]
+fn committed_state_round_trips_the_one_hundred_profile_release_workload() {
+    let directory = TestDirectory::new();
+    let store = AuthoritativeStateStore::open(&directory.path).expect("state store should open");
+    let mut profiles = ProfileCatalog::new();
+    let mut active_id = None;
+    for index in 0..100 {
+        let id = ProfileId::parse(&format!("00000000-0000-4000-8000-{index:012x}"))
+            .expect("fixture ID should parse");
+        profiles
+            .insert(profile(
+                id,
+                &format!("Profile {index:03}"),
+                &format!("scale-{index:03}"),
+                1,
+            ))
+            .expect("Profile should insert");
+        active_id = Some(id);
+    }
+    profiles
+        .activate(
+            &active_id
+                .expect("the release workload should have an Active Profile")
+                .to_string(),
+        )
+        .expect("Profile should activate");
+    let expected = FixtureState {
+        profiles,
+        rules: LocalRuleSet::initialized(vec![
+            RuleString::new("MATCH,DIRECT", 1_024).expect("rule should validate"),
+        ]),
+        effective_configuration: b"mode: rule\ntun:\n  enable: true\n".to_vec(),
+    };
+
+    commit_state(&store, &expected, 12);
+    let hydrated = store
+        .load_committed(snapshot_limits(), RuleSetLimits::product())
+        .expect("committed release workload should load")
+        .expect("committed release workload should exist");
+
+    assert_eq!(hydrated.profiles.len(), 100);
+    assert_eq!(hydrated.profiles, expected.profiles);
+    assert_eq!(hydrated.runtime_generation, RuntimeGeneration(12));
+}
+
+#[test]
 fn removed_inactive_profile_snapshots_are_collected_after_the_previous_generation_expires() {
     let directory = TestDirectory::new();
     let store = AuthoritativeStateStore::open(&directory.path).expect("state store should open");

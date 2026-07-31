@@ -115,6 +115,45 @@ fn refresh_completion_releases_capacity_after_profile_removal() {
 }
 
 #[test]
+fn one_hundred_due_profiles_keep_refresh_work_bounded_and_make_progress() {
+    let mut scheduler = ProfileRefreshScheduler::new();
+    for _ in 0..100 {
+        scheduler.upsert(ProfileId::new(), ProfileRevision(1), 0);
+    }
+
+    let mut dispatched = BTreeSet::new();
+    let mut peak_in_flight = 0;
+    while dispatched.len() < 100 {
+        let tasks = scheduler.take_due(0);
+        assert!(!tasks.is_empty(), "each due Profile should make progress");
+        assert!(tasks.len() <= PROFILE_REFRESH_CONCURRENCY);
+        peak_in_flight = peak_in_flight.max(scheduler.in_flight_count());
+
+        for task in tasks {
+            assert!(dispatched.insert(task.profile_id));
+            assert_eq!(
+                scheduler.complete(RefreshCompletion {
+                    task,
+                    profile_revision: ProfileRevision(1),
+                    completed_at_unix_ms: 0,
+                }),
+                RefreshCompletionStatus::Rescheduled {
+                    next_refresh_at_unix_ms: duration_ms(PROFILE_REFRESH_INTERVAL),
+                }
+            );
+        }
+    }
+
+    assert_eq!(scheduler.scheduled_profile_count(), 100);
+    assert_eq!(scheduler.in_flight_count(), 0);
+    assert_eq!(peak_in_flight, PROFILE_REFRESH_CONCURRENCY);
+    assert_eq!(
+        scheduler.next_deadline(),
+        Some(duration_ms(PROFILE_REFRESH_INTERVAL))
+    );
+}
+
+#[test]
 fn probe_generation_deduplicates_nodes_and_enqueues_the_first_pass_immediately() {
     let first = node("first");
     let second = node("second");

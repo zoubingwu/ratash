@@ -1,3 +1,4 @@
+use hopash::constants::{CORE_LOG_LINE_MAX_BYTES, LOG_CAPACITY};
 use hopash::domain::{CoreInstanceGeneration, SampleState, TrafficSample};
 use hopash::telemetry::{CoreLogRecord, LogBuffer, LogFilter, LogLevel, LogSource, TelemetryStore};
 
@@ -111,6 +112,41 @@ fn sustained_traffic_input_keeps_a_fixed_capacity_series() {
             .expect("latest sample should exist")
             .upload_bytes_per_second,
         99_999
+    );
+}
+
+#[test]
+fn sustained_core_log_input_keeps_the_release_capacity_and_reports_eviction() {
+    let total_records = LOG_CAPACITY * 10;
+    let mut buffer =
+        LogBuffer::new(LOG_CAPACITY, CORE_LOG_LINE_MAX_BYTES).expect("release limits should work");
+
+    for index in 0..total_records {
+        buffer
+            .push(
+                u64::try_from(index).expect("fixture index should fit"),
+                LogLevel::Info,
+                LogSource::CoreApi,
+                "steady-state Core Log",
+            )
+            .expect("fixture log should fit");
+    }
+
+    let tail = buffer.tail_after(Some(0));
+    let expected_earliest =
+        u64::try_from(total_records - LOG_CAPACITY + 1).expect("fixture sequence should fit");
+    assert_eq!(buffer.len(), LOG_CAPACITY);
+    assert_eq!(buffer.capacity(), LOG_CAPACITY);
+    assert_eq!(
+        buffer.dropped_total(),
+        (total_records - LOG_CAPACITY) as u64
+    );
+    assert!(tail.gap);
+    assert_eq!(tail.records.len(), LOG_CAPACITY);
+    assert_eq!(tail.earliest_sequence, Some(expected_earliest));
+    assert_eq!(
+        tail.latest_sequence,
+        Some(u64::try_from(total_records).expect("fixture sequence should fit"))
     );
 }
 
