@@ -46,6 +46,7 @@
 - `src/application.rs` defines transport-independent operations, outputs, errors, and the application service seam.
 - `src/domain.rs` defines shared lifecycle, identity, status, and validated value types.
 - `src/contract.rs` owns the versioned JSON V1 envelope and explicit status DTO projection.
+- `src/ipc.rs` owns the versioned local wire protocol, bounded JSON framing, private Unix socket boundary, and per-subscriber status and log backpressure state.
 - `src/profile.rs` owns sanitized Subscription URLs, validated Profile Snapshots, Profile naming, catalog selection, and refresh revision checks.
 - `src/profile_source.rs` owns bounded HTTP(S) Profile downloads, redirect policy, metadata extraction, and safe download errors.
 - `src/persistence.rs` owns private content-addressed objects, recoverable transaction journals, and the committed manifest pointer.
