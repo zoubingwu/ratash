@@ -269,14 +269,26 @@ fn release_metadata_names_every_required_resource_measurement() {
     assert_eq!(metadata["workloads"]["active_nodes"], 10_000);
     assert_eq!(metadata["workloads"]["local_rules"], 20_000);
     assert_eq!(metadata["workloads"]["tui_duration_seconds"], 1_800);
-    assert_eq!(metadata["status"], "capture_required");
-    assert!(
-        metadata["measurements"]
-            .as_object()
-            .expect("measurements should be an object")
-            .values()
-            .all(serde_json::Value::is_null)
-    );
+    let status = metadata["status"]
+        .as_str()
+        .expect("benchmark status should be a string");
+    assert!(matches!(status, "capture_required" | "approved"));
+    let measurements = metadata["measurements"]
+        .as_object()
+        .expect("measurements should be an object");
+    match status {
+        "capture_required" => {
+            assert!(measurements.values().all(serde_json::Value::is_null));
+        }
+        "approved" => {
+            assert!(
+                measurements
+                    .values()
+                    .all(|value| { value.as_f64().is_some_and(|measurement| measurement >= 0.0) })
+            );
+        }
+        _ => unreachable!("the benchmark status was validated above"),
+    }
     for measurement in [
         "wrapper_binary_bytes",
         "one_shot_cli_cold_start_ms",
@@ -287,14 +299,21 @@ fn release_metadata_names_every_required_resource_measurement() {
         "privileged_service_idle_rss_bytes",
         "combined_idle_rss_bytes",
         "idle_wakeups_per_second",
+        "probe_peak_memory_bytes",
         "probe_peak_concurrency",
         "probe_first_pass_ms",
         "probe_stale_ratio",
+        "rule_parse_20000_ms",
+        "rule_filter_20000_ms",
+        "rule_single_mutation_20000_ms",
+        "telemetry_sustained_cpu_percent",
+        "telemetry_peak_memory_bytes",
         "tui_cold_start_ms",
         "tui_idle_rss_bytes",
+        "tui_peak_memory_bytes",
     ] {
         assert!(
-            metadata["measurements"].get(measurement).is_some(),
+            measurements.get(measurement).is_some(),
             "benchmark metadata is missing {measurement}"
         );
     }
