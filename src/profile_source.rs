@@ -48,6 +48,7 @@ pub struct ProfileDownload {
 
 impl ProfileDownload {
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn from_parts(
         body: Vec<u8>,
         metadata_name: Option<String>,

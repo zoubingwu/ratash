@@ -89,6 +89,10 @@ fn state_paths_use_an_absolute_override_or_the_macos_user_location() {
         default_paths.root.join("supervisor.sock")
     );
     assert_eq!(
+        default_paths.shutdown_socket,
+        default_paths.root.join("supervisor-control.sock")
+    );
+    assert_eq!(
         StatePaths::from_environment(Some(OsStr::new("relative")), None)
             .expect_err("relative override should fail")
             .kind(),

@@ -93,7 +93,7 @@ fn json_operation_failure_uses_stderr_and_the_supervisor_exit_code() {
             "schema_version": 1,
             "error": {
                 "code": "supervisor_unavailable",
-                "message": "The Hopash Supervisor is unavailable",
+                "message": "The Hopash Supervisor IPC endpoint is unavailable",
                 "retryable": true
             }
         })

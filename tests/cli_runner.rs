@@ -1,7 +1,7 @@
 use hopash::application::{
     ApplicationClient, ApplicationError, ApplicationErrorDetails, ApplicationOperation,
-    ApplicationOutput, ApplicationService, ProfileListOutcome, ProfileRefreshState, ProfileSummary,
-    SelectorCandidate, SelectorKind,
+    ApplicationOutput, ApplicationService, LifecycleFailureDetails, ProfileListOutcome,
+    ProfileRefreshState, ProfileSummary, SelectorCandidate, SelectorKind,
 };
 use hopash::cli::{
     ForegroundRunner, Invocation, OutputMode, run_invocation, run_invocation_with_frontend,
@@ -401,4 +401,64 @@ fn human_profile_output_redacts_urls_and_escapes_terminal_controls() {
     assert!(!output.contains("subscription-secret"));
     assert!(!output.contains("password"));
     assert!(output.contains("[redacted]"));
+}
+
+#[test]
+fn lifecycle_failures_expose_stable_stage_and_category_details() {
+    let error = ApplicationError::new(
+        ErrorCode::CoreUnavailable,
+        "The Supervisor reported a startup failure",
+        true,
+    )
+    .with_details(ApplicationErrorDetails::LifecycleFailure(Box::new(
+        LifecycleFailureDetails {
+            stage: "core_readiness".to_owned(),
+            category: "readiness".to_owned(),
+        },
+    )));
+    let json_client = RecordingClient {
+        calls: RefCell::new(Vec::new()),
+        result: Err(error.clone()),
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let exit = run_invocation(
+        Invocation::Application {
+            operation: ApplicationOperation::Start,
+            output: OutputMode::Json,
+        },
+        &json_client,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(exit, ProcessExitCode::ExternalOperationFailure);
+    let value: serde_json::Value =
+        serde_json::from_slice(&stderr).expect("stderr should contain one JSON document");
+    assert_eq!(
+        value["error"]["details"]["lifecycle_stage"],
+        "core_readiness"
+    );
+    assert_eq!(value["error"]["details"]["failure_category"], "readiness");
+
+    let human_client = RecordingClient {
+        calls: RefCell::new(Vec::new()),
+        result: Err(error),
+    };
+    stdout.clear();
+    stderr.clear();
+    let exit = run_invocation(
+        Invocation::Application {
+            operation: ApplicationOperation::Start,
+            output: OutputMode::Human,
+        },
+        &human_client,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(exit, ProcessExitCode::ExternalOperationFailure);
+    let diagnostic = String::from_utf8(stderr).expect("diagnostic should be UTF-8");
+    assert!(diagnostic.contains("Lifecycle Stage: core_readiness"));
+    assert!(diagnostic.contains("Failure Category: readiness"));
 }

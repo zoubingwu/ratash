@@ -428,14 +428,18 @@ fn a_valid_stale_record_and_socket_are_cleaned_before_start() {
     let ownership = SupervisorOwnership::acquire(paths.clone(), stale.clone(), 1, process.as_ref())
         .expect("stale owner should acquire");
     let listener = UnixListener::bind(&paths.ipc_socket).expect("stale socket should bind");
+    let control_listener =
+        UnixListener::bind(&paths.shutdown_socket).expect("stale control socket should bind");
     std::mem::forget(ownership);
     drop(listener);
+    drop(control_listener);
     process.set_identity(stale.pid, None);
 
     let outcome = lifecycle.start().expect("stale state should recover");
 
     assert!(outcome.changed);
     assert_eq!(process.spawn_count(), 1);
+    assert!(!paths.shutdown_socket.exists());
     assert_eq!(
         outcome
             .instance
@@ -469,6 +473,34 @@ fn stale_cleanup_preserves_a_regular_file_at_the_socket_path() {
     assert_eq!(
         fs::read(&paths.ipc_socket).expect("regular file should remain"),
         b"preserve me"
+    );
+    assert_eq!(process.spawn_count(), 0);
+}
+
+#[test]
+fn stale_cleanup_preserves_a_regular_file_at_the_control_socket_path() {
+    let directory = TestDirectory::new();
+    let (lifecycle, process, _) = fixture(&directory);
+    let paths = StatePaths::for_root(directory.path.join("state"));
+    let stale = ProcessIdentity {
+        pid: 9_102,
+        start_identity: "stale-control-start".to_owned(),
+    };
+    process.set_identity(stale.pid, Some(&stale.start_identity));
+    let ownership = SupervisorOwnership::acquire(paths.clone(), stale.clone(), 1, process.as_ref())
+        .expect("stale owner should acquire");
+    fs::write(&paths.shutdown_socket, b"preserve control")
+        .expect("fixture control file should write");
+    std::mem::forget(ownership);
+    process.set_identity(stale.pid, None);
+
+    let error = lifecycle.start().expect_err("unsafe cleanup should fail");
+
+    assert_eq!(error.kind(), DaemonErrorKind::UnsafeStaleState);
+    assert_eq!(error.stage(), Some(StartupStage::StaleCleanup));
+    assert_eq!(
+        fs::read(&paths.shutdown_socket).expect("regular control file should remain"),
+        b"preserve control"
     );
     assert_eq!(process.spawn_count(), 0);
 }

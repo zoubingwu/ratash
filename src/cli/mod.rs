@@ -6,4 +6,5 @@ mod runner;
 pub use command::{Cli, Invocation, OutputMode};
 pub use help::render_agent_help;
 pub use process::parse_process_invocation;
+pub(crate) use runner::write_application_error;
 pub use runner::{ForegroundRunner, run_invocation, run_invocation_with_frontend};

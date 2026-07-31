@@ -18,6 +18,7 @@ const RECORD_MAX_BYTES: usize = 64 * 1_024;
 pub struct StatePaths {
     pub root: PathBuf,
     pub ipc_socket: PathBuf,
+    pub shutdown_socket: PathBuf,
     pub persistence: PathBuf,
     pub runtime: PathBuf,
     pub instance_record: PathBuf,
@@ -29,6 +30,7 @@ impl StatePaths {
         let root = root.into();
         Self {
             ipc_socket: root.join("supervisor.sock"),
+            shutdown_socket: root.join("supervisor-control.sock"),
             persistence: root.join("state"),
             runtime: root.join("runtime"),
             instance_record: root.join("instance.json"),

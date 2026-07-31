@@ -573,6 +573,13 @@ impl fmt::Debug for ApplicationError {
 pub enum ApplicationErrorDetails {
     CandidateIds { candidate_ids: Vec<String> },
     RuntimeApplyFailure(Box<RuntimeApplyFailureDetails>),
+    LifecycleFailure(Box<LifecycleFailureDetails>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LifecycleFailureDetails {
+    pub stage: String,
+    pub category: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

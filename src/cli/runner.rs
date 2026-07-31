@@ -515,7 +515,7 @@ fn write_log_metadata(
     Ok(())
 }
 
-fn write_application_error(
+pub(crate) fn write_application_error(
     error: ApplicationError,
     mode: OutputMode,
     stderr: &mut dyn Write,
@@ -593,6 +593,18 @@ fn write_human_application_error(
                     )
                     .is_err()
                     || write_recovery(&details.recovery, stderr).is_err()
+                {
+                    return ProcessExitCode::InternalFailure;
+                }
+            }
+            ApplicationErrorDetails::LifecycleFailure(details) => {
+                if writeln!(stderr, "Lifecycle Stage: {}", terminal_safe(&details.stage)).is_err()
+                    || writeln!(
+                        stderr,
+                        "Failure Category: {}",
+                        terminal_safe(&details.category)
+                    )
+                    .is_err()
                 {
                     return ProcessExitCode::InternalFailure;
                 }

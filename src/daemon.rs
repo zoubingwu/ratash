@@ -674,14 +674,16 @@ impl SupervisorOwnership {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShutdownIntent {
     pub process: ProcessIdentity,
     pub instance_token: String,
     pub protocol_version: u16,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShutdownAcknowledgement {
     pub process: ProcessIdentity,
     pub instance_token: String,
@@ -1115,16 +1117,22 @@ where
         )
         .map_err(with_stale_cleanup_stage)?;
         let Some(record) = record else {
-            match fs::symlink_metadata(&self.paths.ipc_socket) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-                Ok(_) => {}
-                Err(error) => {
-                    return Err(DaemonError::startup(
-                        DaemonErrorKind::UnsafeStaleState,
-                        StartupStage::StaleCleanup,
-                    )
-                    .with_source(error));
-                }
+            let main_exists = path_exists(&self.paths.ipc_socket).map_err(|error| {
+                DaemonError::startup(
+                    DaemonErrorKind::UnsafeStaleState,
+                    StartupStage::StaleCleanup,
+                )
+                .with_source(error)
+            })?;
+            let control_exists = path_exists(&self.paths.shutdown_socket).map_err(|error| {
+                DaemonError::startup(
+                    DaemonErrorKind::UnsafeStaleState,
+                    StartupStage::StaleCleanup,
+                )
+                .with_source(error)
+            })?;
+            if !main_exists && !control_exists {
+                return Ok(());
             }
             return Err(DaemonError::startup(
                 DaemonErrorKind::UnsafeStaleState,
@@ -1398,14 +1406,8 @@ fn remove_instance_artifacts(
     if current.as_ref() != Some(expected) || expected.socket_path != paths.ipc_socket {
         return Err(DaemonError::new(DaemonErrorKind::UnsafeStaleState));
     }
-    let socket_exists = match fs::symlink_metadata(&paths.ipc_socket) {
-        Ok(metadata) if metadata.file_type().is_socket() => true,
-        Ok(_) => return Err(DaemonError::new(DaemonErrorKind::UnsafeStaleState)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-        Err(error) => {
-            return Err(DaemonError::new(DaemonErrorKind::StateOperationFailed).with_source(error));
-        }
-    };
+    let socket_exists = verified_socket_exists(&paths.ipc_socket)?;
+    let shutdown_socket_exists = verified_socket_exists(&paths.shutdown_socket)?;
     let quarantine = paths
         .root
         .join(format!(".instance.{}.stale", uuid::Uuid::new_v4()));
@@ -1423,6 +1425,12 @@ fn remove_instance_artifacts(
             return Err(DaemonError::new(DaemonErrorKind::UnsafeStaleState).with_source(error));
         }
     }
+    if shutdown_socket_exists
+        && let Err(error) = remove_verified_stale_socket(&paths.shutdown_socket)
+    {
+        let _ = restore_quarantined_record(&quarantine, &paths.instance_record);
+        return Err(DaemonError::new(DaemonErrorKind::UnsafeStaleState).with_source(error));
+    }
     if let Err(error) = remove_regular_file(&quarantine) {
         let _ = restore_quarantined_record(&quarantine, &paths.instance_record);
         return Err(error);
@@ -1430,6 +1438,25 @@ fn remove_instance_artifacts(
     File::open(&paths.root)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| DaemonError::new(DaemonErrorKind::StateOperationFailed).with_source(error))
+}
+
+fn path_exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn verified_socket_exists(path: &Path) -> Result<bool, DaemonError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => Ok(true),
+        Ok(_) => Err(DaemonError::new(DaemonErrorKind::UnsafeStaleState)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(DaemonError::new(DaemonErrorKind::StateOperationFailed).with_source(error))
+        }
+    }
 }
 
 fn restore_quarantined_record(quarantine: &Path, destination: &Path) -> io::Result<()> {

@@ -101,6 +101,16 @@ impl From<ApplicationError> for ApiError {
                             .expect("RecoveryViewV1 is serializable"),
                     );
                 }
+                ApplicationErrorDetails::LifecycleFailure(lifecycle_failure) => {
+                    details.insert(
+                        "lifecycle_stage".to_owned(),
+                        serde_json::json!(lifecycle_failure.stage),
+                    );
+                    details.insert(
+                        "failure_category".to_owned(),
+                        serde_json::json!(lifecycle_failure.category),
+                    );
+                }
             }
         }
         if let Some(selector_details) = error.selector_candidates {
