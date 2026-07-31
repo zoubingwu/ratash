@@ -1,4 +1,4 @@
-use hopash::domain::{NodeRecordId, SubscriptionUrl};
+use hopash::domain::{NodeRecordId, ProfileId, SubscriptionUrl};
 
 #[test]
 fn subscription_url_accepts_http_and_https_at_the_domain_boundary() {
@@ -17,6 +17,63 @@ fn subscription_url_accepts_http_and_https_at_the_domain_boundary() {
 }
 
 #[test]
+fn subscription_url_redaction_removes_credentials_and_sensitive_values() {
+    let url = SubscriptionUrl::parse(
+        "https://alice:password@profiles.example.test/api/access-token-value/profile.yaml?token=query-secret&client=private-value#fragment",
+    )
+    .expect("fixture URL should be valid");
+
+    let redacted = url.redacted();
+
+    assert!(redacted.starts_with("https://profiles.example.test/"));
+    assert!(redacted.contains("[redacted]"));
+    for secret in [
+        "alice",
+        "password",
+        "access-token-value",
+        "query-secret",
+        "private-value",
+        "fragment",
+    ] {
+        assert!(!redacted.contains(secret), "{secret} leaked in {redacted}");
+    }
+}
+
+#[test]
+fn subscription_url_redaction_covers_encoded_jwt_base64_and_token_filenames() {
+    for value in [
+        "https://profiles.example.test/eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signaturevalue/profile.yaml",
+        "https://profiles.example.test/QWxhZGRpbjpvcGVuIHNlc2FtZQ==/profile.yaml",
+        "https://profiles.example.test/%61ccess-%74oken-value/profile.yaml",
+        "https://profiles.example.test/0123456789abcdef0123456789abcdef.yaml",
+    ] {
+        let url = SubscriptionUrl::parse(value).expect("fixture URL should be valid");
+        let redacted = url.redacted();
+
+        assert!(redacted.contains("[redacted]"), "{redacted}");
+        assert!(!redacted.contains("eyJhbGci"), "{redacted}");
+        assert!(!redacted.contains("QWxhZGRp"), "{redacted}");
+        assert!(!redacted.contains("%61ccess"), "{redacted}");
+        assert!(!redacted.contains("0123456789abcdef"), "{redacted}");
+    }
+}
+
+#[test]
+fn subscription_url_redaction_hides_token_shaped_query_keys() {
+    for value in [
+        "https://profiles.example.test/profile.yaml?0123456789abcdef0123456789abcdef",
+        "https://profiles.example.test/profile.yaml?access-token-value=unused",
+    ] {
+        let url = SubscriptionUrl::parse(value).expect("fixture URL should be valid");
+        let redacted = url.redacted();
+
+        assert!(redacted.contains("[redacted]=[redacted]"), "{redacted}");
+        assert!(!redacted.contains("0123456789abcdef"), "{redacted}");
+        assert!(!redacted.contains("access-token-value"), "{redacted}");
+    }
+}
+
+#[test]
 fn node_record_ids_are_deterministic_and_source_aware() {
     let core = NodeRecordId::for_core("Shared Node");
     let provider_a = NodeRecordId::for_provider("Provider A", "Shared Node");
@@ -29,4 +86,21 @@ fn node_record_ids_are_deterministic_and_source_aware() {
     );
     assert_ne!(core, provider_a);
     assert_ne!(provider_a, provider_b);
+    assert!(core.as_str().starts_with("node_v1_"));
+    assert_eq!(core.as_str().len(), "node_v1_".len() + 64);
+    assert!(!core.as_str().contains("Shared Node"));
+    assert!(!provider_a.as_str().contains("Provider A"));
+}
+
+#[test]
+fn profile_ids_are_opaque_unique_and_round_trip_through_text() {
+    let first = ProfileId::new();
+    let second = ProfileId::new();
+
+    assert_ne!(first, second);
+    assert_eq!(
+        ProfileId::parse(&first.to_string()).expect("generated ID should parse"),
+        first
+    );
+    assert!(ProfileId::parse("profile-a").is_err());
 }

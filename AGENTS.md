@@ -46,6 +46,9 @@
 - `src/application.rs` defines transport-independent operations, outputs, errors, and the application service seam.
 - `src/domain.rs` defines shared lifecycle, identity, status, and validated value types.
 - `src/contract.rs` owns the versioned JSON V1 envelope and explicit status DTO projection.
+- `src/profile.rs` owns sanitized Subscription URLs, validated Profile Snapshots, Profile naming, catalog selection, and refresh revision checks.
+- `src/persistence.rs` owns private content-addressed objects, recoverable transaction journals, and the committed manifest pointer.
+- `src/digest.rs` is the internal SHA-256 helper shared by stable identities and immutable storage.
 - `src/cli/command.rs` defines the public Clap command tree and maps parsed commands to typed invocations.
 - `src/cli/process.rs` owns process argument errors, JSON usage envelopes, and sensitive argument redaction.
 - `src/cli/help.rs` generates Agent Help from the Clap command tree plus the fixed recovery workflow.

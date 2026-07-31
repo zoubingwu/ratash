@@ -258,7 +258,7 @@ pub struct ActiveProfileViewV1 {
 impl From<ActiveProfileSummary> for ActiveProfileViewV1 {
     fn from(profile: ActiveProfileSummary) -> Self {
         Self {
-            id: profile.id.0,
+            id: profile.id.to_string(),
             name: profile.name,
         }
     }

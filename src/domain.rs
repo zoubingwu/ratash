@@ -58,8 +58,34 @@ pub struct CoreInstanceGeneration(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProbeGeneration(pub u64);
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ProfileId(pub String);
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LocalRuleSetRevision(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProfileId(uuid::Uuid);
+
+impl ProfileId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+
+    pub fn parse(value: &str) -> Result<Self, uuid::Error> {
+        uuid::Uuid::parse_str(value).map(Self)
+    }
+}
+
+impl Default for ProfileId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for ProfileId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct SubscriptionUrl(url::Url);
@@ -78,6 +104,80 @@ impl SubscriptionUrl {
     pub fn expose(&self) -> &url::Url {
         &self.0
     }
+
+    #[must_use]
+    pub fn redacted(&self) -> String {
+        let mut output = self.0.origin().ascii_serialization();
+        if let Some(segments) = self.0.path_segments() {
+            for segment in segments {
+                output.push('/');
+                if is_token_like_path_segment(segment) {
+                    output.push_str("[redacted]");
+                } else {
+                    output.push_str(segment);
+                }
+            }
+        }
+        if let Some(query) = self.0.query() {
+            output.push('?');
+            for (index, pair) in query.split('&').enumerate() {
+                if index > 0 {
+                    output.push('&');
+                }
+                let (key, has_value) = pair
+                    .split_once('=')
+                    .map_or((pair, false), |(key, _)| (key, true));
+                if has_value && !is_token_like_path_segment(key) {
+                    output.push_str(key);
+                } else {
+                    output.push_str("[redacted]");
+                }
+                output.push_str("=[redacted]");
+            }
+        }
+        output
+    }
+}
+
+pub(crate) fn is_token_like_path_segment(segment: &str) -> bool {
+    let decoded = percent_encoding::percent_decode_str(segment).decode_utf8_lossy();
+    let normalized = decoded.to_ascii_lowercase();
+    ["token", "secret", "credential", "auth", "api-key", "apikey"]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+        || looks_like_encoded_secret(&decoded)
+}
+
+fn looks_like_encoded_secret(value: &str) -> bool {
+    let value = [".yaml", ".yml", ".txt"]
+        .iter()
+        .find_map(|suffix| value.strip_suffix(suffix))
+        .unwrap_or(value);
+    let jwt_parts = value.split('.').collect::<Vec<_>>();
+    if jwt_parts.len() == 3
+        && jwt_parts.iter().all(|part| {
+            part.len() >= 8
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+    {
+        return true;
+    }
+
+    if value.len() < 24
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'+' | b'=' | b'.')
+        })
+    {
+        return false;
+    }
+
+    let has_alpha = value.bytes().any(|byte| byte.is_ascii_alphabetic());
+    let has_digit = value.bytes().any(|byte| byte.is_ascii_digit());
+    let has_upper = value.bytes().any(|byte| byte.is_ascii_uppercase());
+    let has_lower = value.bytes().any(|byte| byte.is_ascii_lowercase());
+    (has_alpha && has_digit) || (has_upper && has_lower) || value.contains('=')
 }
 
 impl fmt::Debug for SubscriptionUrl {
@@ -121,15 +221,14 @@ impl NodeRecordId {
 }
 
 fn source_aware_node_id(source: &str, components: &[&str]) -> String {
-    components
-        .iter()
-        .fold(source.to_owned(), |mut id, component| {
-            id.push(':');
-            id.push_str(&component.len().to_string());
-            id.push(':');
-            id.push_str(component);
-            id
-        })
+    let mut canonical = b"hopash-node-v1\0".to_vec();
+    canonical.extend_from_slice(source.as_bytes());
+    canonical.push(0);
+    for component in components {
+        canonical.extend_from_slice(&(component.len() as u64).to_be_bytes());
+        canonical.extend_from_slice(component.as_bytes());
+    }
+    format!("node_v1_{}", crate::digest::sha256_hex(&canonical))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
