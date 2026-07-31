@@ -18,7 +18,7 @@ use hopash::ipc_runtime::{
     IpcClient, IpcServer, IpcServerConfig, IpcStreamBroker, SameUserPeerAuthorizer,
     StatusStreamUpdate,
 };
-use hopash::telemetry::{CoreLogRecord, LogLevel, LogSource};
+use hopash::telemetry::{CoreLogRecord, LogLevel, LogSource, LogTail};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -297,6 +297,60 @@ fn log_gap_recovers_through_tail_then_live_following_resumes() {
 
     drop(stale);
     drop(resumed);
+    server.shutdown().expect("server should stop cleanly");
+}
+
+#[test]
+fn authoritative_log_tail_resynchronizes_broker_history_and_followers() {
+    let socket = TempSocket::new("authoritative-log-resync");
+    let streams = broker(8);
+    streams
+        .publish_log(log_record(1, "old-1"))
+        .expect("the initial log should publish");
+    streams
+        .publish_log(log_record(2, "old-2"))
+        .expect("the initial log should publish");
+    let mut server = start_server(&socket, Arc::clone(&streams));
+    let client = IpcClient::new(socket.path());
+    let mut follower = client
+        .follow_logs(Some(2), 12)
+        .expect("the live follower should connect");
+
+    streams
+        .synchronize_log_tail(LogTail {
+            records: vec![log_record(10, "new-10"), log_record(11, "new-11")],
+            dropped_total: 8,
+            gap: true,
+            earliest_sequence: Some(10),
+            latest_sequence: Some(11),
+        })
+        .expect("the authoritative tail should replace broker history");
+
+    assert_eq!(
+        follower
+            .next_item()
+            .expect("the gap frame should be valid")
+            .expect("the gap frame should exist")
+            .item,
+        LogStreamItem::Gap {
+            after_sequence: Some(2),
+            latest_sequence: 11,
+        }
+    );
+    let tail = client
+        .log_tail(Some(2))
+        .expect("the replacement tail should load");
+    assert_eq!(tail.dropped_total, 8);
+    assert!(tail.gap);
+    assert_eq!(
+        tail.records
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>(),
+        [10, 11]
+    );
+
+    drop(follower);
     server.shutdown().expect("server should stop cleanly");
 }
 

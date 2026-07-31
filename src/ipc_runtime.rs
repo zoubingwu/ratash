@@ -29,8 +29,9 @@ use crate::application::{
     RuntimeApplyStatus, SelectorCandidate, SelectorIdentity, SelectorKind,
 };
 use crate::constants::{
-    CORE_LOG_LINE_MAX_BYTES, IPC_FRAME_MAX_BYTES, IPC_REQUEST_TIMEOUT, LOG_CAPACITY,
-    LOG_SUBSCRIBER_CAPACITY, STATUS_SUBSCRIBER_CAPACITY,
+    CORE_LOG_LINE_MAX_BYTES, IPC_FRAME_MAX_BYTES, IPC_PROFILE_ADD_TIMEOUT, IPC_REQUEST_TIMEOUT,
+    IPC_RUNTIME_MUTATION_TIMEOUT, LOG_CAPACITY, LOG_SUBSCRIBER_CAPACITY,
+    STATUS_SUBSCRIBER_CAPACITY,
 };
 use crate::domain::{
     ActiveProfileSummary, ApplyState, CoreInstanceGeneration, CoreLifecycle, CoreStatus,
@@ -49,7 +50,7 @@ use crate::ipc::{
     StatusStreamItem, StatusSubscriber, StatusSubscriptionPayload, bind_private_listener,
     read_frame, write_frame,
 };
-use crate::telemetry::CoreLogRecord;
+use crate::telemetry::{CoreLogRecord, LogTail};
 
 use crate::unix_io::DeadlineUnixStream;
 
@@ -63,14 +64,25 @@ const DEFAULT_PENDING_CONNECTIONS: usize = 32;
 pub struct IpcClient {
     socket_path: PathBuf,
     connect_timeout: Duration,
-    io_timeout: Duration,
+    timeout_policy: IpcTimeoutPolicy,
     next_request_id: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum IpcTimeoutPolicy {
+    Product,
+    Fixed(Duration),
 }
 
 impl IpcClient {
     #[must_use]
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
-        Self::with_timeouts(socket_path, IPC_REQUEST_TIMEOUT, IPC_REQUEST_TIMEOUT)
+        Self {
+            socket_path: socket_path.into(),
+            connect_timeout: IPC_REQUEST_TIMEOUT,
+            timeout_policy: IpcTimeoutPolicy::Product,
+            next_request_id: AtomicU64::new(1),
+        }
     }
 
     #[must_use]
@@ -82,7 +94,7 @@ impl IpcClient {
         Self {
             socket_path: socket_path.into(),
             connect_timeout,
-            io_timeout,
+            timeout_policy: IpcTimeoutPolicy::Fixed(io_timeout),
             next_request_id: AtomicU64::new(1),
         }
     }
@@ -97,7 +109,7 @@ impl IpcClient {
     }
 
     fn connect(&self) -> io::Result<UnixStream> {
-        if self.connect_timeout.is_zero() || self.io_timeout.is_zero() {
+        if self.connect_timeout.is_zero() || self.stream_timeout().is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "IPC deadlines must be positive",
@@ -108,6 +120,27 @@ impl IpcClient {
         socket.connect_timeout(&address, self.connect_timeout)?;
         let stream = UnixStream::from(socket);
         Ok(stream)
+    }
+
+    fn stream_timeout(&self) -> Duration {
+        match self.timeout_policy {
+            IpcTimeoutPolicy::Product => IPC_REQUEST_TIMEOUT,
+            IpcTimeoutPolicy::Fixed(timeout) => timeout,
+        }
+    }
+
+    fn response_timeout(&self, operation: &ApplicationOperation) -> Duration {
+        match self.timeout_policy {
+            IpcTimeoutPolicy::Fixed(timeout) => timeout,
+            IpcTimeoutPolicy::Product => match operation {
+                ApplicationOperation::ProfileAdd { .. } => IPC_PROFILE_ADD_TIMEOUT,
+                ApplicationOperation::ProfileUse { .. }
+                | ApplicationOperation::RuleAdd { .. }
+                | ApplicationOperation::RuleReplace { .. }
+                | ApplicationOperation::RuleRemove { .. } => IPC_RUNTIME_MUTATION_TIMEOUT,
+                _ => IPC_REQUEST_TIMEOUT,
+            },
+        }
     }
 
     pub fn subscribe_status(
@@ -150,7 +183,8 @@ impl IpcClient {
             RequestOperation::LogTail(LogTailPayload { after_sequence }),
         );
         let stream = self.connect().map_err(connect_error)?;
-        let mut stream = DeadlineUnixStream::new(stream, self.io_timeout).map_err(connect_error)?;
+        let mut stream =
+            DeadlineUnixStream::new(stream, self.stream_timeout()).map_err(connect_error)?;
         stream.begin_write().map_err(connect_error)?;
         write_frame(&mut stream, &request).map_err(write_error)?;
         stream.begin_read().map_err(connect_error)?;
@@ -183,7 +217,8 @@ impl IpcClient {
                 .try_clone()
                 .map_err(|_| connect_error(io::Error::other("IPC stream clone failed")))?,
         );
-        let mut stream = DeadlineUnixStream::new(stream, self.io_timeout).map_err(connect_error)?;
+        let mut stream =
+            DeadlineUnixStream::new(stream, self.stream_timeout()).map_err(connect_error)?;
         stream.begin_write().map_err(connect_error)?;
         write_frame(&mut stream, &request).map_err(write_error)?;
         Ok(StreamTransport {
@@ -739,6 +774,33 @@ impl IpcStreamBroker {
         Ok(())
     }
 
+    pub fn synchronize_log_tail(&self, tail: LogTail) -> Result<(), StreamBrokerError> {
+        validate_log_tail(&tail)?;
+        let mut state = self
+            .logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.subscribers.retain(|subscriber| {
+            let Some(subscriber) = subscriber.upgrade() else {
+                return false;
+            };
+            for record in &tail.records {
+                subscriber.publish(record);
+            }
+            true
+        });
+        let truncated = tail.records.len().saturating_sub(state.capacity);
+        state.records = tail
+            .records
+            .into_iter()
+            .skip(truncated)
+            .collect::<std::collections::VecDeque<_>>();
+        state.dropped_total = tail
+            .dropped_total
+            .saturating_add(u64::try_from(truncated).unwrap_or(u64::MAX));
+        Ok(())
+    }
+
     fn subscribe_status(&self) -> (StatusStreamItem, Arc<StatusSubscription>) {
         let mut state = self
             .status
@@ -857,6 +919,34 @@ impl IpcStreamBroker {
     }
 }
 
+fn validate_log_tail(tail: &LogTail) -> Result<(), StreamBrokerError> {
+    let mut previous: Option<u64> = None;
+    for record in &tail.records {
+        if record.message().len() > CORE_LOG_LINE_MAX_BYTES {
+            return Err(StreamBrokerError::ItemTooLarge);
+        }
+        ensure_stream_item_size(&crate::ipc::LogRecordV1::from(record))?;
+        if let Some(previous) = previous {
+            let expected = previous
+                .checked_add(1)
+                .ok_or(StreamBrokerError::SequenceExhausted)?;
+            if record.sequence() != expected {
+                return Err(StreamBrokerError::LogSequence {
+                    expected,
+                    actual: record.sequence(),
+                });
+            }
+        }
+        previous = Some(record.sequence());
+    }
+    if let Some(last) = previous
+        && tail.latest_sequence != Some(last)
+    {
+        return Err(StreamBrokerError::Encoding);
+    }
+    Ok(())
+}
+
 impl fmt::Debug for IpcStreamBroker {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -965,7 +1055,7 @@ impl fmt::Debug for IpcClient {
             .debug_struct("IpcClient")
             .field("socket_path", &"[REDACTED]")
             .field("connect_timeout", &self.connect_timeout)
-            .field("io_timeout", &self.io_timeout)
+            .field("timeout_policy", &self.timeout_policy)
             .finish_non_exhaustive()
     }
 }
@@ -976,10 +1066,12 @@ impl ApplicationClient for IpcClient {
         operation: ApplicationOperation,
     ) -> Result<ApplicationOutput, ApplicationError> {
         let expected_output = ExpectedOutput::for_operation(&operation);
+        let response_timeout = self.response_timeout(&operation);
         let request_id = self.request_id();
         let request = IpcRequest::new(request_id, request_operation(operation));
         let stream = self.connect().map_err(connect_error)?;
-        let mut stream = DeadlineUnixStream::new(stream, self.io_timeout).map_err(connect_error)?;
+        let mut stream =
+            DeadlineUnixStream::new(stream, response_timeout).map_err(connect_error)?;
         stream.begin_write().map_err(connect_error)?;
         write_frame(&mut stream, &request).map_err(write_error)?;
         stream.begin_read().map_err(connect_error)?;
@@ -3282,5 +3374,57 @@ impl From<WireStreamState> for StreamState {
             WireStreamState::Stale => Self::Stale,
             WireStreamState::Degraded => Self::Degraded,
         }
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    use crate::constants::{
+        CORE_HEALTH_TIMEOUT, CORE_READINESS_TIMEOUT, MIHOMO_VALIDATION_TIMEOUT,
+        PROFILE_TOTAL_TIMEOUT,
+    };
+
+    #[test]
+    fn product_client_covers_the_complete_bounded_mutation_path() {
+        let client = IpcClient::new("/tmp/hopash-timeout-contract.sock");
+        let profile_add = ApplicationOperation::ProfileAdd {
+            subscription_url: SubscriptionUrl::parse("https://example.test/profile.yaml")
+                .expect("the fixture URL should be valid"),
+        };
+        let minimum_profile_add = PROFILE_TOTAL_TIMEOUT
+            .saturating_add(MIHOMO_VALIDATION_TIMEOUT)
+            .saturating_add(CORE_READINESS_TIMEOUT)
+            .saturating_add(CORE_HEALTH_TIMEOUT);
+        assert!(client.response_timeout(&profile_add) > minimum_profile_add);
+
+        let rule_add = ApplicationOperation::RuleAdd {
+            rule: "MATCH,DIRECT".to_owned(),
+            placement: ApplicationRulePlacement::Append,
+        };
+        let minimum_runtime_mutation = MIHOMO_VALIDATION_TIMEOUT
+            .saturating_add(CORE_READINESS_TIMEOUT)
+            .saturating_add(CORE_HEALTH_TIMEOUT);
+        assert!(client.response_timeout(&rule_add) > minimum_runtime_mutation);
+        assert_eq!(
+            client.response_timeout(&ApplicationOperation::GetStatus),
+            IPC_REQUEST_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn explicit_test_timeouts_remain_exact_for_every_operation() {
+        let timeout = Duration::from_millis(7);
+        let client = IpcClient::with_timeouts(
+            "/tmp/hopash-fixed-timeout.sock",
+            Duration::from_millis(5),
+            timeout,
+        );
+        let operation = ApplicationOperation::ProfileAdd {
+            subscription_url: SubscriptionUrl::parse("https://example.test/profile.yaml")
+                .expect("the fixture URL should be valid"),
+        };
+        assert_eq!(client.response_timeout(&operation), timeout);
+        assert_eq!(client.stream_timeout(), timeout);
     }
 }

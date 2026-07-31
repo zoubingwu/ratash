@@ -32,6 +32,8 @@ pub const STREAM_STALE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 pub const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(10);
 pub const IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub const IPC_RUNTIME_MUTATION_TIMEOUT: Duration = Duration::from_secs(40);
+pub const IPC_PROFILE_ADD_TIMEOUT: Duration = Duration::from_secs(65);
 
 pub const LOG_CAPACITY: usize = 10_000;
 pub const LOG_SUBSCRIBER_CAPACITY: usize = 256;
