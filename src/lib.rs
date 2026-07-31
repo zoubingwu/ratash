@@ -16,6 +16,7 @@ pub mod mihomo;
 pub mod persistence;
 pub mod profile;
 pub mod profile_source;
+pub mod process_controller;
 pub mod rule;
 pub mod runtime_bundle;
 pub mod scheduler;

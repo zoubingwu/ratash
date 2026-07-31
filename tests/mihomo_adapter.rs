@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
@@ -236,6 +236,78 @@ fn json_response(status: &str, body: &[u8]) -> Vec<u8> {
 fn adapter() -> UnixMihomoAdapter {
     UnixMihomoAdapter::new(MihomoAdapterConfig::default())
         .expect("default Mihomo adapter configuration should be valid")
+}
+
+#[test]
+fn configuration_reload_uses_the_pinned_force_endpoint_and_strict_statuses() {
+    let configuration_path = "/tmp/hopash-runtime/config.yaml";
+    let success: Handler = Box::new(move |mut stream| {
+        let request = read_request(&stream);
+        assert_request(&request, "PUT", "/configs?force=true", SECRET);
+        assert_eq!(
+            request.headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("reload request body should be JSON"),
+            serde_json::json!({"path": configuration_path})
+        );
+        stream
+            .write_all(&response("204 No Content", None, b""))
+            .expect("reload response should be written");
+        finish_http_response(&mut stream);
+    });
+    let fixture = UnixFixture::new(
+        "reload",
+        vec![
+            success,
+            handler(
+                "PUT",
+                "/configs?force=true",
+                SECRET,
+                json_response("400 Bad Request", b"{}"),
+            ),
+            handler(
+                "PUT",
+                "/configs?force=true",
+                SECRET,
+                json_response("503 Service Unavailable", b"{}"),
+            ),
+        ],
+    );
+    let endpoint = fixture.endpoint(SECRET);
+    let adapter = adapter();
+
+    adapter
+        .reload_configuration(&endpoint, Path::new(configuration_path))
+        .expect("configuration reload should succeed");
+    assert_eq!(
+        adapter
+            .reload_configuration(&endpoint, Path::new(configuration_path))
+            .expect_err("a rejected reload should fail")
+            .kind,
+        MihomoErrorKind::InvalidResponse
+    );
+    assert_eq!(
+        adapter
+            .reload_configuration(&endpoint, Path::new(configuration_path))
+            .expect_err("an unavailable reload endpoint should fail")
+            .kind,
+        MihomoErrorKind::Unavailable
+    );
+    fixture.finish();
+
+    assert_eq!(
+        adapter
+            .reload_configuration(
+                &CoreControlEndpoint::new("/tmp/missing.sock", SECRET),
+                Path::new("relative.yaml"),
+            )
+            .expect_err("a relative configuration path should fail before I/O")
+            .kind,
+        MihomoErrorKind::InvalidResponse
+    );
 }
 
 #[test]

@@ -2,6 +2,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use mio::net::UnixStream as MioUnixStream;
@@ -106,6 +107,35 @@ impl UnixMihomoAdapter {
             }
         }
         Ok(Self { config })
+    }
+
+    pub fn reload_configuration(
+        &self,
+        endpoint: &CoreControlEndpoint,
+        configuration_path: &Path,
+    ) -> Result<(), MihomoError> {
+        #[derive(Serialize)]
+        struct ReloadBody<'a> {
+            path: &'a str,
+        }
+
+        let path = configuration_path
+            .to_str()
+            .ok_or_else(|| invalid_response("Mihomo configuration path is not valid UTF-8"))?;
+        if !configuration_path.is_absolute() {
+            return Err(invalid_response(
+                "Mihomo configuration path is not absolute",
+            ));
+        }
+        let body = serde_json::to_vec(&ReloadBody { path })
+            .map_err(|_| invalid_response("Mihomo reload request encoding failed"))?;
+        let response = self.request(endpoint, HttpMethod::Put, "/configs?force=true", &body)?;
+        match response.head.status {
+            204 if response.body.is_empty() => Ok(()),
+            401 | 403 => Err(unauthorized("Mihomo reload authorization failed")),
+            500..=599 => Err(unavailable("Mihomo reload endpoint is unavailable")),
+            _ => Err(invalid_response("Mihomo reload response is invalid")),
+        }
     }
 
     fn request(
