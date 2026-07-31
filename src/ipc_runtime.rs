@@ -13,6 +13,8 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use mio::net::UnixListener as MioUnixListener;
+use mio::{Events, Interest, Poll, Token, Waker};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, SockAddr, Socket, Type};
 
@@ -54,9 +56,10 @@ use crate::telemetry::{CoreLogRecord, LogTail};
 
 use crate::unix_io::DeadlineUnixStream;
 
-const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DEFAULT_SERVER_WORKERS: usize = 4;
 const DEFAULT_PENDING_CONNECTIONS: usize = 32;
+const LISTENER_TOKEN: Token = Token(0);
+const SHUTDOWN_TOKEN: Token = Token(1);
 // -----------------------------------------------------------------------------
 // Synchronous client
 // -----------------------------------------------------------------------------
@@ -1458,12 +1461,33 @@ struct SocketIdentity {
     inode: u64,
 }
 
+#[derive(Clone, Default)]
+struct AcceptLoopMetrics {
+    #[cfg(test)]
+    poll_returns: Arc<AtomicUsize>,
+}
+
+impl AcceptLoopMetrics {
+    fn record_poll_return(&self) {
+        #[cfg(test)]
+        self.poll_returns.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn poll_returns(&self) -> usize {
+        self.poll_returns.load(Ordering::Relaxed)
+    }
+}
+
 pub struct IpcServer {
     socket_path: PathBuf,
     socket_identity: SocketIdentity,
     shutdown: Arc<AtomicBool>,
+    waker: Arc<Waker>,
     streams: Option<Arc<IpcStreamBroker>>,
     thread: Option<JoinHandle<io::Result<()>>>,
+    #[cfg(test)]
+    accept_metrics: AcceptLoopMetrics,
 }
 
 impl IpcServer {
@@ -1520,26 +1544,34 @@ impl IpcServer {
             device: metadata.dev(),
             inode: metadata.ino(),
         };
-        if let Err(error) = listener.set_nonblocking(true) {
-            drop(listener);
-            let _ = cleanup_socket(&socket_path, socket_identity);
-            return Err(error);
-        }
+        let (listener, poll, waker) = match prepare_accept_loop(listener) {
+            Ok(parts) => parts,
+            Err(error) => {
+                let _ = cleanup_socket(&socket_path, socket_identity);
+                return Err(error);
+            }
+        };
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
         let application: Arc<dyn ApplicationClient + Send + Sync> = application;
         let authorizer: Arc<dyn PeerAuthorizer> = authorizer;
         let thread_streams = streams.clone();
+        let accept_metrics = AcceptLoopMetrics::default();
+        let thread_accept_metrics = accept_metrics.clone();
         let thread = match thread::Builder::new()
             .name("hopash-ipc-accept".to_owned())
             .spawn(move || {
                 run_server(
                     listener,
-                    application,
-                    authorizer,
-                    thread_streams,
-                    config,
-                    thread_shutdown,
+                    poll,
+                    ServerRunContext {
+                        application,
+                        authorizer,
+                        streams: thread_streams,
+                        config,
+                        shutdown: thread_shutdown,
+                        accept_metrics: thread_accept_metrics,
+                    },
                 )
             }) {
             Ok(thread) => thread,
@@ -1552,8 +1584,11 @@ impl IpcServer {
             socket_path,
             socket_identity,
             shutdown,
+            waker,
             streams,
             thread: Some(thread),
+            #[cfg(test)]
+            accept_metrics,
         })
     }
 
@@ -1562,13 +1597,17 @@ impl IpcServer {
         if let Some(streams) = &self.streams {
             streams.notify_all();
         }
+        let wake_result = match self.thread.as_ref() {
+            Some(thread) if !thread.is_finished() => self.waker.wake(),
+            Some(_) | None => Ok(()),
+        };
         let thread_result = self.thread.take().map_or(Ok(()), |thread| {
             thread
                 .join()
                 .map_err(|_| io::Error::other("IPC server thread panicked"))?
         });
         let cleanup_result = cleanup_socket(&self.socket_path, self.socket_identity);
-        thread_result.and(cleanup_result)
+        wake_result.and(thread_result).and(cleanup_result)
     }
 }
 
@@ -1588,6 +1627,16 @@ impl Drop for IpcServer {
     }
 }
 
+fn prepare_accept_loop(listener: UnixListener) -> io::Result<(MioUnixListener, Poll, Arc<Waker>)> {
+    listener.set_nonblocking(true)?;
+    let mut listener = MioUnixListener::from_std(listener);
+    let poll = Poll::new()?;
+    poll.registry()
+        .register(&mut listener, LISTENER_TOKEN, Interest::READABLE)?;
+    let waker = Arc::new(Waker::new(poll.registry(), SHUTDOWN_TOKEN)?);
+    Ok((listener, poll, waker))
+}
+
 fn validate_server_config(config: &IpcServerConfig) -> io::Result<()> {
     if config.io_timeout.is_zero()
         || config.worker_count == 0
@@ -1601,14 +1650,28 @@ fn validate_server_config(config: &IpcServerConfig) -> io::Result<()> {
     Ok(())
 }
 
-fn run_server(
-    listener: UnixListener,
+struct ServerRunContext {
     application: Arc<dyn ApplicationClient + Send + Sync>,
     authorizer: Arc<dyn PeerAuthorizer>,
     streams: Option<Arc<IpcStreamBroker>>,
     config: IpcServerConfig,
     shutdown: Arc<AtomicBool>,
+    accept_metrics: AcceptLoopMetrics,
+}
+
+fn run_server(
+    listener: MioUnixListener,
+    mut poll: Poll,
+    context: ServerRunContext,
 ) -> io::Result<()> {
+    let ServerRunContext {
+        application,
+        authorizer,
+        streams,
+        config,
+        shutdown,
+        accept_metrics,
+    } = context;
     let (sender, receiver) = mpsc::sync_channel(config.pending_connection_capacity);
     let receiver = Arc::new(Mutex::new(receiver));
     let active_streams = Arc::new(AtomicUsize::new(0));
@@ -1623,7 +1686,14 @@ fn run_server(
     };
     let workers = spawn_workers(config.worker_count, Arc::clone(&receiver), workers_context)?;
 
-    let accept_result = accept_loop(&listener, &authorizer, &sender, &shutdown);
+    let accept_result = accept_loop(
+        &listener,
+        &mut poll,
+        &authorizer,
+        &sender,
+        &shutdown,
+        &accept_metrics,
+    );
     drop(sender);
     let mut worker_panicked = false;
     for worker in workers {
@@ -1685,14 +1755,49 @@ fn worker_loop(receiver: Arc<Mutex<Receiver<UnixStream>>>, context: WorkerContex
 }
 
 fn accept_loop(
-    listener: &UnixListener,
+    listener: &MioUnixListener,
+    poll: &mut Poll,
+    authorizer: &Arc<dyn PeerAuthorizer>,
+    sender: &SyncSender<UnixStream>,
+    shutdown: &AtomicBool,
+    metrics: &AcceptLoopMetrics,
+) -> io::Result<()> {
+    let mut events = Events::with_capacity(4);
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        events.clear();
+        match poll.poll(&mut events, None) {
+            Ok(()) => metrics.record_poll_return(),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+        if shutdown.load(Ordering::Acquire)
+            || events.iter().any(|event| event.token() == SHUTDOWN_TOKEN)
+        {
+            return Ok(());
+        }
+        if events.iter().any(|event| event.token() == LISTENER_TOKEN) {
+            accept_ready_connections(listener, authorizer, sender, shutdown)?;
+        }
+    }
+}
+
+fn accept_ready_connections(
+    listener: &MioUnixListener,
     authorizer: &Arc<dyn PeerAuthorizer>,
     sender: &SyncSender<UnixStream>,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
-    while !shutdown.load(Ordering::Acquire) {
+    loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                let stream = UnixStream::from(stream);
+                if shutdown.load(Ordering::Acquire) {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    return Ok(());
+                }
                 if authorizer.authorize(&stream).is_err() {
                     let _ = stream.shutdown(Shutdown::Both);
                     continue;
@@ -1704,14 +1809,11 @@ fn accept_loop(
                     }
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::park_timeout(SERVER_POLL_INTERVAL);
-            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
         }
     }
-    Ok(())
 }
 
 fn handle_connection(
@@ -3389,6 +3491,33 @@ mod timeout_tests {
         PROFILE_TOTAL_TIMEOUT,
     };
 
+    struct IdleAuthorizer {
+        calls: AtomicUsize,
+    }
+
+    impl PeerAuthorizer for IdleAuthorizer {
+        fn authorize(&self, _peer: &UnixStream) -> Result<(), PeerAuthorizationError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    struct IdleApplication {
+        calls: AtomicUsize,
+    }
+
+    impl ApplicationClient for IdleApplication {
+        fn execute(
+            &self,
+            _operation: ApplicationOperation,
+        ) -> Result<ApplicationOutput, ApplicationError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ApplicationOutput::Status(
+                crate::application::ApplicationService::new().status(),
+            ))
+        }
+    }
+
     #[test]
     fn product_client_covers_the_complete_bounded_mutation_path() {
         let client = IpcClient::new("/tmp/hopash-timeout-contract.sock");
@@ -3430,5 +3559,48 @@ mod timeout_tests {
         };
         assert_eq!(client.response_timeout(&operation), timeout);
         assert_eq!(client.stream_timeout(), timeout);
+    }
+
+    #[test]
+    fn idle_server_blocks_without_periodic_wakes_and_shutdown_bypasses_handlers() {
+        let root = PathBuf::from("/tmp").join(format!(
+            "hopash-idle-ipc-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let socket = root.join("supervisor.sock");
+        let application = Arc::new(IdleApplication {
+            calls: AtomicUsize::new(0),
+        });
+        let authorizer = Arc::new(IdleAuthorizer {
+            calls: AtomicUsize::new(0),
+        });
+        let mut server = IpcServer::start(
+            &socket,
+            Arc::clone(&application),
+            Arc::clone(&authorizer),
+            IpcServerConfig {
+                io_timeout: Duration::from_millis(100),
+                worker_count: 1,
+                pending_connection_capacity: 1,
+            },
+        )
+        .expect("the idle fixture server should start");
+
+        thread::sleep(Duration::from_millis(75));
+        assert_eq!(server.accept_metrics.poll_returns(), 0);
+        assert_eq!(authorizer.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(application.calls.load(Ordering::Relaxed), 0);
+        let started = std::time::Instant::now();
+        server
+            .shutdown()
+            .expect("the idle fixture server should stop");
+
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(server.accept_metrics.poll_returns(), 1);
+        assert_eq!(authorizer.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(application.calls.load(Ordering::Relaxed), 0);
+        assert!(!socket.exists());
+        let _ = fs::remove_dir(&root);
     }
 }
