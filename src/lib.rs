@@ -11,6 +11,7 @@ pub mod domain;
 pub mod error;
 pub mod persistence;
 pub mod profile;
+pub mod profile_source;
 pub mod rule;
 pub mod scheduler;
 pub mod telemetry;

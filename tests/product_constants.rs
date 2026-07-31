@@ -4,6 +4,11 @@ use hopash::constants::*;
 fn observable_product_limits_are_frozen_for_the_release_contract() {
     assert_eq!(PROFILE_REFRESH_INTERVAL.as_secs(), 21_600);
     assert_eq!(PROFILE_REFRESH_CONCURRENCY, 2);
+    assert_eq!(PROFILE_CONNECT_TIMEOUT.as_secs(), 5);
+    assert_eq!(PROFILE_REQUEST_TIMEOUT.as_secs(), 10);
+    assert_eq!(PROFILE_TOTAL_TIMEOUT.as_secs(), 30);
+    assert_eq!(PROFILE_REDIRECT_LIMIT, 5);
+    assert_eq!(PROFILE_METADATA_NAME_MAX_BYTES, 80);
     assert_eq!(PROBE_WORKER_COUNT, 16);
     assert_eq!(PROBE_INTERVAL.as_secs(), 300);
     assert_eq!(PROBE_TIMEOUT.as_secs(), 5);

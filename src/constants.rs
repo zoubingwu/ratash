@@ -2,6 +2,11 @@ use std::time::Duration;
 
 pub const PROFILE_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 pub const PROFILE_REFRESH_CONCURRENCY: usize = 2;
+pub const PROFILE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const PROFILE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub const PROFILE_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+pub const PROFILE_REDIRECT_LIMIT: usize = 5;
+pub const PROFILE_METADATA_NAME_MAX_BYTES: usize = 80;
 
 pub const CORE_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CORE_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
