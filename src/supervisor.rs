@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Condvar;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 
 use crate::application::{
@@ -469,8 +471,70 @@ struct SupervisorState {
     stream_health: StreamHealthSet,
     cached_proxy_view: Option<ProxyView>,
     selection_restore_pending: bool,
-    apply_state: ApplyState,
     degraded: bool,
+}
+
+#[derive(Default)]
+struct ActivationQueue {
+    running: bool,
+    pending: Option<PendingActivation>,
+}
+
+impl ActivationQueue {
+    fn enqueue(&mut self, selector: &str) -> Arc<ActivationCompletion> {
+        let completion = Arc::new(ActivationCompletion::default());
+        if let Some(superseded) = self.pending.replace(PendingActivation {
+            selector: selector.to_owned(),
+            completion: Arc::clone(&completion),
+        }) {
+            superseded.completion.complete(Err(ApplicationError::new(
+                ErrorCode::OperationUnavailable,
+                "Profile activation was superseded by a newer request",
+                true,
+            )));
+        }
+        completion
+    }
+}
+
+struct PendingActivation {
+    selector: String,
+    completion: Arc<ActivationCompletion>,
+}
+
+#[derive(Default)]
+struct ActivationCompletion {
+    result: Mutex<Option<Result<ApplicationOutput, ApplicationError>>>,
+    ready: Condvar,
+}
+
+struct ApplyActivity<'a> {
+    in_progress: &'a AtomicBool,
+}
+
+impl Drop for ApplyActivity<'_> {
+    fn drop(&mut self) {
+        self.in_progress.store(false, Ordering::Release);
+    }
+}
+
+impl ActivationCompletion {
+    fn complete(&self, result: Result<ApplicationOutput, ApplicationError>) {
+        let mut slot = self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(result);
+        self.ready.notify_one();
+    }
+
+    fn wait(&self) -> Result<ApplicationOutput, ApplicationError> {
+        let mut slot = self.result.lock().map_err(|_| internal_error())?;
+        while slot.is_none() {
+            slot = self.ready.wait(slot).map_err(|_| internal_error())?;
+        }
+        slot.take().ok_or_else(internal_error)?
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -504,6 +568,9 @@ pub struct Supervisor {
     authoritative: AuthoritativeConfig,
     staging_root: PathBuf,
     state: Mutex<SupervisorState>,
+    activation: Mutex<ActivationQueue>,
+    apply_in_progress: AtomicBool,
+    last_status: Mutex<StatusSnapshot>,
 }
 
 impl Supervisor {
@@ -570,6 +637,8 @@ impl Supervisor {
             current_revisions(&profiles, &local_rules, effective_configuration.as_ref());
         dependencies.transactions.set_current_revisions(revisions);
         let started_at_unix_ms = dependencies.clock.now_unix_ms();
+        let initial_status =
+            initial_status_snapshot(started_at_unix_ms, &profiles, runtime_generation);
         Ok(Self {
             clock: dependencies.clock,
             started_at_unix_ms,
@@ -593,9 +662,11 @@ impl Supervisor {
                 stream_health: disconnected_stream_health(),
                 cached_proxy_view: None,
                 selection_restore_pending: false,
-                apply_state: ApplyState::Idle,
                 degraded: false,
             }),
+            activation: Mutex::new(ActivationQueue::default()),
+            apply_in_progress: AtomicBool::new(false),
+            last_status: Mutex::new(initial_status),
         })
     }
 
@@ -682,7 +753,7 @@ impl Supervisor {
                 }
             };
             let generation = next_runtime_generation(state.runtime_generation)?;
-            state.apply_state = ApplyState::Applying;
+            let _apply = self.begin_apply();
             let result = self.apply_candidate(
                 &profiles,
                 &state.local_rules,
@@ -690,7 +761,6 @@ impl Supervisor {
                 generation,
                 false,
             );
-            state.apply_state = ApplyState::Idle;
             if let Err(error) = settle_transaction(&mut state, result) {
                 drop(state);
                 self.record_refresh_failure(
@@ -898,8 +968,35 @@ impl Supervisor {
     }
 
     fn status(&self) -> Result<StatusSnapshot, ApplicationError> {
-        let managed_core = self.managed_core().ok().flatten();
-        let mut state = self.state.lock().map_err(|_| internal_error())?;
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => {
+                let mut status = self
+                    .last_status
+                    .lock()
+                    .map_err(|_| internal_error())?
+                    .clone();
+                status.supervisor.uptime_seconds = self
+                    .clock
+                    .now_unix_ms()
+                    .saturating_sub(self.started_at_unix_ms)
+                    / 1_000;
+                status.apply_state = self.current_apply_state();
+                return Ok(status);
+            }
+            Err(TryLockError::Poisoned(_)) => return Err(internal_error()),
+        };
+        let managed_core = if state.profiles.active_profile_id().is_none() {
+            None
+        } else {
+            self.core
+                .runtime_status()
+                .ok()
+                .and_then(|status| status.managed_core)
+        };
+        if let Some(core) = &managed_core {
+            ensure_telemetry(&mut state, core.instance_generation)?;
+        }
         let uptime_seconds = self
             .clock
             .now_unix_ms()
@@ -934,7 +1031,7 @@ impl Supervisor {
             .unwrap_or_default();
         let zero_profile = active_profile_id.is_none();
         let core_ready = managed_core.is_some();
-        Ok(StatusSnapshot {
+        let status = StatusSnapshot {
             supervisor: SupervisorStatus {
                 lifecycle: if state.degraded {
                     SupervisorLifecycle::Degraded
@@ -976,9 +1073,26 @@ impl Supervisor {
             traffic,
             connection_count,
             runtime_generation: state.runtime_generation,
-            apply_state: state.apply_state,
+            apply_state: self.current_apply_state(),
             stream_health: state.stream_health.clone(),
-        })
+        };
+        *self.last_status.lock().map_err(|_| internal_error())? = status.clone();
+        Ok(status)
+    }
+
+    fn begin_apply(&self) -> ApplyActivity<'_> {
+        self.apply_in_progress.store(true, Ordering::Release);
+        ApplyActivity {
+            in_progress: &self.apply_in_progress,
+        }
+    }
+
+    fn current_apply_state(&self) -> ApplyState {
+        if self.apply_in_progress.load(Ordering::Acquire) {
+            ApplyState::Applying
+        } else {
+            ApplyState::Idle
+        }
     }
 
     fn profile_add(
@@ -1050,10 +1164,9 @@ impl Supervisor {
             let strings = rule_strings(&local_rules)?;
             let configuration = self.compile(profile, &strings)?;
             let generation = RuntimeGeneration(1);
-            state.apply_state = ApplyState::Applying;
+            let _apply = self.begin_apply();
             let result =
                 self.apply_candidate(&profiles, &local_rules, &configuration, generation, false);
-            state.apply_state = ApplyState::Idle;
             let success = settle_transaction(&mut state, result)?;
             state.profiles = profiles;
             state.local_rules = local_rules;
@@ -1106,6 +1219,47 @@ impl Supervisor {
     }
 
     fn profile_use(&self, selector: &str) -> Result<ApplicationOutput, ApplicationError> {
+        let completion = {
+            let mut queue = self
+                .activation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if queue.running {
+                Some(queue.enqueue(selector))
+            } else {
+                queue.running = true;
+                None
+            }
+        };
+        if let Some(completion) = completion {
+            return completion.wait();
+        }
+
+        let initial_result = self.activate_profile_once(selector);
+        loop {
+            let next = {
+                let mut queue = self
+                    .activation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match queue.pending.take() {
+                    Some(pending) => Some(pending),
+                    None => {
+                        queue.running = false;
+                        None
+                    }
+                }
+            };
+            let Some(next) = next else {
+                break;
+            };
+            let result = self.activate_profile_once(&next.selector);
+            next.completion.complete(result);
+        }
+        initial_result
+    }
+
+    fn activate_profile_once(&self, selector: &str) -> Result<ApplicationOutput, ApplicationError> {
         let mut state = self.state.lock().map_err(|_| internal_error())?;
         let profile_id = resolve_profile(&state.profiles, selector)?;
         if state.profiles.active_profile_id() == Some(profile_id) {
@@ -1124,7 +1278,7 @@ impl Supervisor {
         let rules = rule_strings(&state.local_rules)?;
         let configuration = self.compile(profile, &rules)?;
         let generation = next_runtime_generation(state.runtime_generation)?;
-        state.apply_state = ApplyState::Applying;
+        let _apply = self.begin_apply();
         let result = self.apply_candidate(
             &profiles,
             &state.local_rules,
@@ -1132,7 +1286,6 @@ impl Supervisor {
             generation,
             false,
         );
-        state.apply_state = ApplyState::Idle;
         let success = settle_transaction(&mut state, result)?;
         state.profiles = profiles;
         state.effective_configuration = Some(configuration);
@@ -1386,7 +1539,7 @@ impl Supervisor {
         let rules = rule_strings(&local_rules)?;
         let configuration = self.compile(active, &rules)?;
         let generation = next_runtime_generation(state.runtime_generation)?;
-        state.apply_state = ApplyState::Applying;
+        let _apply = self.begin_apply();
         let result = self.apply_candidate(
             &state.profiles,
             &local_rules,
@@ -1394,7 +1547,6 @@ impl Supervisor {
             generation,
             true,
         );
-        state.apply_state = ApplyState::Idle;
         let success = settle_transaction(&mut state, result)?;
         state.local_rules = local_rules;
         state.effective_configuration = Some(configuration);
@@ -2302,6 +2454,56 @@ fn runtime_apply_not_required(generation: Option<RuntimeGeneration>) -> RuntimeA
     }
 }
 
+fn initial_status_snapshot(
+    started_at_unix_ms: u64,
+    profiles: &ProfileCatalog,
+    runtime_generation: Option<RuntimeGeneration>,
+) -> StatusSnapshot {
+    let active_profile = profiles
+        .active_profile_id()
+        .and_then(|id| profiles.get(id))
+        .map(|profile| ActiveProfileSummary {
+            id: profile.id,
+            name: profile.name.clone(),
+        });
+    let unconfigured = active_profile.is_none();
+    StatusSnapshot {
+        supervisor: SupervisorStatus {
+            lifecycle: SupervisorLifecycle::Ready,
+            started_at_unix_ms,
+            uptime_seconds: 0,
+        },
+        core: CoreStatus {
+            lifecycle: if unconfigured {
+                CoreLifecycle::Unconfigured
+            } else {
+                CoreLifecycle::Stopped
+            },
+            pid: None,
+            instance_generation: None,
+        },
+        tun: TunStatus {
+            requested: true,
+            capable: false,
+            effective: false,
+            reason: Some(if unconfigured {
+                TunReason::NoActiveProfile
+            } else {
+                TunReason::CoreUnavailable
+            }),
+        },
+        active_profile,
+        primary_proxy_group: None,
+        selected_node: None,
+        latency: None,
+        traffic: unavailable_traffic(),
+        connection_count: 0,
+        runtime_generation,
+        apply_state: ApplyState::Idle,
+        stream_health: disconnected_stream_health(),
+    }
+}
+
 fn unavailable_traffic() -> TrafficSample {
     TrafficSample {
         upload_bytes_per_second: 0,
@@ -2367,4 +2569,40 @@ fn internal_error() -> ApplicationError {
         "The Supervisor state is unavailable",
         false,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activation_queue_keeps_only_the_latest_pending_target() {
+        let mut queue = ActivationQueue {
+            running: true,
+            pending: None,
+        };
+        let superseded = queue.enqueue("secondary");
+        let latest = queue.enqueue("tertiary");
+
+        let error = superseded
+            .wait()
+            .expect_err("the older pending activation should be superseded");
+        assert_eq!(error.code, ErrorCode::OperationUnavailable);
+        assert!(error.retryable);
+        assert_eq!(
+            queue
+                .pending
+                .as_ref()
+                .map(|pending| pending.selector.as_str()),
+            Some("tertiary")
+        );
+        assert!(Arc::ptr_eq(
+            &queue
+                .pending
+                .as_ref()
+                .expect("the latest activation should remain pending")
+                .completion,
+            &latest
+        ));
+    }
 }

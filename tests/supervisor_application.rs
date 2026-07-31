@@ -22,7 +22,10 @@ use hopash::transaction::{
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::Duration;
 
 #[derive(Debug)]
 struct FixedClock;
@@ -30,6 +33,47 @@ struct FixedClock;
 impl Clock for FixedClock {
     fn now_unix_ms(&self) -> u64 {
         10_000
+    }
+}
+
+#[derive(Default)]
+struct WorkGate {
+    state: Mutex<WorkGateState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct WorkGateState {
+    entered: bool,
+    released: bool,
+}
+
+impl WorkGate {
+    fn reset(&self) {
+        let mut state = self.state.lock().expect("the work gate lock");
+        *state = WorkGateState::default();
+    }
+
+    fn enter_and_wait(&self) {
+        let mut state = self.state.lock().expect("the work gate lock");
+        state.entered = true;
+        self.changed.notify_all();
+        while !state.released {
+            state = self.changed.wait(state).expect("the work gate wait");
+        }
+    }
+
+    fn wait_until_entered(&self) {
+        let mut state = self.state.lock().expect("the work gate lock");
+        while !state.entered {
+            state = self.changed.wait(state).expect("the work gate wait");
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().expect("the work gate lock");
+        state.released = true;
+        self.changed.notify_all();
     }
 }
 
@@ -311,9 +355,24 @@ struct PersistingTransactions {
     busy_next_rule: AtomicBool,
     next_success_recovery: Mutex<Option<TransactionRecoveryOutcome>>,
     next_failure_recovery: Mutex<Option<TransactionRecoveryOutcome>>,
+    block_next_apply: AtomicBool,
+    apply_gate: WorkGate,
 }
 
 impl PersistingTransactions {
+    fn block_next_apply(&self) {
+        self.apply_gate.reset();
+        self.block_next_apply.store(true, Ordering::Release);
+    }
+
+    fn wait_for_blocked_apply(&self) {
+        self.apply_gate.wait_until_entered();
+    }
+
+    fn release_blocked_apply(&self) {
+        self.apply_gate.release();
+    }
+
     fn commit(
         &self,
         request: SupervisorTransactionRequest<'_>,
@@ -380,6 +439,9 @@ impl SupervisorTransactionPort for PersistingTransactions {
                 .take()
                 .unwrap_or(TransactionRecoveryOutcome::NotRequired);
             return Err(failure);
+        }
+        if self.block_next_apply.swap(false, Ordering::AcqRel) {
+            self.apply_gate.enter_and_wait();
         }
         let generation = request.generation;
         self.commit(request)?;
@@ -451,6 +513,8 @@ impl Harness {
             busy_next_rule: AtomicBool::new(false),
             next_success_recovery: Mutex::new(None),
             next_failure_recovery: Mutex::new(None),
+            block_next_apply: AtomicBool::new(false),
+            apply_gate: WorkGate::default(),
         });
         Self {
             directory,
@@ -945,6 +1009,97 @@ fn failed_runtime_recovery_marks_the_supervisor_degraded_and_retains_rules() {
         hopash::domain::CoreLifecycle::Degraded
     );
     assert_eq!(status.runtime_generation, Some(RuntimeGeneration(1)));
+}
+
+#[test]
+fn status_reports_applying_while_a_transaction_owns_authoritative_state() {
+    let harness = Harness::new("observable-apply-state");
+    harness.queue_profile("Primary", "node-a");
+    let supervisor = Arc::new(harness.open());
+    add_profile(supervisor.as_ref(), "https://example.test/primary.yaml");
+    supervisor
+        .execute(ApplicationOperation::GetStatus)
+        .expect("the initial status should be cached");
+    harness.transactions.block_next_apply();
+
+    let mutation_supervisor = Arc::clone(&supervisor);
+    let mutation = thread::spawn(move || {
+        mutation_supervisor.execute(ApplicationOperation::RuleAdd {
+            rule: "DOMAIN,example.com,DIRECT".to_owned(),
+            placement: hopash::application::RulePlacement::Prepend,
+        })
+    });
+    harness.transactions.wait_for_blocked_apply();
+
+    let (status_sender, status_receiver) = mpsc::channel();
+    let status_supervisor = Arc::clone(&supervisor);
+    let status_thread = thread::spawn(move || {
+        let _ = status_sender.send(status_supervisor.execute(ApplicationOperation::GetStatus));
+    });
+    let observed = status_receiver.recv_timeout(Duration::from_millis(500));
+    harness.transactions.release_blocked_apply();
+    mutation
+        .join()
+        .expect("the mutation thread should finish")
+        .expect("the released mutation should commit");
+    status_thread
+        .join()
+        .expect("the status thread should finish");
+    let observed = observed
+        .expect("status should remain responsive while Runtime Apply is blocked")
+        .expect("status should remain available");
+
+    let ApplicationOutput::Status(status) = observed else {
+        panic!("status should return Status")
+    };
+    assert_eq!(status.apply_state, hopash::domain::ApplyState::Applying);
+}
+
+#[test]
+fn activation_executes_one_current_and_one_latest_pending_target() {
+    let harness = Harness::new("pending-activation");
+    harness.queue_profile("Primary", "node-a");
+    harness.queue_profile("Secondary", "node-b");
+    harness.queue_profile("Tertiary", "node-c");
+    let supervisor = Arc::new(harness.open());
+    add_profile(supervisor.as_ref(), "https://example.test/primary.yaml");
+    let secondary = add_profile(supervisor.as_ref(), "https://example.test/secondary.yaml");
+    let tertiary = add_profile(supervisor.as_ref(), "https://example.test/tertiary.yaml");
+    harness.transactions.block_next_apply();
+
+    let current_supervisor = Arc::clone(&supervisor);
+    let current_id = secondary.id.to_string();
+    let current = thread::spawn(move || {
+        current_supervisor.execute(ApplicationOperation::ProfileUse {
+            profile: current_id,
+        })
+    });
+    harness.transactions.wait_for_blocked_apply();
+
+    let pending_supervisor = Arc::clone(&supervisor);
+    let pending_id = tertiary.id.to_string();
+    let pending = thread::spawn(move || {
+        pending_supervisor.execute(ApplicationOperation::ProfileUse {
+            profile: pending_id,
+        })
+    });
+    thread::sleep(Duration::from_millis(20));
+    harness.transactions.release_blocked_apply();
+    current
+        .join()
+        .expect("the current activation thread should finish")
+        .expect("the current activation should commit");
+    pending
+        .join()
+        .expect("the pending activation thread should finish")
+        .expect("the latest pending activation should commit");
+
+    let active = profile_list(supervisor.as_ref())
+        .into_iter()
+        .find(|profile| profile.active)
+        .expect("one Profile should remain active");
+    assert_eq!(active.id, tertiary.id);
+    assert_eq!(harness.transactions.apply_count.load(Ordering::Relaxed), 3);
 }
 
 #[test]
