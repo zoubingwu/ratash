@@ -1,6 +1,6 @@
 use hopash::core::{
-    ApplyDisposition, CoreControlEndpoint, CoreRuntime, CoreRuntimeErrorKind, OwnerSessionProof,
-    OwnerSessionRequest, ProcessOutputSource, RuntimeBundle,
+    ApplyDisposition, CoreControlEndpoint, CoreRuntime, CoreRuntimeError, CoreRuntimeErrorKind,
+    OwnerSessionProof, OwnerSessionRequest, ProcessOutputSource, RuntimeBundle,
 };
 use hopash::domain::{CoreInstanceGeneration, RuntimeGeneration};
 use hopash::service::{
@@ -8,8 +8,9 @@ use hopash::service::{
     CoreProcessController, CoreProcessLog, OwnedProcessIdentity, PrivilegedCoreRuntimeService,
     PrivilegedServiceConfig, PrivilegedServiceDependencies, PrivilegedServiceLifecycle,
     ProcessIdentityProbe, RuntimeManifestFileV1, RuntimeManifestV1, SecretGenerator,
-    ServiceMaintenanceOutcome, ServicePlatformError, ServicePlatformErrorKind, SpawnedCoreProcess,
-    TunCapabilityPreflight, UnexpectedExitOutcome, VerifiedRuntimeBundle,
+    ServiceGenerationStateCommitFault, ServiceMaintenanceOutcome, ServicePlatformError,
+    ServicePlatformErrorKind, SpawnedCoreProcess, TunCapabilityPreflight, UnexpectedExitOutcome,
+    VerifiedRuntimeBundle,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
@@ -129,6 +130,17 @@ impl SecretGenerator for CountingSecrets {
     fn generate(&self) -> Result<String, ServicePlatformError> {
         let value = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         Ok(format!("random-secret-{value}"))
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct FailingSecrets;
+
+impl SecretGenerator for FailingSecrets {
+    fn generate(&self) -> Result<String, ServicePlatformError> {
+        Err(ServicePlatformError::new(
+            ServicePlatformErrorKind::Randomness,
+        ))
     }
 }
 
@@ -302,6 +314,9 @@ struct Harness {
     credentials: FakeCredentials,
     tun: FakeTun,
     processes: FakeProcesses,
+    restart_limit: usize,
+    log_capacity: usize,
+    max_log_line_bytes: usize,
     service: PrivilegedCoreRuntimeService,
 }
 
@@ -351,6 +366,9 @@ impl Harness {
             credentials,
             tun,
             processes,
+            restart_limit,
+            log_capacity,
+            max_log_line_bytes,
             service,
         }
     }
@@ -380,6 +398,66 @@ impl Harness {
             &self.binary,
             &self.binary_sha256,
         )
+    }
+
+    fn reopen(&self) -> PrivilegedCoreRuntimeService {
+        self.try_reopen()
+            .expect("the fixture service should reopen")
+    }
+
+    fn try_reopen(&self) -> Result<PrivilegedCoreRuntimeService, CoreRuntimeError> {
+        self.try_reopen_with_secrets(Box::new(CountingSecrets::default()))
+    }
+
+    fn try_reopen_with_secrets(
+        &self,
+        secrets: Box<dyn SecretGenerator>,
+    ) -> Result<PrivilegedCoreRuntimeService, CoreRuntimeError> {
+        self.try_open_at_root(self.service_root.clone(), secrets)
+    }
+
+    fn try_open_at_root(
+        &self,
+        service_owned_root: PathBuf,
+        secrets: Box<dyn SecretGenerator>,
+    ) -> Result<PrivilegedCoreRuntimeService, CoreRuntimeError> {
+        PrivilegedCoreRuntimeService::new(
+            PrivilegedServiceConfig {
+                protocol_version: CORE_RUNTIME_PROTOCOL_VERSION,
+                service_owned_root,
+                compiler_policy_sha256: self.policy_sha256.clone(),
+                mihomo_binary_sha256: self.binary_sha256.clone(),
+                restart_limit: self.restart_limit,
+                log_capacity: self.log_capacity,
+                max_log_line_bytes: self.max_log_line_bytes,
+            },
+            PrivilegedServiceDependencies {
+                credentials: Box::new(self.credentials.clone()),
+                identities: Box::new(self.identities.clone()),
+                tun: Box::new(self.tun.clone()),
+                secrets,
+                processes: Box::new(self.processes.clone()),
+            },
+        )
+    }
+
+    fn generation_state_path(&self) -> PathBuf {
+        self.service_root
+            .join("control")
+            .join("generation-state-v1.json")
+    }
+
+    fn generation_lock_path(&self) -> PathBuf {
+        self.service_root
+            .join("control")
+            .join("generation-state-v1.lock")
+    }
+
+    fn reopen_error(&self) -> CoreRuntimeError {
+        match self.try_reopen() {
+            Ok(_) => panic!("the fixture service reopen should fail"),
+            Err(error) => error,
+        }
     }
 }
 
@@ -442,6 +520,424 @@ fn session_bootstrap_negotiates_protocol_credentials_random_proof_and_generation
         & 0o777;
     assert_eq!(service_mode, 0o711);
     assert_eq!(control_mode, 0o711);
+    let generation_state_metadata = fs::symlink_metadata(harness.generation_state_path())
+        .expect("generation state metadata should load");
+    assert!(generation_state_metadata.file_type().is_file());
+    assert_eq!(
+        generation_state_metadata.permissions().mode() & 0o777,
+        0o600
+    );
+    let generation_lock_metadata = fs::symlink_metadata(harness.generation_lock_path())
+        .expect("generation lock metadata should load");
+    assert!(generation_lock_metadata.file_type().is_file());
+    assert_eq!(generation_lock_metadata.len(), 0);
+    assert_eq!(generation_lock_metadata.permissions().mode() & 0o777, 0o600);
+}
+
+#[test]
+fn owner_and_core_generations_continue_after_service_reopen() {
+    let harness = Harness::new();
+    let first_session = harness.open();
+    let first_apply = harness
+        .service
+        .apply_candidate(&first_session.proof, &harness.bundle(1))
+        .expect("the first Core should spawn");
+    harness
+        .service
+        .close_owner_session(&first_session.proof)
+        .expect("the first owner should close");
+
+    let reopened = harness.reopen();
+    let second_session = reopened
+        .open_owner_session(&harness.request(200, "supervisor-200", "instance-200"))
+        .expect("the reopened service should admit a new owner");
+    let second_apply = reopened
+        .apply_candidate(&second_session.proof, &harness.bundle(2))
+        .expect("the reopened service should spawn a new Core");
+
+    assert_eq!(first_session.owner_generation, 1);
+    assert_eq!(second_session.owner_generation, 2);
+    assert_eq!(
+        first_apply.managed_core.instance_generation,
+        CoreInstanceGeneration(1)
+    );
+    assert_eq!(
+        second_apply.managed_core.instance_generation,
+        CoreInstanceGeneration(2)
+    );
+}
+
+#[test]
+fn stale_service_instances_reread_locked_generation_high_water_marks() {
+    let harness = Harness::new();
+    let first_service = harness.reopen();
+    let stale_service = harness.reopen();
+    let first_session = first_service
+        .open_owner_session(&harness.request(100, "supervisor-100", "instance-100"))
+        .expect("the first service should admit an owner");
+    let first_apply = first_service
+        .apply_candidate(&first_session.proof, &harness.bundle(1))
+        .expect("the first service should spawn a Core");
+    first_service
+        .close_owner_session(&first_session.proof)
+        .expect("the first service owner should close");
+
+    let stale_session = stale_service
+        .open_owner_session(&harness.request(200, "supervisor-200", "instance-200"))
+        .expect("the stale service should refresh the owner high-water mark");
+    let stale_apply = stale_service
+        .apply_candidate(&stale_session.proof, &harness.bundle(2))
+        .expect("the stale service should refresh the Core high-water mark");
+
+    assert_eq!(first_session.owner_generation, 1);
+    assert_eq!(stale_session.owner_generation, 2);
+    assert_eq!(
+        first_apply.managed_core.instance_generation,
+        CoreInstanceGeneration(1)
+    );
+    assert_eq!(
+        stale_apply.managed_core.instance_generation,
+        CoreInstanceGeneration(2)
+    );
+}
+
+#[test]
+fn failed_core_spawn_reserves_a_durable_generation_gap() {
+    let harness = Harness::new();
+    let first_session = harness.open();
+    harness.processes.script_spawns([SpawnScript::Failure]);
+    let error = harness
+        .service
+        .apply_candidate(&first_session.proof, &harness.bundle(1))
+        .expect_err("the scripted Core spawn should fail");
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Apply);
+    harness
+        .service
+        .close_owner_session(&first_session.proof)
+        .expect("the failed owner should close");
+
+    let reopened = harness.reopen();
+    let second_session = reopened
+        .open_owner_session(&harness.request(200, "supervisor-200", "instance-200"))
+        .expect("the reopened service should admit a new owner");
+    let applied = reopened
+        .apply_candidate(&second_session.proof, &harness.bundle(2))
+        .expect("the second Core spawn should succeed");
+
+    assert_eq!(second_session.owner_generation, 2);
+    assert_eq!(
+        applied.managed_core.instance_generation,
+        CoreInstanceGeneration(2)
+    );
+}
+
+#[test]
+fn core_spawn_waits_for_a_durable_private_generation_reservation() {
+    let harness = Harness::new();
+    let session = harness.open();
+    let state_path = harness.generation_state_path();
+    fs::set_permissions(&state_path, fs::Permissions::from_mode(0o644))
+        .expect("the generation state permissions should change");
+
+    let error = harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect_err("a non-private generation state should block Core spawn");
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Unavailable);
+    assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 0);
+
+    fs::set_permissions(&state_path, fs::Permissions::from_mode(0o600))
+        .expect("the generation state privacy should be restored");
+    let applied = harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect("the durable Core generation reservation should succeed");
+
+    assert_eq!(
+        applied.managed_core.instance_generation,
+        CoreInstanceGeneration(1)
+    );
+    assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn every_atomic_generation_commit_failure_prevents_spawn_and_recovers_high_water() {
+    for (fault, recovered_generation) in [
+        (ServiceGenerationStateCommitFault::Write, 1),
+        (ServiceGenerationStateCommitFault::FileSync, 1),
+        (ServiceGenerationStateCommitFault::Rename, 1),
+        (ServiceGenerationStateCommitFault::DirectorySync, 2),
+    ] {
+        let harness = Harness::new();
+        let session = harness.open();
+        harness
+            .service
+            .arm_generation_state_commit_fault(fault)
+            .expect("the generation commit fault should arm");
+
+        let error = harness
+            .service
+            .apply_candidate(&session.proof, &harness.bundle(1))
+            .expect_err("the injected generation commit failure should block Core spawn");
+
+        assert_eq!(error.kind, CoreRuntimeErrorKind::Unavailable);
+        assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 0);
+
+        let reopened = harness.reopen();
+        let recovery_session = reopened
+            .open_owner_session(&harness.request(200, "supervisor-200", "instance-200"))
+            .expect("the persisted high-water state should remain recoverable");
+        let recovered = reopened
+            .apply_candidate(&recovery_session.proof, &harness.bundle(2))
+            .expect("the recovered service should spawn a Core");
+
+        assert_eq!(
+            recovered.managed_core.instance_generation,
+            CoreInstanceGeneration(recovered_generation)
+        );
+        assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[test]
+fn failed_owner_secret_generation_reserves_a_durable_generation_gap() {
+    let harness = Harness::new();
+    let failing_service = harness
+        .try_reopen_with_secrets(Box::new(FailingSecrets))
+        .expect("the failing fixture service should initialize");
+    let error = failing_service
+        .open_owner_session(&harness.request(100, "supervisor-100", "instance-100"))
+        .expect_err("the scripted secret generation should fail");
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Unavailable);
+    drop(failing_service);
+
+    let reopened = harness.reopen();
+    let session = reopened
+        .open_owner_session(&harness.request(200, "supervisor-200", "instance-200"))
+        .expect("the reopened service should admit a new owner");
+
+    assert_eq!(session.owner_generation, 2);
+}
+
+#[test]
+fn service_reopen_rejects_corrupt_generation_state_without_exposing_paths() {
+    let harness = Harness::new();
+    fs::write(harness.generation_state_path(), b"{broken")
+        .expect("the generation state should be corrupted");
+
+    let error = harness.reopen_error();
+    let rendered = format!("{error} {error:?}");
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Unavailable);
+    assert!(!rendered.contains(&harness.directory.path.display().to_string()));
+    assert!(!rendered.contains("generation-state-v1.json"));
+}
+
+#[test]
+fn service_reopen_rejects_non_private_generation_state_permissions() {
+    let harness = Harness::new();
+    let state_path = harness.generation_state_path();
+    fs::set_permissions(&state_path, fs::Permissions::from_mode(0o644))
+        .expect("the generation state permissions should change");
+
+    let error = harness.reopen_error();
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Unavailable);
+}
+
+#[test]
+fn service_reopen_rejects_non_private_control_root_permissions() {
+    let harness = Harness::new();
+    let control_root = harness.service_root.join("control");
+    fs::set_permissions(&control_root, fs::Permissions::from_mode(0o700))
+        .expect("the control root permissions should change");
+
+    let error = harness.reopen_error();
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Unavailable);
+}
+
+#[test]
+fn service_reopen_rejects_non_private_service_root_permissions() {
+    let harness = Harness::new();
+    fs::set_permissions(&harness.service_root, fs::Permissions::from_mode(0o700))
+        .expect("the service root permissions should change");
+
+    let error = harness.reopen_error();
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Unavailable);
+}
+
+#[test]
+fn service_reopen_rejects_generation_state_symlinks() {
+    let harness = Harness::new();
+    let state_path = harness.generation_state_path();
+    let external_state = harness
+        .directory
+        .path
+        .join("external-generation-state.json");
+    fs::write(
+        &external_state,
+        br#"{"schema_version":1,"owner_generation":20,"core_instance_generation":30}"#,
+    )
+    .expect("the external generation state should be written");
+    fs::set_permissions(&external_state, fs::Permissions::from_mode(0o600))
+        .expect("the external generation state should be private");
+    fs::remove_file(&state_path).expect("the managed generation state should be removed");
+    symlink(&external_state, &state_path).expect("the generation state symlink should be created");
+
+    let error = harness.reopen_error();
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Unavailable);
+}
+
+#[test]
+fn service_reopen_rejects_control_root_symlinks() {
+    let harness = Harness::new();
+    let control_root = harness.service_root.join("control");
+    fs::remove_file(harness.generation_state_path())
+        .expect("the managed generation state should be removed");
+    fs::remove_file(harness.generation_lock_path())
+        .expect("the managed generation lock should be removed");
+    fs::remove_dir(&control_root).expect("the managed control root should be removed");
+    let external_control_root = harness.directory.path.join("external-control");
+    fs::create_dir(&external_control_root).expect("the external control root should be created");
+    fs::set_permissions(&external_control_root, fs::Permissions::from_mode(0o711))
+        .expect("the external control root permissions should be set");
+    symlink(&external_control_root, &control_root).expect("the control root symlink should exist");
+
+    let error = harness.reopen_error();
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Unavailable);
+}
+
+#[test]
+fn service_reopen_rejects_service_root_symlinks() {
+    let harness = Harness::new();
+    let control_root = harness.service_root.join("control");
+    fs::remove_file(harness.generation_state_path())
+        .expect("the managed generation state should be removed");
+    fs::remove_file(harness.generation_lock_path())
+        .expect("the managed generation lock should be removed");
+    fs::remove_dir(control_root).expect("the managed control root should be removed");
+    fs::remove_dir(&harness.service_root).expect("the managed service root should be removed");
+    let external_service_root = harness.directory.path.join("external-service");
+    fs::create_dir(&external_service_root).expect("the external service root should be created");
+    fs::set_permissions(&external_service_root, fs::Permissions::from_mode(0o711))
+        .expect("the external service root permissions should be set");
+    symlink(&external_service_root, &harness.service_root)
+        .expect("the service root symlink should exist");
+
+    let error = harness.reopen_error();
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Unavailable);
+}
+
+#[test]
+fn service_reopen_rejects_service_root_parent_symlinks() {
+    let harness = Harness::new();
+    let external_parent = harness.directory.path.join("external-parent");
+    fs::create_dir(&external_parent).expect("the external parent should be created");
+    let linked_parent = harness.directory.path.join("linked-parent");
+    symlink(&external_parent, &linked_parent).expect("the parent symlink should exist");
+
+    let result = harness.try_open_at_root(
+        linked_parent.join("service-owned"),
+        Box::new(CountingSecrets::default()),
+    );
+    let error = match result {
+        Ok(_) => panic!("a service root below a symlinked parent should be rejected"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Unavailable);
+}
+
+#[test]
+fn service_reopen_rejects_group_or_other_writable_service_root_parents() {
+    let harness = Harness::new();
+    let writable_parent = harness.directory.path.join("writable-parent");
+    fs::create_dir(&writable_parent).expect("the writable parent should be created");
+    fs::set_permissions(&writable_parent, fs::Permissions::from_mode(0o777))
+        .expect("the writable parent permissions should change");
+
+    let result = harness.try_open_at_root(
+        writable_parent.join("service-owned"),
+        Box::new(CountingSecrets::default()),
+    );
+    let error = match result {
+        Ok(_) => panic!("a service root below a writable parent should be rejected"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Unavailable);
+}
+
+#[test]
+fn service_reopen_rejects_non_file_generation_state() {
+    let harness = Harness::new();
+    let state_path = harness.generation_state_path();
+    fs::remove_file(&state_path).expect("the managed generation state should be removed");
+    fs::create_dir(&state_path).expect("a directory should replace the generation state");
+
+    let error = harness.reopen_error();
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Unavailable);
+}
+
+#[test]
+fn service_reopen_cleans_only_strict_pending_generation_states() {
+    let harness = Harness::new();
+    let control_root = harness.service_root.join("control");
+    let mut private_pending = Vec::new();
+    for sequence in 1..=16 {
+        let identifier = uuid::Uuid::from_u128(sequence);
+        let path = control_root.join(format!(".generation-state-v1.json.{identifier}.pending"));
+        fs::write(&path, b"partial").expect("the private pending state should be written");
+        let mode = if sequence == 1 { 0o000 } else { 0o600 };
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+            .expect("the private pending state should be private");
+        private_pending.push(path);
+    }
+    let unknown = control_root.join("unrelated.pending");
+    fs::write(&unknown, b"preserve").expect("the unknown entry should be written");
+    let noncanonical_uuid =
+        control_root.join(".generation-state-v1.json.00000000000000000000000000000016.pending");
+    fs::write(&noncanonical_uuid, b"preserve")
+        .expect("the noncanonical pending entry should be written");
+    fs::set_permissions(&noncanonical_uuid, fs::Permissions::from_mode(0o600))
+        .expect("the noncanonical pending entry should be private");
+    let non_private = control_root.join(format!(
+        ".generation-state-v1.json.{}.pending",
+        uuid::Uuid::from_u128(20)
+    ));
+    fs::write(&non_private, b"preserve").expect("the non-private entry should be written");
+    fs::set_permissions(&non_private, fs::Permissions::from_mode(0o644))
+        .expect("the non-private entry permissions should change");
+    let special_mode = control_root.join(format!(
+        ".generation-state-v1.json.{}.pending",
+        uuid::Uuid::from_u128(22)
+    ));
+    fs::write(&special_mode, b"preserve").expect("the special-mode entry should be written");
+    fs::set_permissions(&special_mode, fs::Permissions::from_mode(0o1600))
+        .expect("the special-mode entry permissions should change");
+    let symlink_target = harness.directory.path.join("pending-symlink-target");
+    fs::write(&symlink_target, b"preserve").expect("the symlink target should be written");
+    let pending_symlink = control_root.join(format!(
+        ".generation-state-v1.json.{}.pending",
+        uuid::Uuid::from_u128(21)
+    ));
+    symlink(&symlink_target, &pending_symlink).expect("the pending symlink should be created");
+
+    let _reopened = harness.reopen();
+
+    assert!(private_pending.iter().all(|path| !path.exists()));
+    assert!(unknown.exists());
+    assert!(noncanonical_uuid.exists());
+    assert!(non_private.exists());
+    assert!(special_mode.exists());
+    assert!(fs::symlink_metadata(pending_symlink).is_ok());
 }
 
 #[test]
