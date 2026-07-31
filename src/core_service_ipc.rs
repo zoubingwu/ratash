@@ -53,6 +53,7 @@ const CORE_SERVICE_LOG_BATCH_MAX: usize = IPC_FRAME_MAX_BYTES / CORE_LOG_LINE_MA
 
 pub struct CoreServiceClient {
     socket_path: PathBuf,
+    expected_service_uid: u32,
     connect_timeout: Duration,
     io_timeout: Duration,
     next_request_id: AtomicU64,
@@ -61,7 +62,12 @@ pub struct CoreServiceClient {
 impl CoreServiceClient {
     #[must_use]
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
-        Self::with_timeouts(socket_path, IPC_REQUEST_TIMEOUT, IPC_REQUEST_TIMEOUT)
+        Self::with_service_uid_and_timeouts(
+            socket_path,
+            0,
+            IPC_REQUEST_TIMEOUT,
+            IPC_REQUEST_TIMEOUT,
+        )
     }
 
     #[must_use]
@@ -70,8 +76,29 @@ impl CoreServiceClient {
         connect_timeout: Duration,
         io_timeout: Duration,
     ) -> Self {
+        Self::with_service_uid_and_timeouts(socket_path, 0, connect_timeout, io_timeout)
+    }
+
+    #[must_use]
+    pub fn for_service_uid(socket_path: impl Into<PathBuf>, expected_service_uid: u32) -> Self {
+        Self::with_service_uid_and_timeouts(
+            socket_path,
+            expected_service_uid,
+            IPC_REQUEST_TIMEOUT,
+            IPC_REQUEST_TIMEOUT,
+        )
+    }
+
+    #[must_use]
+    pub fn with_service_uid_and_timeouts(
+        socket_path: impl Into<PathBuf>,
+        expected_service_uid: u32,
+        connect_timeout: Duration,
+        io_timeout: Duration,
+    ) -> Self {
         Self {
             socket_path: socket_path.into(),
+            expected_service_uid,
             connect_timeout,
             io_timeout,
             next_request_id: AtomicU64::new(1),
@@ -97,7 +124,15 @@ impl CoreServiceClient {
         let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
         let address = SockAddr::unix(&self.socket_path)?;
         socket.connect_timeout(&address, self.connect_timeout)?;
-        Ok(UnixStream::from(socket))
+        let stream = UnixStream::from(socket);
+        let actual_uid = peer_uid(&stream).map_err(io::Error::other)?;
+        if actual_uid != self.expected_service_uid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Core service peer identity mismatch",
+            ));
+        }
+        Ok(stream)
     }
 
     fn request(&self, operation: WireOperation) -> Result<WireSuccess, CoreRuntimeError> {
@@ -133,6 +168,7 @@ impl fmt::Debug for CoreServiceClient {
         formatter
             .debug_struct("CoreServiceClient")
             .field("socket_path", &"[REDACTED]")
+            .field("expected_service_uid", &self.expected_service_uid)
             .field("connect_timeout", &self.connect_timeout)
             .field("io_timeout", &self.io_timeout)
             .finish_non_exhaustive()
@@ -1711,7 +1747,7 @@ fn prepare_runtime_root(path: &Path) -> io::Result<PathBuf> {
             "Core service runtime root must be a real directory",
         ));
     }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o711))?;
     fs::canonicalize(path)
 }
 
@@ -1727,6 +1763,8 @@ fn bind_service_listener(socket_path: &Path, allowed_owner_uid: u32) -> io::Resu
         })?;
     prepare_service_socket_parent(parent)
         .map_err(|error| safe_io_error(error, "Core service IPC parent setup failed"))?;
+    recover_stale_service_socket(socket_path, parent, allowed_owner_uid)
+        .map_err(|error| safe_io_error(error, "Core service IPC stale socket check failed"))?;
     let listener = UnixListener::bind(socket_path)
         .map_err(|error| safe_io_error(error, "Core service IPC bind failed"))?;
     let configure_result = configure_service_socket(socket_path, parent, allowed_owner_uid)
@@ -1737,6 +1775,49 @@ fn bind_service_listener(socket_path: &Path, allowed_owner_uid: u32) -> io::Resu
         return Err(error);
     }
     Ok(listener)
+}
+
+fn recover_stale_service_socket(
+    socket_path: &Path,
+    parent: &Path,
+    allowed_owner_uid: u32,
+) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(socket_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "Core service IPC path is occupied",
+        ));
+    }
+    if metadata.uid() != allowed_owner_uid || metadata.mode() & 0o777 != 0o600 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Core service IPC stale socket identity is invalid",
+        ));
+    }
+    let identity = SocketIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    match UnixStream::connect(socket_path) {
+        Ok(stream) => {
+            drop(stream);
+            Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "Core service IPC socket is active",
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+            cleanup_socket(socket_path, identity)?;
+            sync_directory(parent)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn prepare_service_socket_parent(parent: &Path) -> io::Result<()> {
@@ -1761,7 +1842,17 @@ fn prepare_service_socket_parent(parent: &Path) -> io::Result<()> {
             validate_service_socket_parent(&metadata)
         }
         Err(error) => Err(error),
+    }?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o711))?;
+    let metadata = fs::symlink_metadata(parent)?;
+    validate_service_socket_parent(&metadata)?;
+    if metadata.mode() & 0o777 != 0o711 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Core service IPC parent access policy failed",
+        ));
     }
+    Ok(())
 }
 
 fn validate_service_socket_parent(metadata: &fs::Metadata) -> io::Result<()> {

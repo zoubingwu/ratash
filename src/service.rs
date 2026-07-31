@@ -211,6 +211,14 @@ pub trait CoreProcessController: Send + Sync {
         endpoint: &CoreControlEndpoint,
     ) -> Result<(), ServicePlatformError>;
 
+    fn grant_endpoint_access(
+        &self,
+        endpoint: &CoreControlEndpoint,
+        owner_uid: u32,
+    ) -> Result<(), ServicePlatformError>;
+
+    fn reap_if_exited(&self, process: &OwnedProcessIdentity) -> Result<bool, ServicePlatformError>;
+
     fn take_logs(
         &self,
         process: &OwnedProcessIdentity,
@@ -378,7 +386,7 @@ impl PrivilegedCoreRuntimeService {
         #[cfg(unix)]
         fs::set_permissions(
             &config.service_owned_root,
-            fs::Permissions::from_mode(0o700),
+            fs::Permissions::from_mode(0o711),
         )
         .map_err(|_| {
             service_error(
@@ -400,7 +408,7 @@ impl PrivilegedCoreRuntimeService {
             )
         })?;
         #[cfg(unix)]
-        fs::set_permissions(&control_root, fs::Permissions::from_mode(0o700)).map_err(|_| {
+        fs::set_permissions(&control_root, fs::Permissions::from_mode(0o711)).map_err(|_| {
             service_error(
                 CoreRuntimeErrorKind::Unavailable,
                 "control root permission update failed",
@@ -627,6 +635,19 @@ impl PrivilegedCoreRuntimeService {
         &self,
         identity: &OwnedProcessIdentity,
     ) -> Result<bool, CoreRuntimeError> {
+        if self
+            .dependencies
+            .processes
+            .reap_if_exited(identity)
+            .map_err(|_| {
+                service_error(
+                    CoreRuntimeErrorKind::Unavailable,
+                    "Core process inspection failed",
+                )
+            })?
+        {
+            return Ok(false);
+        }
         self.dependencies
             .identities
             .start_identity(identity.pid)
@@ -763,6 +784,18 @@ impl PrivilegedCoreRuntimeService {
         {
             let _ = self.dependencies.processes.stop(&owned_identity);
             return Err(map_readiness_error(error));
+        }
+        if self
+            .dependencies
+            .processes
+            .grant_endpoint_access(&owner.endpoint, owner.owner_uid)
+            .is_err()
+        {
+            let _ = self.dependencies.processes.stop(&owned_identity);
+            return Err(service_error(
+                CoreRuntimeErrorKind::Apply,
+                "Core control endpoint access setup failed",
+            ));
         }
         Ok(ManagedCoreRecord {
             handle: ManagedCoreHandle {

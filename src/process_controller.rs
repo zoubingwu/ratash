@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
+use std::fs;
 use std::io::Read;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, chown};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -420,6 +422,64 @@ impl CoreProcessController for NativeCoreProcessController {
             }
             thread::sleep(remaining.min(self.config.readiness_poll_interval));
         }
+    }
+
+    fn grant_endpoint_access(
+        &self,
+        endpoint: &CoreControlEndpoint,
+        owner_uid: u32,
+    ) -> Result<(), ServicePlatformError> {
+        let before = fs::symlink_metadata(&endpoint.socket_path)
+            .map_err(|_| platform_error(ServicePlatformErrorKind::ProcessInspection))?;
+        let service_uid = nix::unistd::Uid::effective().as_raw();
+        if !before.file_type().is_socket()
+            || (before.uid() != service_uid && before.uid() != owner_uid)
+        {
+            return Err(platform_error(ServicePlatformErrorKind::ProcessInspection));
+        }
+        fs::set_permissions(&endpoint.socket_path, fs::Permissions::from_mode(0o600))
+            .map_err(|_| platform_error(ServicePlatformErrorKind::ProcessInspection))?;
+        if before.uid() != owner_uid {
+            chown(&endpoint.socket_path, Some(owner_uid), None)
+                .map_err(|_| platform_error(ServicePlatformErrorKind::ProcessInspection))?;
+        }
+        fs::set_permissions(&endpoint.socket_path, fs::Permissions::from_mode(0o600))
+            .map_err(|_| platform_error(ServicePlatformErrorKind::ProcessInspection))?;
+        let after = fs::symlink_metadata(&endpoint.socket_path)
+            .map_err(|_| platform_error(ServicePlatformErrorKind::ProcessInspection))?;
+        if !after.file_type().is_socket()
+            || after.uid() != owner_uid
+            || after.mode() & 0o777 != 0o600
+            || after.dev() != before.dev()
+            || after.ino() != before.ino()
+        {
+            return Err(platform_error(ServicePlatformErrorKind::ProcessInspection));
+        }
+        Ok(())
+    }
+
+    fn reap_if_exited(&self, process: &OwnedProcessIdentity) -> Result<bool, ServicePlatformError> {
+        let mut state = self.lock_state()?;
+        let managed = state
+            .child
+            .as_mut()
+            .ok_or_else(|| platform_error(ServicePlatformErrorKind::ProcessInspection))?;
+        if managed.identity != *process {
+            return Err(platform_error(ServicePlatformErrorKind::ProcessInspection));
+        }
+        let exited = managed
+            .child
+            .try_wait()
+            .map_err(|_| platform_error(ServicePlatformErrorKind::ProcessInspection))?
+            .is_some();
+        if exited {
+            self.logs
+                .lock()
+                .map_err(|_| platform_error(ServicePlatformErrorKind::Logs))?
+                .finish_generation(process.instance_generation);
+            state.child = None;
+        }
+        Ok(exited)
     }
 
     fn take_logs(

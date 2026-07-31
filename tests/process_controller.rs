@@ -1,8 +1,10 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hopash::config::{AuthoritativeConfig, ConfigCompiler, EffectiveConfiguration};
 use hopash::core::{
@@ -17,9 +19,10 @@ use hopash::process_controller::{
 use hopash::profile::{ProfileSnapshot, SnapshotLimits};
 use hopash::runtime_bundle::RuntimeBundleStager;
 use hopash::service::{
-    CORE_RUNTIME_PROTOCOL_VERSION, CallerCredentialValidator, PrivilegedCoreRuntimeService,
-    PrivilegedServiceConfig, PrivilegedServiceDependencies, ServicePlatformError,
-    TunCapabilityPreflight, UuidSecretGenerator,
+    CORE_RUNTIME_PROTOCOL_VERSION, CallerCredentialValidator, CoreProcessController,
+    PrivilegedCoreRuntimeService, PrivilegedServiceConfig, PrivilegedServiceDependencies,
+    ServiceMaintenanceOutcome, ServicePlatformError, TunCapabilityPreflight, UnexpectedExitOutcome,
+    UuidSecretGenerator,
 };
 use sha2::{Digest, Sha256};
 
@@ -27,10 +30,10 @@ struct TestDirectory(PathBuf);
 
 impl TestDirectory {
     fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "hopash-process-controller-{label}-{}-{}",
+        let path = Path::new("/private/tmp").join(format!(
+            "hpc-{label}-{}-{}",
             std::process::id(),
-            uuid::Uuid::new_v4()
+            uuid::Uuid::new_v4().simple()
         ));
         fs::create_dir_all(&path).expect("fixture directory should be created");
         Self(path)
@@ -155,6 +158,8 @@ fn verified_runtime_spawns_reloads_forwards_bounded_logs_and_stops() {
             protocol_version: CORE_RUNTIME_PROTOCOL_VERSION,
         })
         .expect("owner session should open");
+    let endpoint_listener = UnixListener::bind(&session.endpoint.socket_path)
+        .expect("fixture Core control endpoint should bind");
 
     let first = service
         .apply_candidate(&session.proof, &first_bundle)
@@ -191,14 +196,42 @@ fn verified_runtime_spawns_reloads_forwards_bounded_logs_and_stops() {
     );
     drop(reloads);
 
+    let kill_status = Command::new("/bin/kill")
+        .args(["-KILL", &second.managed_core.pid.to_string()])
+        .status()
+        .expect("fixture Core kill command should run");
+    assert!(kill_status.success());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let restarted = loop {
+        match service
+            .maintenance_tick()
+            .expect("service maintenance should inspect the fixture child")
+        {
+            ServiceMaintenanceOutcome::UnexpectedExit(UnexpectedExitOutcome::Restarted {
+                managed_core,
+                ..
+            }) => break managed_core,
+            ServiceMaintenanceOutcome::Unchanged(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            outcome => panic!("fixture Core should restart after its child exit: {outcome:?}"),
+        }
+    };
+    assert_eq!(restarted.runtime_generation, RuntimeGeneration(2));
+    assert_eq!(
+        restarted.instance_generation,
+        hopash::domain::CoreInstanceGeneration(first.managed_core.instance_generation.0 + 1)
+    );
+
     let stopped = service
         .stop(&session.proof)
-        .expect("owned fixture Core should stop");
+        .expect("restarted fixture Core should stop");
     assert!(stopped.stopped);
     assert_eq!(
         stopped.instance_generation,
-        Some(first.managed_core.instance_generation)
+        Some(restarted.instance_generation)
     );
+    drop(endpoint_listener);
     service
         .close_owner_session(&session.proof)
         .expect("owner session should close");
@@ -236,6 +269,50 @@ fn controller_configuration_rejects_zero_deadlines_and_capacities() {
             NativeCoreProcessController::new(invalid, controls.clone(), inspector.clone()).is_err()
         );
     }
+}
+
+#[test]
+fn core_control_endpoint_is_private_to_the_owner_and_service() {
+    let directory = TestDirectory::new("endpoint");
+    let service_root = directory.0.join("r");
+    let control_root = service_root.join("c");
+    let generation_root = service_root.join("g1");
+    fs::create_dir_all(&control_root).expect("control root should be created");
+    fs::create_dir(&generation_root).expect("generation root should be created");
+    fs::set_permissions(&service_root, fs::Permissions::from_mode(0o711))
+        .expect("service root access should be configured");
+    fs::set_permissions(&control_root, fs::Permissions::from_mode(0o711))
+        .expect("control root access should be configured");
+    fs::set_permissions(&generation_root, fs::Permissions::from_mode(0o700))
+        .expect("generation root should stay private");
+    let endpoint = CoreControlEndpoint::new(control_root.join("s"), "secret");
+    let listener = UnixListener::bind(&endpoint.socket_path)
+        .expect("fixture Core control endpoint should bind");
+    fs::set_permissions(&endpoint.socket_path, fs::Permissions::from_mode(0o777))
+        .expect("fixture endpoint permissions should be widened before hardening");
+    let controller = NativeCoreProcessController::new(
+        NativeCoreProcessConfig::default(),
+        Arc::new(FakeControl::default()),
+        Arc::new(PsProcessInspector),
+    )
+    .expect("process controller should be configured");
+
+    controller
+        .grant_endpoint_access(&endpoint, nix::unistd::Uid::effective().as_raw())
+        .expect("endpoint access should be restricted to the owner and service");
+
+    let endpoint_metadata =
+        fs::symlink_metadata(&endpoint.socket_path).expect("endpoint metadata should load");
+    let generation_metadata =
+        fs::symlink_metadata(&generation_root).expect("generation metadata should load");
+    assert!(endpoint_metadata.file_type().is_socket());
+    assert_eq!(
+        endpoint_metadata.uid(),
+        nix::unistd::Uid::effective().as_raw()
+    );
+    assert_eq!(endpoint_metadata.mode() & 0o777, 0o600);
+    assert_eq!(generation_metadata.mode() & 0o777, 0o700);
+    drop(listener);
 }
 
 fn wait_for_logs(

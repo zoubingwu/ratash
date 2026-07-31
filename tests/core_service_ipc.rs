@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -252,7 +252,10 @@ impl Harness {
             CoreServiceServerConfig::new(&runtime_root, owner_uid),
         )
         .expect("the Core service IPC server should start");
-        let client = CoreServiceClient::new(&socket_path);
+        let client = CoreServiceClient::for_service_uid(
+            &socket_path,
+            nix::unistd::Uid::effective().as_raw(),
+        );
         Self {
             directory,
             socket_path,
@@ -279,6 +282,19 @@ impl Harness {
             RuntimeGeneration(generation),
         )
     }
+}
+
+fn server_fixture(
+    directory: &TestDirectory,
+    label: &str,
+) -> (PathBuf, Arc<FakeRuntime>, CoreServiceServerConfig) {
+    let service_root = directory.path.join(format!("service-{label}"));
+    fs::create_dir(&service_root).expect("the service fixture root should be created");
+    let runtime_root = service_root.join("runtime");
+    let socket_path = directory.path.join(format!("ipc-{label}/core.sock"));
+    let runtime = Arc::new(FakeRuntime::new(runtime_root.clone(), &service_root));
+    let config = CoreServiceServerConfig::new(runtime_root, nix::unistd::geteuid().as_raw());
+    (socket_path, runtime, config)
 }
 
 #[test]
@@ -310,6 +326,27 @@ fn all_core_runtime_operations_round_trip_through_staged_service_owned_state() {
         .clone();
     assert!(staged_root.starts_with(&harness.runtime_root));
     assert_ne!(staged_root, source.generation_root);
+    assert_eq!(
+        fs::symlink_metadata(&harness.runtime_root)
+            .expect("service runtime root metadata should load")
+            .mode()
+            & 0o777,
+        0o711
+    );
+    assert_eq!(
+        fs::symlink_metadata(&staged_root)
+            .expect("staged generation metadata should load")
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::symlink_metadata(staged_root.join("config.yaml"))
+            .expect("staged configuration metadata should load")
+            .mode()
+            & 0o777,
+        0o400
+    );
 
     let status = harness
         .client
@@ -383,6 +420,20 @@ fn peer_uid_must_match_the_claimed_owner_before_session_bootstrap() {
 }
 
 #[test]
+fn client_rejects_a_core_service_owned_by_an_unexpected_uid() {
+    let harness = Harness::new();
+    let unexpected_uid = nix::unistd::Uid::effective().as_raw() ^ 1;
+    let client = CoreServiceClient::for_service_uid(&harness.socket_path, unexpected_uid);
+
+    let error = client
+        .open_owner_session(&harness.owner_request())
+        .expect_err("an unexpected service owner must fail before request delivery");
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Unavailable);
+    assert_eq!(harness.runtime.state().open_count, 0);
+}
+
+#[test]
 fn session_id_is_peer_bound_and_the_runtime_still_checks_the_secret_token() {
     let harness = Harness::new();
     let session = harness
@@ -437,8 +488,9 @@ fn absolute_response_deadline_bounds_a_stalled_runtime_operation() {
         .open_owner_session(&harness.owner_request())
         .expect("the owner session should open");
     harness.runtime.state().status_delay = Some(Duration::from_millis(250));
-    let client = CoreServiceClient::with_timeouts(
+    let client = CoreServiceClient::with_service_uid_and_timeouts(
         &harness.socket_path,
+        nix::unistd::Uid::effective().as_raw(),
         Duration::from_secs(1),
         Duration::from_millis(40),
     );
@@ -575,7 +627,8 @@ fn client_rejects_a_response_with_a_different_request_id() {
         });
         write_frame(&mut stream, &response).expect("the raw correlation response should be sent");
     });
-    let client = CoreServiceClient::new(&socket_path);
+    let client =
+        CoreServiceClient::for_service_uid(&socket_path, nix::unistd::Uid::effective().as_raw());
 
     let error = client
         .status(&OwnerSessionProof::new("fixture", "fixture"))
@@ -586,6 +639,108 @@ fn client_rejects_a_response_with_a_different_request_id() {
         .join()
         .expect("the raw correlation responder should finish");
     fs::remove_file(socket_path).expect("the raw correlation socket should be removed");
+}
+
+#[test]
+fn verified_stale_service_socket_is_recovered_before_bind() {
+    let directory = TestDirectory::new();
+    let (socket_path, runtime, config) = server_fixture(&directory, "stale");
+    fs::create_dir_all(socket_path.parent().expect("socket parent should exist"))
+        .expect("socket parent should be created");
+    let stale = UnixListener::bind(&socket_path).expect("stale socket fixture should bind");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
+        .expect("stale socket access should match the service policy");
+    drop(stale);
+
+    let mut server = CoreServiceServer::start(&socket_path, runtime, config)
+        .expect("a verified stale socket should be recovered");
+
+    let client =
+        CoreServiceClient::for_service_uid(&socket_path, nix::unistd::Uid::effective().as_raw());
+    let error = client
+        .status(&OwnerSessionProof::new("stale", "stale"))
+        .expect_err("the replacement service should answer requests");
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Authentication);
+    server
+        .shutdown()
+        .expect("the replacement service should shut down cleanly");
+}
+
+#[test]
+fn active_service_socket_is_preserved() {
+    let directory = TestDirectory::new();
+    let (socket_path, runtime, config) = server_fixture(&directory, "active");
+    fs::create_dir_all(socket_path.parent().expect("socket parent should exist"))
+        .expect("socket parent should be created");
+    let active = UnixListener::bind(&socket_path).expect("active socket fixture should bind");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
+        .expect("active socket access should match the service policy");
+    let before = fs::symlink_metadata(&socket_path).expect("active socket metadata should load");
+
+    let error = CoreServiceServer::start(&socket_path, runtime, config)
+        .expect_err("an active service socket should retain ownership");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+    let after = fs::symlink_metadata(&socket_path).expect("active socket should remain present");
+    assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+    UnixStream::connect(&socket_path).expect("the active listener should still accept peers");
+    active
+        .accept()
+        .expect("the active listener should retain ownership");
+}
+
+#[test]
+fn unverified_service_paths_are_preserved() {
+    let directory = TestDirectory::new();
+    let (file_path, file_runtime, file_config) = server_fixture(&directory, "file");
+    fs::create_dir_all(file_path.parent().expect("file parent should exist"))
+        .expect("file parent should be created");
+    fs::write(&file_path, b"preserve").expect("file fixture should be written");
+
+    CoreServiceServer::start(&file_path, file_runtime, file_config)
+        .expect_err("a non-socket service path should be preserved");
+
+    assert_eq!(
+        fs::read(&file_path).expect("file fixture should remain readable"),
+        b"preserve"
+    );
+
+    let (link_path, link_runtime, link_config) = server_fixture(&directory, "link");
+    fs::create_dir_all(link_path.parent().expect("link parent should exist"))
+        .expect("link parent should be created");
+    let target = directory.path.join("link-target");
+    fs::write(&target, b"target").expect("symlink target should be written");
+    symlink(&target, &link_path).expect("service path symlink should be created");
+
+    CoreServiceServer::start(&link_path, link_runtime, link_config)
+        .expect_err("a service path symlink should be preserved");
+
+    assert!(
+        fs::symlink_metadata(&link_path)
+            .expect("service path symlink should remain")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read(&target).expect("symlink target should remain readable"),
+        b"target"
+    );
+
+    let (wide_path, wide_runtime, wide_config) = server_fixture(&directory, "wide");
+    fs::create_dir_all(wide_path.parent().expect("wide socket parent should exist"))
+        .expect("wide socket parent should be created");
+    let wide = UnixListener::bind(&wide_path).expect("wide socket fixture should bind");
+    fs::set_permissions(&wide_path, fs::Permissions::from_mode(0o666))
+        .expect("wide socket fixture permissions should be configured");
+    let before = fs::symlink_metadata(&wide_path).expect("wide socket metadata should load");
+    drop(wide);
+
+    let error = CoreServiceServer::start(&wide_path, wide_runtime, wide_config)
+        .expect_err("a stale socket outside the service access policy should be preserved");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    let after = fs::symlink_metadata(&wide_path).expect("wide stale socket should remain");
+    assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
 }
 
 #[test]

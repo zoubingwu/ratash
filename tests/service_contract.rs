@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 #[cfg(unix)]
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -262,6 +262,25 @@ impl CoreProcessController for FakeProcesses {
         }
     }
 
+    fn grant_endpoint_access(
+        &self,
+        _endpoint: &CoreControlEndpoint,
+        _owner_uid: u32,
+    ) -> Result<(), ServicePlatformError> {
+        Ok(())
+    }
+
+    fn reap_if_exited(&self, process: &OwnedProcessIdentity) -> Result<bool, ServicePlatformError> {
+        let state = self.state.lock().expect("process lock");
+        match state.processes.get(&process.pid) {
+            Some(identity) if identity == &process.process_start_identity => Ok(false),
+            Some(_) => Err(ServicePlatformError::new(
+                ServicePlatformErrorKind::ProcessInspection,
+            )),
+            None => Ok(true),
+        }
+    }
+
     fn take_logs(
         &self,
         _process: &OwnedProcessIdentity,
@@ -411,6 +430,18 @@ fn session_bootstrap_negotiates_protocol_credentials_random_proof_and_generation
     assert_eq!(first.proof.session_token(), "random-secret-2");
     assert_eq!(metadata.endpoint.secret(), "random-secret-3");
     assert!(!format!("{:?}", first.proof).contains("random-secret-2"));
+    let service_mode = fs::symlink_metadata(&harness.service_root)
+        .expect("service root metadata should load")
+        .permissions()
+        .mode()
+        & 0o777;
+    let control_mode = fs::symlink_metadata(harness.service_root.join("control"))
+        .expect("control root metadata should load")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(service_mode, 0o711);
+    assert_eq!(control_mode, 0o711);
 }
 
 #[test]
@@ -1299,6 +1330,30 @@ impl CoreProcessController for FixtureProcesses {
                 ServicePlatformErrorKind::Readiness,
             ))
         }
+    }
+
+    fn grant_endpoint_access(
+        &self,
+        _endpoint: &CoreControlEndpoint,
+        _owner_uid: u32,
+    ) -> Result<(), ServicePlatformError> {
+        Ok(())
+    }
+
+    fn reap_if_exited(&self, process: &OwnedProcessIdentity) -> Result<bool, ServicePlatformError> {
+        let mut children = self.inner.children.lock().expect("fixture process lock");
+        let child = children.get_mut(&process.pid).ok_or_else(|| {
+            ServicePlatformError::new(ServicePlatformErrorKind::ProcessInspection)
+        })?;
+        let exited = child
+            .try_wait()
+            .map_err(|_| ServicePlatformError::new(ServicePlatformErrorKind::ProcessInspection))?
+            .is_some();
+        if exited {
+            children.remove(&process.pid);
+            self.identities.remove(process.pid);
+        }
+        Ok(exited)
     }
 
     fn take_logs(
