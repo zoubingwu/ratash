@@ -6,8 +6,8 @@ use crate::core::{
 };
 use crate::domain::{LocalRuleSetRevision, RuntimeGeneration};
 use crate::persistence::{
-    CommittedManifest, ObjectId, PersistenceStore, PreparedTransaction, RecoveryState,
-    TransactionBundle, TransactionId,
+    CommittedManifest, ObjectId, PersistencePruneResult, PersistenceStore, PreparedTransaction,
+    RecoveryState, TransactionBundle, TransactionId,
 };
 use crate::profile::{ActiveProfileRevision, ProfileRevision};
 use std::fmt;
@@ -53,6 +53,10 @@ pub trait TransactionStore: Send + Sync {
     fn commit_prepared(&self, prepared: &PreparedTransaction) -> io::Result<()>;
     fn clear_prepared(&self, prepared: &PreparedTransaction) -> io::Result<()>;
     fn load_transaction(&self, id: &TransactionId) -> io::Result<TransactionBundle>;
+
+    fn prune_unreachable(&self) -> io::Result<PersistencePruneResult> {
+        Ok(PersistencePruneResult::default())
+    }
 }
 
 impl TransactionStore for PersistenceStore {
@@ -78,6 +82,10 @@ impl TransactionStore for PersistenceStore {
 
     fn load_transaction(&self, id: &TransactionId) -> io::Result<TransactionBundle> {
         PersistenceStore::load_transaction(self, id)
+    }
+
+    fn prune_unreachable(&self) -> io::Result<PersistencePruneResult> {
+        PersistenceStore::prune_unreachable(self)
     }
 }
 
@@ -364,7 +372,7 @@ impl ConfigTransactionCoordinator {
         }
 
         if let Some(prepared) = state.prepared.as_ref()
-            && self.store.clear_prepared(prepared).is_err()
+            && self.clear_prepared_and_prune(prepared).is_err()
         {
             return Err(ConfigTransactionError::new(
                 ConfigTransactionErrorKind::Cleanup,
@@ -515,7 +523,7 @@ impl ConfigTransactionCoordinator {
                 candidate.runtime.generation,
                 committed_generation,
             )?
-        } else if self.store.clear_prepared(&prepared).is_err() {
+        } else if self.clear_prepared_and_prune(&prepared).is_err() {
             RecoveryOutcome::Pending {
                 target: Some(candidate.runtime.generation),
             }
@@ -624,7 +632,7 @@ impl ConfigTransactionCoordinator {
         {
             return RecoveryOutcome::Failed { target };
         }
-        if self.store.clear_prepared(prepared).is_err() {
+        if self.clear_prepared_and_prune(prepared).is_err() {
             return RecoveryOutcome::Failed { target };
         }
         RecoveryOutcome::Converged { generation: target }
@@ -650,7 +658,7 @@ impl ConfigTransactionCoordinator {
             }
         };
         if state.committed.as_ref().map(|manifest| &manifest.current) == Some(&prepared.candidate) {
-            let recovery = if self.store.clear_prepared(prepared).is_ok() {
+            let recovery = if self.clear_prepared_and_prune(prepared).is_ok() {
                 RecoveryOutcome::Converged {
                     generation: Some(candidate_generation),
                 }
@@ -692,7 +700,7 @@ impl ConfigTransactionCoordinator {
         prepared: &PreparedTransaction,
         committed_generation: Option<RuntimeGeneration>,
     ) -> RecoveryOutcome {
-        if self.store.clear_prepared(prepared).is_ok() {
+        if self.clear_prepared_and_prune(prepared).is_ok() {
             RecoveryOutcome::Converged {
                 generation: committed_generation,
             }
@@ -745,5 +753,11 @@ impl ConfigTransactionCoordinator {
                     .map_err(|_| ())
             })
             .transpose()
+    }
+
+    fn clear_prepared_and_prune(&self, prepared: &PreparedTransaction) -> io::Result<()> {
+        self.store.clear_prepared(prepared)?;
+        let _ = self.store.prune_unreachable();
+        Ok(())
     }
 }

@@ -5,7 +5,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use hopash::domain::{LocalRuleSetRevision, ProfileId, RuntimeGeneration};
-use hopash::persistence::{ObjectId, PersistenceStore, TransactionBundle, TransactionId};
+use hopash::persistence::{
+    ObjectId, PERSISTENCE_PRUNE_REMOVAL_LIMIT, PersistenceStore, TransactionBundle, TransactionId,
+};
 use hopash::profile::ProfileRevision;
 use sha2::{Digest, Sha256};
 
@@ -382,6 +384,275 @@ fn transaction_loading_rejects_invalid_typed_identifiers() {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 }
 
+#[test]
+fn pruning_retains_committed_previous_and_prepared_recovery_content() {
+    let directory = TestDirectory::new();
+    let store = PersistenceStore::open(&directory.path).expect("store should open");
+    let first_bundle = transaction_bundle(&store, "profile-a", 1);
+    let first = store
+        .prepare(&first_bundle)
+        .expect("first transaction should prepare");
+    store
+        .commit_prepared(&first)
+        .expect("first transaction should commit");
+    store
+        .clear_prepared(&first)
+        .expect("first journal should clear");
+    let second_bundle = transaction_bundle(&store, "profile-b", 2);
+    let second = store
+        .prepare(&second_bundle)
+        .expect("second transaction should prepare");
+    store
+        .commit_prepared(&second)
+        .expect("second transaction should commit");
+    store
+        .clear_prepared(&second)
+        .expect("second journal should clear");
+    let prepared_bundle = transaction_bundle(&store, "profile-a", 3);
+    let prepared = store
+        .prepare(&prepared_bundle)
+        .expect("candidate transaction should prepare");
+    let orphan_object = store
+        .put_object(b"unreferenced object")
+        .expect("orphan object should stage");
+    let orphan_transaction_content = b"unreferenced transaction";
+    let orphan_transaction = digest(orphan_transaction_content);
+    fs::write(
+        directory
+            .path
+            .join("transactions")
+            .join(&orphan_transaction),
+        orphan_transaction_content,
+    )
+    .expect("orphan transaction should stage");
+
+    let result = store.prune_unreachable().expect("pruning should succeed");
+
+    assert_eq!(result.removed_objects, 1);
+    assert_eq!(result.removed_transactions, 1);
+    assert!(!result.has_more);
+    assert!(
+        !directory
+            .path
+            .join("objects")
+            .join(orphan_object.as_str())
+            .exists()
+    );
+    assert!(
+        !directory
+            .path
+            .join("transactions")
+            .join(orphan_transaction)
+            .exists()
+    );
+    for (transaction, bundle) in [
+        (&first.candidate, &first_bundle),
+        (&second.candidate, &second_bundle),
+        (&prepared.candidate, &prepared_bundle),
+    ] {
+        assert_eq!(
+            store
+                .load_transaction(transaction)
+                .expect("retained transaction should load"),
+            *bundle
+        );
+        for object in [
+            &bundle.supervisor_state,
+            &bundle.profile_snapshot,
+            &bundle.local_rule_set,
+            &bundle.effective_configuration,
+        ] {
+            store
+                .read_object(object)
+                .expect("retained transaction object should load");
+        }
+    }
+    assert_eq!(
+        store
+            .recover()
+            .expect("recovery state should load")
+            .prepared,
+        Some(prepared)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pruning_preserves_unknown_names_directories_and_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let directory = TestDirectory::new();
+    let store = PersistenceStore::open(&directory.path).expect("store should open");
+    let object_directory_name = digest(b"object directory");
+    let transaction_directory_name = digest(b"transaction directory");
+    let object_link_name = digest(b"object link");
+    let transaction_link_name = digest(b"transaction link");
+    let outside_target = directory.path.join("symlink-target");
+    fs::write(&outside_target, b"preserve target").expect("symlink target should be written");
+    fs::write(directory.path.join("objects").join("keep.tmp"), b"unknown")
+        .expect("unknown object entry should be written");
+    fs::write(
+        directory.path.join("transactions").join("manifest.backup"),
+        b"unknown",
+    )
+    .expect("unknown transaction entry should be written");
+    fs::create_dir(directory.path.join("objects").join(&object_directory_name))
+        .expect("digest-named object directory should be created");
+    fs::create_dir(
+        directory
+            .path
+            .join("transactions")
+            .join(&transaction_directory_name),
+    )
+    .expect("digest-named transaction directory should be created");
+    symlink(
+        &outside_target,
+        directory.path.join("objects").join(&object_link_name),
+    )
+    .expect("digest-named object symlink should be created");
+    symlink(
+        &outside_target,
+        directory
+            .path
+            .join("transactions")
+            .join(&transaction_link_name),
+    )
+    .expect("digest-named transaction symlink should be created");
+    let removable_object = digest(b"removable object");
+    let removable_transaction = digest(b"removable transaction");
+    fs::write(
+        directory.path.join("objects").join(&removable_object),
+        b"orphan",
+    )
+    .expect("orphan object should be written");
+    fs::write(
+        directory
+            .path
+            .join("transactions")
+            .join(&removable_transaction),
+        b"orphan",
+    )
+    .expect("orphan transaction should be written");
+
+    let result = store.prune_unreachable().expect("pruning should succeed");
+
+    assert_eq!(result.removed_objects, 1);
+    assert_eq!(result.removed_transactions, 1);
+    for path in [
+        directory.path.join("objects").join("keep.tmp"),
+        directory.path.join("transactions").join("manifest.backup"),
+        directory.path.join("objects").join(object_directory_name),
+        directory
+            .path
+            .join("transactions")
+            .join(transaction_directory_name),
+        directory.path.join("objects").join(object_link_name),
+        directory
+            .path
+            .join("transactions")
+            .join(transaction_link_name),
+        outside_target,
+    ] {
+        assert!(
+            path.exists(),
+            "unsafe entry should remain: {}",
+            path.display()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn pruning_refuses_to_follow_a_referenced_transaction_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let directory = TestDirectory::new();
+    let store = PersistenceStore::open(&directory.path).expect("store should open");
+    let bundle = transaction_bundle(&store, "profile-a", 1);
+    let prepared = store.prepare(&bundle).expect("transaction should prepare");
+    store
+        .commit_prepared(&prepared)
+        .expect("transaction should commit");
+    store
+        .clear_prepared(&prepared)
+        .expect("journal should clear");
+    let transaction_path = directory
+        .path
+        .join("transactions")
+        .join(prepared.candidate.as_str());
+    let outside_target = directory.path.join("referenced-transaction-target");
+    fs::rename(&transaction_path, &outside_target)
+        .expect("referenced transaction should move to the fixture target");
+    symlink(&outside_target, &transaction_path)
+        .expect("referenced transaction symlink should be created");
+
+    store
+        .prune_unreachable()
+        .expect_err("referenced transaction symlink should stop pruning");
+
+    assert!(
+        fs::symlink_metadata(&transaction_path)
+            .expect("transaction symlink should remain")
+            .file_type()
+            .is_symlink()
+    );
+    assert!(outside_target.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn pruning_rejects_a_referenced_fifo_before_opening_it() {
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+    use std::os::unix::fs::FileTypeExt;
+
+    let directory = TestDirectory::new();
+    let store = PersistenceStore::open(&directory.path).expect("store should open");
+    let bundle = transaction_bundle(&store, "profile-a", 1);
+    let prepared = store.prepare(&bundle).expect("transaction should prepare");
+    store
+        .commit_prepared(&prepared)
+        .expect("transaction should commit");
+    store
+        .clear_prepared(&prepared)
+        .expect("journal should clear");
+    let transaction_path = directory
+        .path
+        .join("transactions")
+        .join(prepared.candidate.as_str());
+    fs::remove_file(&transaction_path).expect("referenced transaction should be removed");
+    mkfifo(&transaction_path, Mode::S_IRUSR | Mode::S_IWUSR)
+        .expect("referenced transaction FIFO should be created");
+
+    store
+        .prune_unreachable()
+        .expect_err("referenced transaction FIFO should stop pruning");
+
+    assert!(
+        fs::symlink_metadata(&transaction_path)
+            .expect("transaction FIFO should remain")
+            .file_type()
+            .is_fifo()
+    );
+}
+
+#[test]
+fn pruning_limits_each_removal_batch() {
+    let directory = TestDirectory::new();
+    let store = PersistenceStore::open(&directory.path).expect("store should open");
+    for index in 0..=PERSISTENCE_PRUNE_REMOVAL_LIMIT {
+        let name = digest(format!("orphan-{index}").as_bytes());
+        fs::write(directory.path.join("objects").join(name), b"orphan")
+            .expect("orphan object should be written");
+    }
+
+    let result = store.prune_unreachable().expect("pruning should succeed");
+
+    assert_eq!(result.removed_objects, PERSISTENCE_PRUNE_REMOVAL_LIMIT);
+    assert_eq!(result.removed_transactions, 0);
+    assert!(result.has_more);
+}
+
 fn transaction_bundle(
     store: &PersistenceStore,
     active_profile_id: &str,
@@ -411,4 +682,13 @@ fn transaction_bundle(
         active_profile_id,
         runtime_generation: RuntimeGeneration(runtime_generation),
     }
+}
+
+fn digest(content: &[u8]) -> String {
+    Sha256::digest(content)
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            write!(output, "{byte:02x}").expect("writing to a String should succeed");
+            output
+        })
 }

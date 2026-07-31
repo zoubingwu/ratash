@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 #[cfg(unix)]
@@ -6,8 +7,15 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::constants::SUPERVISOR_STATE_MAX_BYTES;
 use crate::domain::{LocalRuleSetRevision, ProfileId, RuntimeGeneration};
 use crate::profile::ProfileRevision;
+
+pub const PERSISTENCE_PRUNE_ENTRY_LIMIT: usize = 4_096;
+pub const PERSISTENCE_PRUNE_REMOVAL_LIMIT: usize = 256;
+const PERSISTENCE_PRUNE_REFERENCE_LIMIT: usize = 1_024;
+const TRANSACTION_BUNDLE_MAX_BYTES: usize = 4_096;
+const TRANSACTION_METADATA_MAX_BYTES: usize = 1_024;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -163,6 +171,14 @@ pub struct RecoveryState {
     pub prepared: Option<PreparedTransaction>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PersistencePruneResult {
+    pub scanned_entries: usize,
+    pub removed_objects: usize,
+    pub removed_transactions: usize,
+    pub has_more: bool,
+}
+
 #[derive(Debug)]
 pub struct PersistenceStore {
     root: PathBuf,
@@ -273,6 +289,51 @@ impl PersistenceStore {
         dto.try_into()
     }
 
+    pub fn prune_unreachable(&self) -> io::Result<PersistencePruneResult> {
+        let (retained_transactions, retained_objects) = self.retained_content()?;
+        let mut result = PersistencePruneResult::default();
+        let mut candidates = Vec::with_capacity(PERSISTENCE_PRUNE_REMOVAL_LIMIT);
+
+        collect_prune_candidates(
+            &self.root.join("objects"),
+            &retained_objects,
+            PruneEntryKind::Object,
+            &mut result,
+            &mut candidates,
+        )?;
+        collect_prune_candidates(
+            &self.root.join("transactions"),
+            &retained_transactions,
+            PruneEntryKind::Transaction,
+            &mut result,
+            &mut candidates,
+        )?;
+
+        for candidate in candidates {
+            let metadata = match fs::symlink_metadata(&candidate.path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if !metadata.file_type().is_file() {
+                continue;
+            }
+            fs::remove_file(&candidate.path)?;
+            match candidate.kind {
+                PruneEntryKind::Object => result.removed_objects += 1,
+                PruneEntryKind::Transaction => result.removed_transactions += 1,
+            }
+        }
+
+        if result.removed_objects > 0 {
+            sync_directory(&self.root.join("objects"))?;
+        }
+        if result.removed_transactions > 0 {
+            sync_directory(&self.root.join("transactions"))?;
+        }
+        Ok(result)
+    }
+
     fn object_path(&self, id: &ObjectId) -> PathBuf {
         self.root.join("objects").join(id.as_str())
     }
@@ -320,6 +381,148 @@ impl PersistenceStore {
     fn read_manifest(&self) -> io::Result<Option<CommittedManifest>> {
         read_optional_json(&self.root.join("manifest.json"))
     }
+
+    fn retained_content(&self) -> io::Result<(BTreeSet<String>, BTreeSet<String>)> {
+        let state = RecoveryState {
+            committed: read_optional_regular_json(
+                &self.root.join("manifest.json"),
+                TRANSACTION_METADATA_MAX_BYTES,
+            )?,
+            prepared: read_optional_regular_json(
+                &self.root.join("prepared.json"),
+                TRANSACTION_METADATA_MAX_BYTES,
+            )?,
+        };
+        let mut retained_transactions = BTreeSet::new();
+        if let Some(committed) = state.committed {
+            retain_transaction(&mut retained_transactions, committed.current);
+            if let Some(previous) = committed.previous {
+                retain_transaction(&mut retained_transactions, previous);
+            }
+        }
+        if let Some(prepared) = state.prepared {
+            retain_transaction(&mut retained_transactions, prepared.candidate);
+            if let Some(previous) = prepared.previous {
+                retain_transaction(&mut retained_transactions, previous);
+            }
+        }
+
+        let mut retained_objects = BTreeSet::new();
+        for transaction in &retained_transactions {
+            let transaction = TransactionId::parse(transaction)?;
+            let content = read_regular_hashed_file_limited(
+                &self.transaction_path(&transaction),
+                transaction.as_str(),
+                TRANSACTION_BUNDLE_MAX_BYTES,
+            )?;
+            let bundle: TransactionBundleDto = deserialize(&content)?;
+            let bundle: TransactionBundle = bundle.try_into()?;
+            retain_bundle_objects(&mut retained_objects, &bundle);
+            let state = read_regular_hashed_file_limited(
+                &self.object_path(&bundle.supervisor_state),
+                bundle.supervisor_state.as_str(),
+                SUPERVISOR_STATE_MAX_BYTES,
+            )?;
+            collect_json_object_references(&state, &mut retained_objects)?;
+        }
+        Ok((retained_transactions, retained_objects))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PruneEntryKind {
+    Object,
+    Transaction,
+}
+
+struct PruneCandidate {
+    path: PathBuf,
+    kind: PruneEntryKind,
+}
+
+fn retain_transaction(retained: &mut BTreeSet<String>, id: TransactionId) {
+    retained.insert(id.as_str().to_owned());
+}
+
+fn retain_bundle_objects(retained: &mut BTreeSet<String>, bundle: &TransactionBundle) {
+    for id in [
+        &bundle.supervisor_state,
+        &bundle.profile_snapshot,
+        &bundle.local_rule_set,
+        &bundle.effective_configuration,
+    ] {
+        retained.insert(id.as_str().to_owned());
+    }
+}
+
+fn collect_json_object_references(
+    content: &[u8],
+    retained: &mut BTreeSet<String>,
+) -> io::Result<()> {
+    let Some(first) = content
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+    else {
+        return Ok(());
+    };
+    if !matches!(first, b'{' | b'[') {
+        return Ok(());
+    }
+    let value: serde_json::Value = deserialize(content)?;
+    let mut pending = vec![&value];
+    while let Some(value) = pending.pop() {
+        match value {
+            serde_json::Value::Array(values) => pending.extend(values),
+            serde_json::Value::Object(values) => pending.extend(values.values()),
+            serde_json::Value::String(value) if ObjectId::parse(value).is_ok() => {
+                retained.insert(value.clone());
+                if retained.len() > PERSISTENCE_PRUNE_REFERENCE_LIMIT {
+                    return Err(invalid_data(
+                        "stored state exceeds the persistence reference limit",
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn collect_prune_candidates(
+    directory: &Path,
+    retained: &BTreeSet<String>,
+    kind: PruneEntryKind,
+    result: &mut PersistencePruneResult,
+    candidates: &mut Vec<PruneCandidate>,
+) -> io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        if result.scanned_entries == PERSISTENCE_PRUNE_ENTRY_LIMIT {
+            result.has_more = true;
+            break;
+        }
+        let entry = entry?;
+        result.scanned_entries += 1;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if validate_digest(file_name).is_err()
+            || retained.contains(file_name)
+            || !entry.file_type()?.is_file()
+        {
+            continue;
+        }
+        if candidates.len() == PERSISTENCE_PRUNE_REMOVAL_LIMIT {
+            result.has_more = true;
+            continue;
+        }
+        candidates.push(PruneCandidate {
+            path: entry.path(),
+            kind,
+        });
+    }
+    Ok(())
 }
 
 fn create_private_directory(path: &Path) -> io::Result<()> {
@@ -376,10 +579,67 @@ where
     }
 }
 
+fn read_optional_regular_json<T>(path: &Path, limit: usize) -> io::Result<Option<T>>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    match read_regular_file_limited(path, limit) {
+        Ok(content) => deserialize(&content).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn read_hashed_file(path: &Path, expected: &str) -> io::Result<Vec<u8>> {
     let content = fs::read(path)?;
     if crate::digest::sha256_hex(&content) != expected {
         return Err(invalid_data("stored content does not match its ID"));
+    }
+    Ok(content)
+}
+
+fn read_regular_hashed_file_limited(
+    path: &Path,
+    expected: &str,
+    limit: usize,
+) -> io::Result<Vec<u8>> {
+    let content = read_regular_file_limited(path, limit)?;
+    if crate::digest::sha256_hex(&content) != expected {
+        return Err(invalid_data("stored content does not match its ID"));
+    }
+    Ok(content)
+}
+
+fn read_regular_file_limited(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+    let path_metadata = fs::symlink_metadata(path)?;
+    if !path_metadata.file_type().is_file() {
+        return Err(invalid_data(
+            "referenced stored content is not a regular file",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(nix::libc::O_NOFOLLOW);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(invalid_data(
+            "referenced stored content is not a regular file",
+        ));
+    }
+    if metadata.len() > limit as u64 {
+        return Err(invalid_data(
+            "referenced stored content exceeds its size limit",
+        ));
+    }
+    let mut content = Vec::new();
+    file.take((limit as u64).saturating_add(1))
+        .read_to_end(&mut content)?;
+    if content.len() > limit {
+        return Err(invalid_data(
+            "referenced stored content exceeds its size limit",
+        ));
     }
     Ok(content)
 }

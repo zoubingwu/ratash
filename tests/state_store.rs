@@ -74,6 +74,67 @@ fn committed_state_round_trips_multiple_profiles_and_private_metadata() {
 }
 
 #[test]
+fn removed_inactive_profile_snapshots_are_collected_after_the_previous_generation_expires() {
+    let directory = TestDirectory::new();
+    let store = AuthoritativeStateStore::open(&directory.path).expect("state store should open");
+    let mut expected = fixture_state();
+    let inactive_snapshot = expected
+        .profiles
+        .profiles()
+        .find(|profile| profile.name == "Backup")
+        .expect("inactive Profile should exist")
+        .snapshot
+        .raw()
+        .to_vec();
+    let inactive_snapshot = store
+        .persistence()
+        .put_object(&inactive_snapshot)
+        .expect("inactive snapshot should be stored");
+
+    commit_state(&store, &expected, 1);
+    store
+        .persistence()
+        .prune_unreachable()
+        .expect("first pruning should succeed");
+    expected
+        .profiles
+        .remove("Backup")
+        .expect("inactive Profile should be removed");
+    commit_state(&store, &expected, 2);
+    store
+        .persistence()
+        .prune_unreachable()
+        .expect("second pruning should succeed");
+    assert!(
+        directory
+            .path
+            .join("objects")
+            .join(inactive_snapshot.as_str())
+            .exists()
+    );
+
+    commit_state(&store, &expected, 3);
+    let result = store
+        .persistence()
+        .prune_unreachable()
+        .expect("third pruning should succeed");
+
+    assert!(result.removed_objects > 0);
+    assert!(
+        !directory
+            .path
+            .join("objects")
+            .join(inactive_snapshot.as_str())
+            .exists()
+    );
+    let hydrated = store
+        .load_committed(snapshot_limits(), RuleSetLimits::product())
+        .expect("pruned committed state should load")
+        .expect("committed state should exist");
+    assert_eq!(hydrated.profiles, expected.profiles);
+}
+
+#[test]
 fn absent_manifest_hydrates_as_a_zero_profile_state() {
     let directory = TestDirectory::new();
     let store = AuthoritativeStateStore::open(&directory.path).expect("state store should open");
@@ -221,6 +282,29 @@ fn fixture_state() -> FixtureState {
         rules,
         effective_configuration: b"mode: rule\ntun:\n  enable: true\n".to_vec(),
     }
+}
+
+fn commit_state(store: &AuthoritativeStateStore, state: &FixtureState, generation: u64) {
+    let bundle = store
+        .stage_candidate(AuthoritativeState {
+            profiles: &state.profiles,
+            local_rules: &state.rules,
+            effective_configuration: &state.effective_configuration,
+            runtime_generation: RuntimeGeneration(generation),
+        })
+        .expect("candidate should stage");
+    let prepared = store
+        .persistence()
+        .prepare(&bundle)
+        .expect("candidate should prepare");
+    store
+        .persistence()
+        .commit_prepared(&prepared)
+        .expect("candidate should commit");
+    store
+        .persistence()
+        .clear_prepared(&prepared)
+        .expect("journal should clear");
 }
 
 fn profile(id: ProfileId, name: &str, marker: &str, revision: u64) -> Profile {
