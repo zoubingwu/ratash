@@ -26,6 +26,7 @@ fn observable_product_limits_are_frozen_for_the_release_contract() {
     assert_eq!(MINIMUM_TERMINAL_WIDTH, 80);
     assert_eq!(MINIMUM_TERMINAL_HEIGHT, 24);
     assert_eq!(MAX_ACTIVE_NODES, 10_000);
+    assert_eq!(SELECTION_RESTORE_ATTEMPT_LIMIT, 10);
     assert_eq!(LOCAL_RULE_COUNT_MAX, 20_000);
     assert_eq!(PROBE_URL, "https://www.gstatic.com/generate_204");
 }

@@ -264,6 +264,7 @@ struct FakeCoreState {
     selections: Vec<NodeSelection>,
     fail_next_selection: bool,
     fail_selection_call: Option<usize>,
+    fail_proxy_view_attempts: usize,
     next_instance_generation: u64,
 }
 
@@ -306,12 +307,18 @@ impl SupervisorCorePort for FakeCore {
         _core: &ManagedCoreHandle,
         _effective_group_order: &[String],
     ) -> Result<ProxyView, MihomoError> {
-        Ok(self
+        let mut state = self
             .state
             .lock()
-            .expect("the Core lock should be available")
-            .view
-            .clone())
+            .expect("the Core lock should be available");
+        if state.fail_proxy_view_attempts > 0 {
+            state.fail_proxy_view_attempts -= 1;
+            return Err(MihomoError::new(
+                hopash::core::MihomoErrorKind::Unavailable,
+                "the fixture provider is warming up",
+            ));
+        }
+        Ok(state.view.clone())
     }
 
     fn select_node(
@@ -515,6 +522,7 @@ impl Harness {
                 selections: Vec::new(),
                 fail_next_selection: false,
                 fail_selection_call: None,
+                fail_proxy_view_attempts: 0,
                 next_instance_generation: 0,
             }),
         });
@@ -548,10 +556,27 @@ impl Harness {
     }
 
     fn open(&self) -> Supervisor {
-        self.open_with_source(self.source.clone())
+        self.open_for_session(
+            self.source.clone(),
+            self.directory.path.join("core.sock"),
+            "fixture-secret",
+        )
     }
 
     fn open_with_source(&self, source: Arc<dyn ProfileFetchPort>) -> Supervisor {
+        self.open_for_session(
+            source,
+            self.directory.path.join("core.sock"),
+            "fixture-secret",
+        )
+    }
+
+    fn open_for_session(
+        &self,
+        source: Arc<dyn ProfileFetchPort>,
+        core_socket: PathBuf,
+        core_secret: &str,
+    ) -> Supervisor {
         Supervisor::open(SupervisorDependencies {
             clock: self.clock.clone(),
             source,
@@ -560,10 +585,7 @@ impl Harness {
             transactions: self.transactions.clone(),
             state_store: self.state_store.clone(),
             core: self.core.clone(),
-            authoritative: AuthoritativeConfig::new(
-                self.directory.path.join("core.sock").display().to_string(),
-                "fixture-secret",
-            ),
+            authoritative: AuthoritativeConfig::new(core_socket.display().to_string(), core_secret),
             staging_root: self.directory.path.join("staging"),
         })
         .expect("the Supervisor should open")
@@ -916,6 +938,78 @@ fn first_profile_add_commits_rules_runtime_probes_and_reopens_from_persistence()
     assert_eq!(profiles.profiles.len(), 1);
     assert_eq!(profiles.profiles[0].id, added.profile.id);
     assert!(profiles.profiles[0].active);
+    let ApplicationOutput::Status(status) = reopened
+        .execute(ApplicationOperation::GetStatus)
+        .expect("the restarted status should load")
+    else {
+        panic!("status should return a Status output")
+    };
+    assert_eq!(status.runtime_generation, Some(RuntimeGeneration(2)));
+    assert_eq!(harness.transactions.apply_count.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn restart_recompiles_for_the_new_core_session_and_restores_runtime_state() {
+    let harness = Harness::new("restart-session");
+    harness.core.state.lock().expect("the Core lock").view = two_node_proxy_view();
+    harness.queue_profile("Primary", "node-a");
+    let supervisor = harness.open();
+    add_profile(&supervisor, "https://example.test/primary.yaml");
+    supervisor
+        .execute(ApplicationOperation::ProxySelect {
+            group: "Main".to_owned(),
+            node: NodeRecordId::for_core("node-b").as_str().to_owned(),
+        })
+        .expect("the saved selection should be committed");
+    drop(supervisor);
+    {
+        let mut core = harness.core.state.lock().expect("the Core lock");
+        core.selections.clear();
+        core.view.groups[0].selected_name = Some("node-a".to_owned());
+    }
+
+    let restarted = harness.open_for_session(
+        harness.source.clone(),
+        harness.directory.path.join("rotated-core.sock"),
+        "rotated-session-secret",
+    );
+
+    let hydrated = harness
+        .state_store
+        .load_committed(
+            hopash::profile::SnapshotLimits::new(
+                hopash::constants::PROFILE_RESPONSE_MAX_BYTES,
+                hopash::constants::YAML_MAX_DEPTH,
+            ),
+            hopash::rule::RuleSetLimits::product(),
+        )
+        .expect("the restarted state should load")
+        .expect("the restarted state should remain committed");
+    let persisted = String::from_utf8(hydrated.effective_configuration)
+        .expect("the Effective Configuration should be UTF-8");
+    assert!(persisted.contains("rotated-core.sock"));
+    assert!(persisted.contains("rotated-session-secret"));
+    assert_eq!(hydrated.runtime_generation, RuntimeGeneration(2));
+    assert_eq!(harness.transactions.apply_count.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        harness
+            .core
+            .state
+            .lock()
+            .expect("the Core lock")
+            .selections
+            .last()
+            .expect("the selection should be restored")
+            .node_name,
+        "node-b"
+    );
+    assert_eq!(
+        restarted
+            .take_due_probes()
+            .expect("the restarted probe queue should be readable")
+            .len(),
+        2
+    );
 }
 
 #[test]
@@ -1323,6 +1417,112 @@ fn profile_activation_restores_its_saved_proxy_group_selection() {
         supervisor
             .retry_selection_restore()
             .expect("selection restoration state should be readable")
+    );
+}
+
+#[test]
+fn core_replacement_retries_provider_warmup_then_restores_selections_and_probes() {
+    let harness = Harness::new("core-replacement-restore");
+    harness.core.state.lock().expect("the Core lock").view = two_node_proxy_view();
+    harness.queue_profile("Primary", "node-a");
+    let supervisor = harness.open();
+    add_profile(&supervisor, "https://example.test/primary.yaml");
+    supervisor
+        .execute(ApplicationOperation::ProxySelect {
+            group: "Main".to_owned(),
+            node: NodeRecordId::for_core("node-b").as_str().to_owned(),
+        })
+        .expect("the selection should persist");
+    let _ = supervisor
+        .take_due_probes()
+        .expect("the first Probe Generation should be readable");
+    harness.core.applied(RuntimeGeneration(1));
+    {
+        let mut core = harness.core.state.lock().expect("the Core lock");
+        core.selections.clear();
+        core.view.groups[0].selected_name = Some("node-a".to_owned());
+        core.fail_proxy_view_attempts = 2;
+    }
+
+    supervisor
+        .reconcile_runtime_state()
+        .expect("the first warm-up attempt should remain recoverable");
+    supervisor
+        .reconcile_runtime_state()
+        .expect("the second warm-up attempt should remain recoverable");
+    assert!(
+        harness
+            .core
+            .state
+            .lock()
+            .expect("the Core lock")
+            .selections
+            .is_empty()
+    );
+
+    supervisor
+        .reconcile_runtime_state()
+        .expect("the ready provider view should reconcile");
+    assert_eq!(
+        harness
+            .core
+            .state
+            .lock()
+            .expect("the Core lock")
+            .selections
+            .last()
+            .expect("the saved selection should be restored")
+            .node_name,
+        "node-b"
+    );
+    let probes = supervisor
+        .take_due_probes()
+        .expect("the replacement Probe Generation should be readable");
+    assert_eq!(probes.len(), 2);
+    assert_eq!(
+        probes[0].task.generation,
+        hopash::domain::ProbeGeneration(2)
+    );
+    assert!(
+        supervisor
+            .retry_selection_restore()
+            .expect("selection restoration should be complete")
+    );
+}
+
+#[test]
+fn unresolved_selection_restoration_has_a_fixed_retry_limit() {
+    let harness = Harness::new("selection-restore-limit");
+    harness.core.state.lock().expect("the Core lock").view = two_node_proxy_view();
+    harness.queue_profile("Primary", "node-a");
+    let supervisor = harness.open();
+    add_profile(&supervisor, "https://example.test/primary.yaml");
+    supervisor
+        .execute(ApplicationOperation::ProxySelect {
+            group: "Main".to_owned(),
+            node: NodeRecordId::for_core("node-b").as_str().to_owned(),
+        })
+        .expect("the selection should persist");
+    harness.core.applied(RuntimeGeneration(1));
+    harness.core.state.lock().expect("the Core lock").view = fixture_proxy_view();
+
+    let mut complete = false;
+    for _ in 0..hopash::constants::SELECTION_RESTORE_ATTEMPT_LIMIT {
+        complete = supervisor
+            .retry_selection_restore()
+            .expect("a bounded restore attempt should complete");
+    }
+    assert!(complete);
+
+    let ApplicationOutput::Status(status) = supervisor
+        .execute(ApplicationOperation::GetStatus)
+        .expect("degraded status should remain available")
+    else {
+        panic!("status should return a Status output")
+    };
+    assert_eq!(
+        status.supervisor.lifecycle,
+        hopash::domain::SupervisorLifecycle::Degraded
     );
 }
 

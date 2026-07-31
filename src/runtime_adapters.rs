@@ -143,9 +143,9 @@ pub const fn classify_runtime_apply_error(error: &CoreRuntimeError) -> RuntimeAp
         CoreRuntimeErrorKind::ReloadTimeout | CoreRuntimeErrorKind::Unavailable => {
             RuntimeApplyFailure::Indeterminate
         }
+        CoreRuntimeErrorKind::TunPermissionDenied => RuntimeApplyFailure::TunPermissionDenied,
         CoreRuntimeErrorKind::Authentication
         | CoreRuntimeErrorKind::ProtocolMismatch
-        | CoreRuntimeErrorKind::TunPermissionDenied
         | CoreRuntimeErrorKind::InvalidBundle
         | CoreRuntimeErrorKind::ProcessIdentityMismatch
         | CoreRuntimeErrorKind::Apply

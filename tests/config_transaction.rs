@@ -259,6 +259,7 @@ enum ApplyScript {
     Success,
     DefiniteFailure,
     IndeterminateFailure,
+    TunPermissionDenied,
 }
 
 struct FakeRuntimeState {
@@ -336,6 +337,7 @@ impl RuntimeApplyPort for FakeRuntime {
                 })
             }
             ApplyScript::DefiniteFailure => Err(RuntimeApplyFailure::Definite),
+            ApplyScript::TunPermissionDenied => Err(RuntimeApplyFailure::TunPermissionDenied),
             ApplyScript::IndeterminateFailure => {
                 state.next_instance_generation += 1;
                 state.managed_core = Some(core_handle(
@@ -769,6 +771,30 @@ fn definite_apply_failure_rolls_back_to_the_previous_generation() {
 }
 
 #[test]
+fn tun_preflight_failure_retains_its_transaction_category() {
+    let harness = Harness::new();
+    harness.commit_initial();
+    let candidate = harness.candidate(2);
+    harness.runtime.script([ApplyScript::TunPermissionDenied]);
+
+    let error = harness
+        .coordinator
+        .execute(&candidate)
+        .expect_err("the TUN preflight should fail");
+
+    assert_eq!(error.kind, ConfigTransactionErrorKind::TunPermissionDenied);
+    assert_eq!(
+        error.recovery,
+        RecoveryOutcome::Converged {
+            generation: Some(RuntimeGeneration(1))
+        }
+    );
+    assert_eq!(harness.committed_generation(), Some(RuntimeGeneration(1)));
+    assert_eq!(harness.runtime.generation(), Some(RuntimeGeneration(1)));
+    assert!(!harness.has_prepared());
+}
+
+#[test]
 fn indeterminate_apply_restarts_and_confirms_the_candidate_before_commit() {
     let harness = Harness::new();
     harness.commit_initial();
@@ -1002,6 +1028,55 @@ fn startup_recovery_converges_an_interrupted_candidate_to_the_committed_pointer(
     assert!(recovered.cleared_prepared_journal);
     assert_eq!(harness.runtime.generation(), Some(RuntimeGeneration(1)));
     assert!(!harness.has_prepared());
+}
+
+#[test]
+fn startup_reapply_discards_stale_prepared_state_without_replaying_an_old_runtime() {
+    let harness = Harness::new();
+    harness.commit_initial();
+    let interrupted = harness.candidate(2);
+    harness
+        .persistence
+        .prepare(&interrupted.transaction)
+        .expect("the interrupted journal should be prepared");
+    harness.runtime.force_generation(RuntimeGeneration(2));
+
+    let recovery = harness
+        .coordinator
+        .prepare_startup_reapply(Some(RuntimeGeneration(1)))
+        .expect("startup should prepare a fresh session-specific transaction");
+
+    assert_eq!(recovery.committed_generation, Some(RuntimeGeneration(1)));
+    assert_eq!(recovery.candidate_generation, RuntimeGeneration(3));
+    assert!(recovery.cleared_prepared_journal);
+    assert_eq!(harness.runtime.generation(), Some(RuntimeGeneration(2)));
+    assert!(!harness.has_prepared());
+
+    let current_session = harness.candidate(3);
+    harness
+        .coordinator
+        .execute(&current_session)
+        .expect("the fresh session transaction should allow a skipped generation");
+    assert_eq!(harness.committed_generation(), Some(RuntimeGeneration(3)));
+}
+
+#[test]
+fn failed_startup_reapply_stops_the_candidate_without_replaying_the_old_endpoint() {
+    let harness = Harness::new();
+    harness.commit_initial();
+    let current_session = harness.candidate(2);
+    harness.runtime.script([ApplyScript::DefiniteFailure]);
+
+    let error = harness
+        .coordinator
+        .execute_startup_reapply(&current_session)
+        .expect_err("the startup candidate should fail");
+
+    assert_eq!(error.kind, ConfigTransactionErrorKind::Apply);
+    assert_eq!(harness.committed_generation(), Some(RuntimeGeneration(1)));
+    assert_eq!(harness.runtime.generation(), None);
+    assert!(!harness.has_prepared());
+    assert!(!harness.events().iter().any(|event| event == "apply:1"));
 }
 
 fn assert_event_order(events: &[String], expected: &[&str]) {

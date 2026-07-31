@@ -184,7 +184,7 @@ fn apply_transport_uncertainty_is_classified_as_indeterminate() {
             CoreRuntimeErrorKind::TunPermissionDenied,
             "fixture"
         )),
-        RuntimeApplyFailure::Definite
+        RuntimeApplyFailure::TunPermissionDenied
     );
 }
 

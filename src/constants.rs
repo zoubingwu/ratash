@@ -25,6 +25,7 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const LATENCY_FRESHNESS: Duration = Duration::from_secs(10 * 60);
 pub const PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 pub const MAX_ACTIVE_NODES: usize = 10_000;
+pub const SELECTION_RESTORE_ATTEMPT_LIMIT: usize = 10;
 
 pub const STATUS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 pub const STREAM_STALE_TIMEOUT: Duration = Duration::from_secs(10);

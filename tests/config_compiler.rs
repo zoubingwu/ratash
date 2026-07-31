@@ -576,6 +576,41 @@ fn compiler_requires_private_endpoint_inputs_and_a_directory_staging_root() {
 }
 
 #[test]
+fn persisted_configuration_validation_recompiles_with_its_session_values() {
+    let staging_root = temporary_root("persisted-configuration");
+    let compiler = ConfigCompiler::bundled().expect("the bundled catalog should load");
+    let snapshot = snapshot("rules: [MATCH,DIRECT]\n");
+    let rules = vec!["MATCH,DIRECT".to_owned()];
+    let configuration = compiler
+        .compile(
+            &snapshot,
+            &rules,
+            &AuthoritativeConfig::new("/tmp/old-core.sock", "old-session-secret"),
+            &staging_root,
+        )
+        .expect("the fixture configuration should compile");
+
+    compiler
+        .validate_persisted(
+            &snapshot,
+            &rules,
+            configuration.yaml().as_bytes(),
+            &staging_root,
+        )
+        .expect("the persisted configuration should match its logical inputs");
+
+    let changed = configuration.yaml().replace("mode: rule", "mode: global");
+    assert_eq!(
+        compiler
+            .validate_persisted(&snapshot, &rules, changed.as_bytes(), &staging_root)
+            .expect_err("a changed managed field should fail integrity validation"),
+        ConfigError::PersistedConfigurationInvalid
+    );
+
+    std::fs::remove_dir_all(staging_root).expect("the staging fixture should be removed");
+}
+
+#[test]
 fn local_provider_paths_reject_traversal_external_absolute_paths_and_symlink_escape() {
     let staging_root = temporary_root("provider-paths");
     let outside_root = temporary_root("provider-paths-outside");

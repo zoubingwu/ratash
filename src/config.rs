@@ -241,6 +241,7 @@ pub enum ConfigError {
         path: PathBuf,
     },
     CoreValidationFailed(CoreValidationError),
+    PersistedConfigurationInvalid,
     SerializationFailed,
 }
 
@@ -267,6 +268,7 @@ impl fmt::Debug for ConfigError {
             Self::ProviderPathOutsideStagingRoot { .. } => "ProviderPathOutsideStagingRoot",
             Self::ProviderFileUnavailable { .. } => "ProviderFileUnavailable",
             Self::CoreValidationFailed(_) => "CoreValidationFailed",
+            Self::PersistedConfigurationInvalid => "PersistedConfigurationInvalid",
             Self::SerializationFailed => "SerializationFailed",
         };
         formatter.write_str(kind)
@@ -340,6 +342,9 @@ impl fmt::Display for ConfigError {
                     formatter,
                     "Mihomo rejected the effective configuration: {error}"
                 )
+            }
+            Self::PersistedConfigurationInvalid => {
+                formatter.write_str("the persisted Effective Configuration is invalid")
             }
             Self::SerializationFailed => {
                 formatter.write_str("effective configuration serialization failed")
@@ -468,6 +473,34 @@ impl ConfigCompiler {
             .validate(&configuration, &canonical_staging_root(staging_root)?)
             .map_err(ConfigError::CoreValidationFailed)?;
         Ok(configuration)
+    }
+
+    pub fn validate_persisted(
+        &self,
+        snapshot: &ProfileSnapshot,
+        rules: &[String],
+        persisted: &[u8],
+        staging_root: &Path,
+    ) -> Result<(), ConfigError> {
+        let document: Value = serde_yaml_ng::from_slice(persisted)
+            .map_err(|_| ConfigError::PersistedConfigurationInvalid)?;
+        let document = document
+            .as_mapping()
+            .ok_or(ConfigError::PersistedConfigurationInvalid)?;
+        let controller_unix = document
+            .get("external-controller-unix")
+            .and_then(Value::as_str)
+            .ok_or(ConfigError::PersistedConfigurationInvalid)?;
+        let secret = document
+            .get("secret")
+            .and_then(Value::as_str)
+            .ok_or(ConfigError::PersistedConfigurationInvalid)?;
+        let authoritative = AuthoritativeConfig::new(controller_unix, secret);
+        let expected = self.compile(snapshot, rules, &authoritative, staging_root)?;
+        if expected.yaml().as_bytes() != persisted {
+            return Err(ConfigError::PersistedConfigurationInvalid);
+        }
+        Ok(())
     }
 }
 

@@ -93,6 +93,7 @@ impl TransactionStore for PersistenceStore {
 pub enum RuntimeApplyFailure {
     Definite,
     Indeterminate,
+    TunPermissionDenied,
 }
 
 pub trait RuntimeApplyPort: Send + Sync {
@@ -195,6 +196,7 @@ pub enum ConfigTransactionErrorKind {
     InvalidCandidate,
     Validation,
     Prepare,
+    TunPermissionDenied,
     Apply,
     IndeterminateApply,
     Health,
@@ -251,6 +253,7 @@ impl fmt::Display for ConfigTransactionError {
             ConfigTransactionErrorKind::Prepare => {
                 "configuration transaction journal preparation failed"
             }
+            ConfigTransactionErrorKind::TunPermissionDenied => "TUN capability preflight failed",
             ConfigTransactionErrorKind::Apply => "Runtime Apply failed",
             ConfigTransactionErrorKind::IndeterminateApply => {
                 "Runtime Apply result remained indeterminate after candidate restart"
@@ -277,6 +280,13 @@ pub struct StartupRecovery {
     pub cleared_prepared_journal: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StartupReapply {
+    pub committed_generation: Option<RuntimeGeneration>,
+    pub candidate_generation: RuntimeGeneration,
+    pub cleared_prepared_journal: bool,
+}
+
 pub struct ConfigTransactionDependencies {
     pub store: Arc<dyn TransactionStore>,
     pub runtime: Arc<dyn RuntimeApplyPort>,
@@ -297,6 +307,12 @@ pub struct ConfigTransactionCoordinator {
     revisions: Arc<dyn CandidateRevisionSource>,
     bundles: Arc<dyn RuntimeBundleResolver>,
     owner: OwnerSessionProof,
+}
+
+#[derive(Clone, Copy)]
+enum FailureRecoveryMode {
+    ConvergeCommitted,
+    StopStartupCandidate,
 }
 
 impl ConfigTransactionCoordinator {
@@ -322,7 +338,17 @@ impl ConfigTransactionCoordinator {
         let guard = self.coordinator_lock.lock().map_err(|_| {
             ConfigTransactionError::simple(ConfigTransactionErrorKind::LockPoisoned)
         })?;
-        self.execute_guarded(candidate, guard)
+        self.execute_guarded(candidate, guard, FailureRecoveryMode::ConvergeCommitted)
+    }
+
+    pub fn execute_startup_reapply(
+        &self,
+        candidate: &ConfigTransactionCandidate,
+    ) -> Result<ConfigTransactionSuccess, ConfigTransactionError> {
+        let guard = self.coordinator_lock.lock().map_err(|_| {
+            ConfigTransactionError::simple(ConfigTransactionErrorKind::LockPoisoned)
+        })?;
+        self.execute_guarded(candidate, guard, FailureRecoveryMode::StopStartupCandidate)
     }
 
     pub fn try_execute_rule(
@@ -342,7 +368,7 @@ impl ConfigTransactionCoordinator {
                 ));
             }
         };
-        self.execute_guarded(candidate, guard)
+        self.execute_guarded(candidate, guard, FailureRecoveryMode::ConvergeCommitted)
     }
 
     pub fn recover_startup(&self) -> Result<StartupRecovery, ConfigTransactionError> {
@@ -390,10 +416,83 @@ impl ConfigTransactionCoordinator {
         })
     }
 
+    pub fn prepare_startup_reapply(
+        &self,
+        expected_committed_generation: Option<RuntimeGeneration>,
+    ) -> Result<StartupReapply, ConfigTransactionError> {
+        let _coordinator = self.coordinator_lock.lock().map_err(|_| {
+            ConfigTransactionError::simple(ConfigTransactionErrorKind::LockPoisoned)
+        })?;
+        let state = self
+            .store
+            .recover()
+            .map_err(|_| ConfigTransactionError::simple(ConfigTransactionErrorKind::Recovery))?;
+        let committed_generation = self
+            .generation_from_manifest(state.committed.as_ref())
+            .map_err(|_| ConfigTransactionError::simple(ConfigTransactionErrorKind::Recovery))?;
+        if committed_generation != expected_committed_generation {
+            return Err(ConfigTransactionError::new(
+                ConfigTransactionErrorKind::Recovery,
+                None,
+                committed_generation,
+                RecoveryOutcome::Failed {
+                    target: expected_committed_generation,
+                },
+            ));
+        }
+
+        let prepared_generation = state.prepared.as_ref().and_then(|prepared| {
+            self.store
+                .load_transaction(&prepared.candidate)
+                .ok()
+                .map(|transaction| transaction.runtime_generation)
+        });
+        let highest_generation = committed_generation
+            .into_iter()
+            .chain(prepared_generation)
+            .map(|generation| generation.0)
+            .max()
+            .unwrap_or(0);
+        let candidate_generation = highest_generation
+            .checked_add(1)
+            .filter(|generation| *generation > 0)
+            .map(RuntimeGeneration)
+            .ok_or_else(|| {
+                ConfigTransactionError::new(
+                    ConfigTransactionErrorKind::Recovery,
+                    None,
+                    committed_generation,
+                    RecoveryOutcome::Failed {
+                        target: committed_generation,
+                    },
+                )
+            })?;
+
+        if let Some(prepared) = state.prepared.as_ref()
+            && self.clear_prepared_and_prune(prepared).is_err()
+        {
+            return Err(ConfigTransactionError::new(
+                ConfigTransactionErrorKind::Cleanup,
+                None,
+                committed_generation,
+                RecoveryOutcome::Pending {
+                    target: committed_generation,
+                },
+            ));
+        }
+
+        Ok(StartupReapply {
+            committed_generation,
+            candidate_generation,
+            cleared_prepared_journal: state.prepared.is_some(),
+        })
+    }
+
     fn execute_guarded(
         &self,
         candidate: &ConfigTransactionCandidate,
         _guard: MutexGuard<'_, ()>,
+        failure_recovery_mode: FailureRecoveryMode,
     ) -> Result<ConfigTransactionSuccess, ConfigTransactionError> {
         let initial_state = self.store.recover().map_err(|_| {
             ConfigTransactionError::new(
@@ -479,9 +578,26 @@ impl ConfigTransactionCoordinator {
         {
             Ok(applied) => (applied, ApplyPath::Direct),
             Err(RuntimeApplyFailure::Definite) => {
-                let recovery = self.rollback(&prepared, committed_generation);
+                let recovery = self.recover_failed_candidate(
+                    &prepared,
+                    committed_generation,
+                    failure_recovery_mode,
+                );
                 return Err(ConfigTransactionError::new(
                     ConfigTransactionErrorKind::Apply,
+                    Some(candidate.runtime.generation),
+                    committed_generation,
+                    recovery,
+                ));
+            }
+            Err(RuntimeApplyFailure::TunPermissionDenied) => {
+                let recovery = self.recover_failed_candidate(
+                    &prepared,
+                    committed_generation,
+                    failure_recovery_mode,
+                );
+                return Err(ConfigTransactionError::new(
+                    ConfigTransactionErrorKind::TunPermissionDenied,
                     Some(candidate.runtime.generation),
                     committed_generation,
                     recovery,
@@ -491,7 +607,11 @@ impl ConfigTransactionCoordinator {
                 match self.restart_candidate(&candidate.runtime) {
                     Ok(applied) => (applied, ApplyPath::CandidateRestart),
                     Err(()) => {
-                        let recovery = self.rollback(&prepared, committed_generation);
+                        let recovery = self.recover_failed_candidate(
+                            &prepared,
+                            committed_generation,
+                            failure_recovery_mode,
+                        );
                         return Err(ConfigTransactionError::new(
                             ConfigTransactionErrorKind::IndeterminateApply,
                             Some(candidate.runtime.generation),
@@ -508,7 +628,11 @@ impl ConfigTransactionCoordinator {
                 .confirm(&applied, candidate.runtime.generation)
                 .is_err()
         {
-            let recovery = self.rollback(&prepared, committed_generation);
+            let recovery = self.recover_failed_candidate(
+                &prepared,
+                committed_generation,
+                failure_recovery_mode,
+            );
             return Err(ConfigTransactionError::new(
                 ConfigTransactionErrorKind::Health,
                 Some(candidate.runtime.generation),
@@ -522,6 +646,7 @@ impl ConfigTransactionCoordinator {
                 &prepared,
                 candidate.runtime.generation,
                 committed_generation,
+                failure_recovery_mode,
             )?
         } else if self.clear_prepared_and_prune(&prepared).is_err() {
             RecoveryOutcome::Pending {
@@ -554,10 +679,10 @@ impl ConfigTransactionCoordinator {
             ));
         }
 
-        let expected_generation = committed_generation
-            .map(|generation| generation.0.checked_add(1))
-            .unwrap_or(Some(1))
-            .map(RuntimeGeneration);
+        let generation_is_newer = committed_generation
+            .map_or(candidate_generation.0 > 0, |current| {
+                candidate_generation > current
+            });
         let effective_object = self
             .store
             .read_object_limited(
@@ -565,7 +690,7 @@ impl ConfigTransactionCoordinator {
                 EFFECTIVE_CONFIGURATION_MAX_BYTES,
             )
             .ok();
-        let structurally_valid = expected_generation == Some(candidate_generation)
+        let structurally_valid = generation_is_newer
             && candidate.transaction.runtime_generation == candidate_generation
             && candidate.transaction.profile_revision == candidate.revisions.profile
             && candidate.transaction.local_rule_set_revision == candidate.revisions.local_rule_set
@@ -638,11 +763,28 @@ impl ConfigTransactionCoordinator {
         RecoveryOutcome::Converged { generation: target }
     }
 
+    fn recover_failed_candidate(
+        &self,
+        prepared: &PreparedTransaction,
+        target: Option<RuntimeGeneration>,
+        mode: FailureRecoveryMode,
+    ) -> RecoveryOutcome {
+        match mode {
+            FailureRecoveryMode::ConvergeCommitted => self.rollback(prepared, target),
+            FailureRecoveryMode::StopStartupCandidate => {
+                let _ = self.runtime.stop(&self.owner);
+                let _ = self.clear_prepared_and_prune(prepared);
+                RecoveryOutcome::Failed { target }
+            }
+        }
+    }
+
     fn recover_commit_failure(
         &self,
         prepared: &PreparedTransaction,
         candidate_generation: RuntimeGeneration,
         previous_generation: Option<RuntimeGeneration>,
+        failure_recovery_mode: FailureRecoveryMode,
     ) -> Result<RecoveryOutcome, ConfigTransactionError> {
         let state = match self.store.recover() {
             Ok(state) => state,
@@ -670,7 +812,8 @@ impl ConfigTransactionCoordinator {
             return Ok(recovery);
         }
 
-        let recovery = self.rollback(prepared, previous_generation);
+        let recovery =
+            self.recover_failed_candidate(prepared, previous_generation, failure_recovery_mode);
         Err(ConfigTransactionError::new(
             ConfigTransactionErrorKind::Commit,
             Some(candidate_generation),

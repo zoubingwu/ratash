@@ -24,6 +24,10 @@ use crate::telemetry::{LogLevel, LogSource};
 // -----------------------------------------------------------------------------
 
 pub trait BackgroundApplication: Send + Sync {
+    fn reconcile_runtime_state(&self) -> Result<(), ApplicationError> {
+        Ok(())
+    }
+
     fn take_due_refreshes(&self) -> Result<Vec<RefreshTask>, ApplicationError>;
 
     fn execute_refresh_task(
@@ -70,6 +74,10 @@ pub trait BackgroundApplication: Send + Sync {
 }
 
 impl BackgroundApplication for Supervisor {
+    fn reconcile_runtime_state(&self) -> Result<(), ApplicationError> {
+        Supervisor::reconcile_runtime_state(self)
+    }
+
     fn take_due_refreshes(&self) -> Result<Vec<RefreshTask>, ApplicationError> {
         Supervisor::take_due_refreshes(self)
     }
@@ -361,6 +369,7 @@ fn scheduler_owner(
         if shutdown.is_requested() {
             return;
         }
+        let _ = application.reconcile_runtime_state();
         if !dispatch_refreshes(application.as_ref(), &refresh_sender) {
             return;
         }

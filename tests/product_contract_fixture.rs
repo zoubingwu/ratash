@@ -62,6 +62,10 @@ fn release_fixture_freezes_capacities_and_input_boundaries() {
         ("profile_count", PROFILE_COUNT_MAX),
         ("core_restart_limit", CORE_RESTART_LIMIT),
         ("probe_workers", PROBE_WORKER_COUNT),
+        (
+            "selection_restore_attempts",
+            SELECTION_RESTORE_ATTEMPT_LIMIT,
+        ),
         ("active_nodes", MAX_ACTIVE_NODES),
         ("logs", LOG_CAPACITY),
         ("log_subscriber", LOG_SUBSCRIBER_CAPACITY),

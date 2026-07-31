@@ -23,7 +23,8 @@ use crate::config::{
 };
 use crate::constants::{
     CORE_LOG_LINE_MAX_BYTES, LOG_CAPACITY, PROBE_TIMEOUT, PROBE_URL, PROFILE_COUNT_MAX,
-    PROFILE_REFRESH_INTERVAL, RULE_STRING_MAX_BYTES, TRAFFIC_SERIES_CAPACITY, YAML_MAX_DEPTH,
+    PROFILE_REFRESH_INTERVAL, RULE_STRING_MAX_BYTES, SELECTION_RESTORE_ATTEMPT_LIMIT,
+    TRAFFIC_SERIES_CAPACITY, YAML_MAX_DEPTH,
 };
 use crate::core::{
     Availability, CoreRuntime, CoreRuntimeStatus, DelayProbeRequest, DelayTarget,
@@ -243,10 +244,30 @@ pub trait SupervisorTransactionPort: Send + Sync {
         fail_fast: bool,
     ) -> Result<ConfigTransactionSuccess, SupervisorTransactionFailure>;
 
+    fn apply_startup(
+        &self,
+        request: SupervisorTransactionRequest<'_>,
+    ) -> Result<ConfigTransactionSuccess, SupervisorTransactionFailure> {
+        self.apply(request, false)
+    }
+
     fn persist_metadata(
         &self,
         request: SupervisorTransactionRequest<'_>,
     ) -> Result<(), SupervisorTransactionFailure>;
+
+    fn prepare_startup_reapply(
+        &self,
+        committed_generation: Option<RuntimeGeneration>,
+    ) -> Result<RuntimeGeneration, SupervisorTransactionFailure> {
+        committed_generation
+            .map_or(Some(1), |generation| generation.0.checked_add(1))
+            .filter(|generation| *generation > 0)
+            .map(RuntimeGeneration)
+            .ok_or_else(|| {
+                SupervisorTransactionFailure::new(SupervisorTransactionFailureKind::State)
+            })
+    }
 
     fn set_current_revisions(&self, revisions: CandidateRevisions);
 }
@@ -339,13 +360,12 @@ impl CoordinatedSupervisorTransactions {
                 SupervisorTransactionFailure::new(SupervisorTransactionFailureKind::State)
             })
     }
-}
 
-impl SupervisorTransactionPort for CoordinatedSupervisorTransactions {
-    fn apply(
+    fn apply_transaction(
         &self,
         request: SupervisorTransactionRequest<'_>,
         fail_fast: bool,
+        startup: bool,
     ) -> Result<ConfigTransactionSuccess, SupervisorTransactionFailure> {
         let _guard = if fail_fast {
             self.transaction_lock
@@ -378,7 +398,9 @@ impl SupervisorTransactionPort for CoordinatedSupervisorTransactions {
             configuration: request.configuration.clone(),
             revisions: request.revisions,
         };
-        let result = if fail_fast {
+        let result = if startup {
+            self.coordinator.execute_startup_reapply(&candidate)
+        } else if fail_fast {
             self.coordinator.try_execute_rule(&candidate)
         } else {
             self.coordinator.execute(&candidate)
@@ -390,6 +412,23 @@ impl SupervisorTransactionPort for CoordinatedSupervisorTransactions {
                 Err(error.into())
             }
         }
+    }
+}
+
+impl SupervisorTransactionPort for CoordinatedSupervisorTransactions {
+    fn apply(
+        &self,
+        request: SupervisorTransactionRequest<'_>,
+        fail_fast: bool,
+    ) -> Result<ConfigTransactionSuccess, SupervisorTransactionFailure> {
+        self.apply_transaction(request, fail_fast, false)
+    }
+
+    fn apply_startup(
+        &self,
+        request: SupervisorTransactionRequest<'_>,
+    ) -> Result<ConfigTransactionSuccess, SupervisorTransactionFailure> {
+        self.apply_transaction(request, false, true)
     }
 
     fn persist_metadata(
@@ -438,6 +477,19 @@ impl SupervisorTransactionPort for CoordinatedSupervisorTransactions {
         Ok(())
     }
 
+    fn prepare_startup_reapply(
+        &self,
+        committed_generation: Option<RuntimeGeneration>,
+    ) -> Result<RuntimeGeneration, SupervisorTransactionFailure> {
+        let _guard = self.transaction_lock.lock().map_err(|_| {
+            SupervisorTransactionFailure::new(SupervisorTransactionFailureKind::State)
+        })?;
+        self.coordinator
+            .prepare_startup_reapply(committed_generation)
+            .map(|recovery| recovery.candidate_generation)
+            .map_err(Into::into)
+    }
+
     fn set_current_revisions(&self, revisions: CandidateRevisions) {
         self.revisions.set(revisions);
     }
@@ -471,7 +523,10 @@ struct SupervisorState {
     telemetry_generation: Option<CoreInstanceGeneration>,
     stream_health: StreamHealthSet,
     cached_proxy_view: Option<ProxyView>,
+    observed_core_generation: Option<CoreInstanceGeneration>,
+    probe_core_generation: Option<CoreInstanceGeneration>,
     selection_restore_pending: bool,
+    selection_restore_attempts_remaining: usize,
     degraded: bool,
 }
 
@@ -587,7 +642,7 @@ impl Supervisor {
             )
             .map_err(|_| internal_error())?;
 
-        let (profiles, local_rules, effective_configuration, runtime_generation) =
+        let (profiles, local_rules, effective_configuration, committed_generation) =
             if let Some(hydrated) = hydrated {
                 let active_id = hydrated
                     .profiles
@@ -599,6 +654,15 @@ impl Supervisor {
                     .ok_or_else(internal_error)?;
                 let rules = rule_strings(&hydrated.local_rules)?;
                 let workspace = prepare_profile_workspace(&staging_root, active_id)?;
+                dependencies
+                    .compiler
+                    .validate_persisted(
+                        &active.snapshot,
+                        &rules,
+                        &hydrated.effective_configuration,
+                        &workspace,
+                    )
+                    .map_err(map_config_error)?;
                 let configuration = dependencies
                     .compiler
                     .compile(
@@ -608,9 +672,6 @@ impl Supervisor {
                         &workspace,
                     )
                     .map_err(map_config_error)?;
-                if configuration.yaml().as_bytes() != hydrated.effective_configuration {
-                    return Err(internal_error());
-                }
                 (
                     hydrated.profiles,
                     hydrated.local_rules,
@@ -637,10 +698,35 @@ impl Supervisor {
         let revisions =
             current_revisions(&profiles, &local_rules, effective_configuration.as_ref());
         dependencies.transactions.set_current_revisions(revisions);
+        let mut runtime_generation = committed_generation;
+        let mut startup_degraded = false;
+        if let Some(configuration) = effective_configuration.as_ref() {
+            let generation = dependencies
+                .transactions
+                .prepare_startup_reapply(committed_generation)
+                .map_err(map_transaction_error)?;
+            let result = dependencies
+                .transactions
+                .apply_startup(SupervisorTransactionRequest {
+                    profiles: &profiles,
+                    local_rules: &local_rules,
+                    configuration,
+                    generation,
+                    revisions: current_revisions(&profiles, &local_rules, Some(configuration)),
+                });
+            let success = result.map_err(map_transaction_error)?;
+            startup_degraded = recovery_requires_degraded(success.recovery);
+            runtime_generation = Some(generation);
+        } else {
+            let _ = dependencies
+                .transactions
+                .prepare_startup_reapply(None)
+                .map_err(map_transaction_error)?;
+        }
         let started_at_unix_ms = dependencies.clock.now_unix_ms();
         let initial_status =
             initial_status_snapshot(started_at_unix_ms, &profiles, runtime_generation);
-        Ok(Self {
+        let supervisor = Self {
             clock: dependencies.clock,
             started_at_unix_ms,
             source: dependencies.source,
@@ -662,13 +748,18 @@ impl Supervisor {
                 telemetry_generation: None,
                 stream_health: disconnected_stream_health(),
                 cached_proxy_view: None,
+                observed_core_generation: None,
+                probe_core_generation: None,
                 selection_restore_pending: false,
-                degraded: false,
+                selection_restore_attempts_remaining: 0,
+                degraded: startup_degraded,
             }),
             activation: Mutex::new(ActivationQueue::default()),
             apply_in_progress: AtomicBool::new(false),
             last_status: Mutex::new(initial_status),
-        })
+        };
+        supervisor.reconcile_runtime_state()?;
+        Ok(supervisor)
     }
 
     pub fn refresh_profile(
@@ -780,8 +871,7 @@ impl Supervisor {
                 .ok_or_else(internal_error)?
                 .revision;
             state.refreshes.upsert(profile_id, revision, next_refresh);
-            self.reset_probes(&mut state);
-            self.restore_active_selections(&mut state);
+            self.reset_runtime_state(&mut state);
             Ok(ProfileRefreshDisposition::ActiveApplied)
         } else {
             let rules = snapshot.rule_strings().to_vec();
@@ -972,8 +1062,14 @@ impl Supervisor {
 
     pub fn retry_selection_restore(&self) -> Result<bool, ApplicationError> {
         let mut state = self.state.lock().map_err(|_| internal_error())?;
-        self.restore_active_selections(&mut state);
+        self.reconcile_runtime_state_locked(&mut state);
         Ok(!state.selection_restore_pending)
+    }
+
+    pub fn reconcile_runtime_state(&self) -> Result<(), ApplicationError> {
+        let mut state = self.state.lock().map_err(|_| internal_error())?;
+        self.reconcile_runtime_state_locked(&mut state);
+        Ok(())
     }
 
     fn status(&self) -> Result<StatusSnapshot, ApplicationError> {
@@ -1189,8 +1285,7 @@ impl Supervisor {
             state
                 .refreshes
                 .upsert(profile_id, revision, next_refresh_at_unix_ms);
-            self.reset_probes(&mut state);
-            self.restore_active_selections(&mut state);
+            self.reset_runtime_state(&mut state);
             Some(runtime_apply_success(success))
         } else {
             let added = profiles.get(profile_id).ok_or_else(internal_error)?;
@@ -1300,8 +1395,7 @@ impl Supervisor {
         state.effective_configuration = Some(configuration);
         state.runtime_generation = Some(generation);
         state.cached_proxy_view = None;
-        self.reset_probes(&mut state);
-        self.restore_active_selections(&mut state);
+        self.reset_runtime_state(&mut state);
         let profile = state.profiles.get(profile_id).ok_or_else(internal_error)?;
         Ok(ApplicationOutput::ProfileMutation(ProfileMutationOutcome {
             action: ProfileMutationAction::Activated,
@@ -1410,6 +1504,8 @@ impl Supervisor {
         }
         state.profiles = profiles;
         state.cached_proxy_view = None;
+        state.selection_restore_pending = false;
+        state.selection_restore_attempts_remaining = 0;
         Ok(ApplicationOutput::ProxySelection(ProxySelectionOutcome {
             group: group_name.to_owned(),
             previous_node: previous.map(|previous| SelectorIdentity {
@@ -1662,27 +1758,89 @@ impl Supervisor {
         Ok((core, view))
     }
 
-    fn reset_probes(&self, state: &mut SupervisorState) {
-        state.next_probe_generation = state.next_probe_generation.saturating_add(1).max(1);
-        let generation = ProbeGeneration(state.next_probe_generation);
-        let nodes = self
+    fn reset_runtime_state(&self, state: &mut SupervisorState) {
+        state.observed_core_generation = None;
+        state.probe_core_generation = None;
+        state.cached_proxy_view = None;
+        self.begin_selection_restore(state);
+        self.reconcile_runtime_state_locked(state);
+    }
+
+    fn reconcile_runtime_state_locked(&self, state: &mut SupervisorState) {
+        if state.profiles.active_profile_id().is_none() {
+            state.observed_core_generation = None;
+            state.probe_core_generation = None;
+            state.cached_proxy_view = None;
+            state.probes.deactivate();
+            state.selection_restore_pending = false;
+            state.selection_restore_attempts_remaining = 0;
+            return;
+        }
+        let core = self
             .core
             .runtime_status()
             .ok()
-            .and_then(|status| status.managed_core)
-            .and_then(|core| {
-                let order = effective_group_order(&state.profiles).ok()?;
-                let view = self.core.proxy_view(&core, &order).ok()?;
-                state.cached_proxy_view = Some(view.clone());
-                Some(
-                    view.nodes
-                        .into_values()
-                        .filter(|node| !node.core_internal)
-                        .map(|node| node.record_id)
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .unwrap_or_default();
+            .and_then(|status| status.managed_core);
+        let Some(core) = core else {
+            if state.observed_core_generation.take().is_some() {
+                state.probe_core_generation = None;
+                state.cached_proxy_view = None;
+                state.probes.deactivate();
+                self.begin_selection_restore(state);
+            }
+            self.consume_selection_restore_attempt(state);
+            return;
+        };
+        if state.observed_core_generation != Some(core.instance_generation) {
+            state.observed_core_generation = Some(core.instance_generation);
+            state.probe_core_generation = None;
+            state.cached_proxy_view = None;
+            state.probes.deactivate();
+            self.begin_selection_restore(state);
+        }
+        if state.probe_core_generation == Some(core.instance_generation)
+            && !state.selection_restore_pending
+            && state.cached_proxy_view.is_some()
+        {
+            return;
+        }
+        let order = match effective_group_order(&state.profiles) {
+            Ok(order) => order,
+            Err(_) => {
+                state.degraded = true;
+                return;
+            }
+        };
+        let view = match self.core.proxy_view(&core, &order) {
+            Ok(view) => view,
+            Err(_) => {
+                self.consume_selection_restore_attempt(state);
+                return;
+            }
+        };
+        state.cached_proxy_view = Some(view.clone());
+        if state.probe_core_generation != Some(core.instance_generation) {
+            self.seed_probes(state, core.instance_generation, &view);
+        }
+        if state.selection_restore_pending {
+            self.restore_active_selections(state, &core, &view);
+        }
+    }
+
+    fn seed_probes(
+        &self,
+        state: &mut SupervisorState,
+        core_generation: CoreInstanceGeneration,
+        view: &ProxyView,
+    ) {
+        state.next_probe_generation = state.next_probe_generation.saturating_add(1).max(1);
+        let generation = ProbeGeneration(state.next_probe_generation);
+        let nodes = view
+            .nodes
+            .values()
+            .filter(|node| !node.core_internal)
+            .map(|node| node.record_id.clone())
+            .collect::<Vec<_>>();
         if state
             .probes
             .reset(generation, nodes, self.clock.now_unix_ms())
@@ -1691,11 +1849,36 @@ impl Supervisor {
             state.probes.deactivate();
             state.degraded = true;
         }
+        state.probe_core_generation = Some(core_generation);
     }
 
-    fn restore_active_selections(&self, state: &mut SupervisorState) {
+    fn begin_selection_restore(&self, state: &mut SupervisorState) {
         let Some(active_id) = state.profiles.active_profile_id() else {
             state.selection_restore_pending = false;
+            state.selection_restore_attempts_remaining = 0;
+            return;
+        };
+        let has_selections = state
+            .profiles
+            .get(active_id)
+            .is_some_and(|profile| !profile.selections.is_empty());
+        state.selection_restore_pending = has_selections;
+        state.selection_restore_attempts_remaining = if has_selections {
+            SELECTION_RESTORE_ATTEMPT_LIMIT
+        } else {
+            0
+        };
+    }
+
+    fn restore_active_selections(
+        &self,
+        state: &mut SupervisorState,
+        core: &ManagedCoreHandle,
+        view: &ProxyView,
+    ) {
+        let Some(active_id) = state.profiles.active_profile_id() else {
+            state.selection_restore_pending = false;
+            state.selection_restore_attempts_remaining = 0;
             return;
         };
         let selections = state
@@ -1703,28 +1886,11 @@ impl Supervisor {
             .get(active_id)
             .map(|profile| profile.selections.clone())
             .unwrap_or_default();
-        if selections.is_empty() {
-            state.selection_restore_pending = false;
-            return;
-        }
-        let Some(core) = self
-            .core
-            .runtime_status()
-            .ok()
-            .and_then(|status| status.managed_core)
-        else {
-            state.selection_restore_pending = true;
-            return;
-        };
-        let Some(view) = state.cached_proxy_view.clone() else {
-            state.selection_restore_pending = true;
-            return;
-        };
         let mut pending = false;
         for (group, node_id) in selections {
-            match selection_by_selector(&view, &group, node_id.as_str()) {
+            match selection_by_selector(view, &group, node_id.as_str()) {
                 Ok(selection) => {
-                    if self.core.select_node(&core, &selection).is_err() {
+                    if self.core.select_node(core, &selection).is_err() {
                         pending = true;
                     }
                 }
@@ -1732,6 +1898,23 @@ impl Supervisor {
             }
         }
         state.selection_restore_pending = pending;
+        if pending {
+            self.consume_selection_restore_attempt(state);
+        } else {
+            state.selection_restore_attempts_remaining = 0;
+        }
+    }
+
+    fn consume_selection_restore_attempt(&self, state: &mut SupervisorState) {
+        if !state.selection_restore_pending {
+            return;
+        }
+        state.selection_restore_attempts_remaining =
+            state.selection_restore_attempts_remaining.saturating_sub(1);
+        if state.selection_restore_attempts_remaining == 0 {
+            state.selection_restore_pending = false;
+            state.degraded = true;
+        }
     }
 
     fn record_refresh_failure(
@@ -2389,6 +2572,21 @@ fn map_config_error(error: ConfigError) -> ApplicationError {
 fn map_transaction_error(error: SupervisorTransactionFailure) -> ApplicationError {
     match error.kind {
         SupervisorTransactionFailureKind::Busy => rule_busy_error(),
+        SupervisorTransactionFailureKind::Coordinator(
+            ConfigTransactionErrorKind::TunPermissionDenied,
+        ) => ApplicationError::new(
+            ErrorCode::TunPermissionDenied,
+            "TUN capability is unavailable for the Managed Core",
+            false,
+        )
+        .with_details(ApplicationErrorDetails::RuntimeApplyFailure(Box::new(
+            RuntimeApplyFailureDetails {
+                candidate_generation: error.candidate_generation,
+                committed_generation: error.committed_generation,
+                stage: RuntimeApplyFailureStage::Apply,
+                recovery: application_recovery(error.recovery),
+            },
+        ))),
         kind => ApplicationError::new(
             ErrorCode::ExternalOperationFailed,
             "Runtime Apply failed and the committed configuration was retained",
@@ -2423,6 +2621,7 @@ fn transaction_failure_stage(kind: SupervisorTransactionFailureKind) -> RuntimeA
             }
             ConfigTransactionErrorKind::Validation => RuntimeApplyFailureStage::Validation,
             ConfigTransactionErrorKind::Prepare => RuntimeApplyFailureStage::Prepare,
+            ConfigTransactionErrorKind::TunPermissionDenied => RuntimeApplyFailureStage::Apply,
             ConfigTransactionErrorKind::Apply => RuntimeApplyFailureStage::Apply,
             ConfigTransactionErrorKind::IndeterminateApply => {
                 RuntimeApplyFailureStage::IndeterminateApply

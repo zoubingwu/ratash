@@ -36,6 +36,7 @@
     "profile_count": 1000,
     "core_restart_limit": 3,
     "probe_workers": 16,
+    "selection_restore_attempts": 10,
     "active_nodes": 10000,
     "logs": 10000,
     "log_subscriber": 256,
