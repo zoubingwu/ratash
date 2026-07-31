@@ -15,4 +15,5 @@ pub mod profile;
 pub mod profile_source;
 pub mod rule;
 pub mod scheduler;
+pub mod state;
 pub mod telemetry;

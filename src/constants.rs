@@ -7,6 +7,10 @@ pub const PROFILE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PROFILE_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 pub const PROFILE_REDIRECT_LIMIT: usize = 5;
 pub const PROFILE_METADATA_NAME_MAX_BYTES: usize = 80;
+pub const PROFILE_COUNT_MAX: usize = 1_000;
+pub const SUBSCRIPTION_URL_MAX_BYTES: usize = 8 * 1_024;
+pub const SUPERVISOR_STATE_MAX_BYTES: usize = 16 * 1024 * 1024;
+pub const EFFECTIVE_CONFIGURATION_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 pub const CORE_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CORE_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);

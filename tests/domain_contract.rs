@@ -14,6 +14,11 @@ fn subscription_url_accepts_http_and_https_at_the_domain_boundary() {
 
     assert!(SubscriptionUrl::parse("file:///tmp/profile.yaml").is_err());
     assert!(SubscriptionUrl::parse("https://?token=secret").is_err());
+    let oversized = format!(
+        "https://example.test/{}",
+        "a".repeat(hopash::constants::SUBSCRIPTION_URL_MAX_BYTES)
+    );
+    assert!(SubscriptionUrl::parse(&oversized).is_err());
 }
 
 #[test]
@@ -90,6 +95,11 @@ fn node_record_ids_are_deterministic_and_source_aware() {
     assert_eq!(core.as_str().len(), "node_v1_".len() + 64);
     assert!(!core.as_str().contains("Shared Node"));
     assert!(!provider_a.as_str().contains("Provider A"));
+    assert_eq!(
+        NodeRecordId::parse(core.as_str()).expect("generated ID should parse"),
+        core
+    );
+    assert!(NodeRecordId::parse("node_v1_invalid").is_err());
 }
 
 #[test]

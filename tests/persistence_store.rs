@@ -58,6 +58,27 @@ fn immutable_objects_are_content_addressed_and_readable() {
 }
 
 #[test]
+fn immutable_object_reads_enforce_the_callers_memory_limit() {
+    let directory = TestDirectory::new();
+    let store = PersistenceStore::open(&directory.path).expect("store should open");
+    let id = store
+        .put_object(b"bounded content")
+        .expect("object should be stored");
+
+    let error = store
+        .read_object_limited(&id, 4)
+        .expect_err("oversized object should be rejected before allocation");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        store
+            .read_object_limited(&id, 15)
+            .expect("bounded object should read"),
+        b"bounded content"
+    );
+}
+
+#[test]
 fn interrupted_object_install_is_repaired_by_the_next_identical_write() {
     let directory = TestDirectory::new();
     let store = PersistenceStore::open(&directory.path).expect("store should open");

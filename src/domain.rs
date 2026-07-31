@@ -92,6 +92,9 @@ pub struct SubscriptionUrl(url::Url);
 
 impl SubscriptionUrl {
     pub fn parse(value: &str) -> Result<Self, InvalidSubscriptionUrl> {
+        if value.len() > crate::constants::SUBSCRIPTION_URL_MAX_BYTES {
+            return Err(InvalidSubscriptionUrl);
+        }
         let parsed = url::Url::parse(value).map_err(|_| InvalidSubscriptionUrl)?;
         if matches!(parsed.scheme(), "http" | "https") && parsed.host().is_some() {
             Ok(Self(parsed))
@@ -201,6 +204,19 @@ impl std::error::Error for InvalidSubscriptionUrl {}
 pub struct NodeRecordId(String);
 
 impl NodeRecordId {
+    pub fn parse(value: &str) -> Result<Self, InvalidNodeRecordId> {
+        let digest = value.strip_prefix("node_v1_").ok_or(InvalidNodeRecordId)?;
+        if digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(InvalidNodeRecordId)
+        }
+    }
+
     #[must_use]
     pub fn for_core(proxy_name: &str) -> Self {
         Self(source_aware_node_id("core", &[proxy_name]))
@@ -219,6 +235,17 @@ impl NodeRecordId {
         &self.0
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidNodeRecordId;
+
+impl fmt::Display for InvalidNodeRecordId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Node record ID is invalid")
+    }
+}
+
+impl std::error::Error for InvalidNodeRecordId {}
 
 fn source_aware_node_id(source: &str, components: &[&str]) -> String {
     let mut canonical = b"hopash-node-v1\0".to_vec();

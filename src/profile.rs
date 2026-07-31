@@ -315,6 +315,39 @@ impl ProfileCatalog {
         self.profiles.get(&id)
     }
 
+    pub fn get_mut(&mut self, id: ProfileId) -> Option<&mut Profile> {
+        self.profiles.get_mut(&id)
+    }
+
+    pub fn profiles(&self) -> impl ExactSizeIterator<Item = &Profile> {
+        self.profiles.values()
+    }
+
+    pub fn restore(
+        profiles: Vec<Profile>,
+        active_profile_id: ProfileId,
+        active_revision: ActiveProfileRevision,
+    ) -> Result<Self, ProfileRestoreError> {
+        if profiles.is_empty() || profiles.len() > crate::constants::PROFILE_COUNT_MAX {
+            return Err(ProfileRestoreError::InvalidProfileCount);
+        }
+        if active_revision.0 == 0 {
+            return Err(ProfileRestoreError::InvalidActiveRevision);
+        }
+        let mut catalog = Self::new();
+        for profile in profiles {
+            catalog
+                .insert(profile)
+                .map_err(|_| ProfileRestoreError::DuplicateProfileId)?;
+        }
+        if !catalog.profiles.contains_key(&active_profile_id) {
+            return Err(ProfileRestoreError::ActiveProfileMissing);
+        }
+        catalog.active_profile_id = Some(active_profile_id);
+        catalog.active_revision = active_revision;
+        Ok(catalog)
+    }
+
     pub fn resolve(&self, selector: &str) -> Result<ProfileId, ProfileSelectorError> {
         if let Ok(id) = ProfileId::parse(selector) {
             return self
@@ -421,6 +454,14 @@ pub enum ProfileSelectorError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProfileInsertError {
     DuplicateId(ProfileId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProfileRestoreError {
+    InvalidProfileCount,
+    DuplicateProfileId,
+    ActiveProfileMissing,
+    InvalidActiveRevision,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -9,6 +9,10 @@ fn observable_product_limits_are_frozen_for_the_release_contract() {
     assert_eq!(PROFILE_TOTAL_TIMEOUT.as_secs(), 30);
     assert_eq!(PROFILE_REDIRECT_LIMIT, 5);
     assert_eq!(PROFILE_METADATA_NAME_MAX_BYTES, 80);
+    assert_eq!(PROFILE_COUNT_MAX, 1_000);
+    assert_eq!(SUBSCRIPTION_URL_MAX_BYTES, 8_192);
+    assert_eq!(SUPERVISOR_STATE_MAX_BYTES, 16 * 1_024 * 1_024);
+    assert_eq!(EFFECTIVE_CONFIGURATION_MAX_BYTES, 64 * 1_024 * 1_024);
     assert_eq!(PROBE_WORKER_COUNT, 16);
     assert_eq!(PROBE_INTERVAL.as_secs(), 300);
     assert_eq!(PROBE_TIMEOUT.as_secs(), 5);
@@ -27,6 +31,9 @@ fn observable_product_limits_are_frozen_for_the_release_contract() {
 fn every_input_and_transport_boundary_has_a_positive_limit() {
     for limit in [
         PROFILE_RESPONSE_MAX_BYTES,
+        SUBSCRIPTION_URL_MAX_BYTES,
+        SUPERVISOR_STATE_MAX_BYTES,
+        EFFECTIVE_CONFIGURATION_MAX_BYTES,
         YAML_MAX_DEPTH,
         RULE_STRING_MAX_BYTES,
         LOCAL_RULE_SET_MAX_BYTES,

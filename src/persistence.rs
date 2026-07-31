@@ -186,8 +186,20 @@ impl PersistenceStore {
     }
 
     pub fn read_object(&self, id: &ObjectId) -> io::Result<Vec<u8>> {
+        self.read_object_limited(id, usize::MAX)
+    }
+
+    pub fn read_object_limited(&self, id: &ObjectId, limit: usize) -> io::Result<Vec<u8>> {
+        let file = File::open(self.object_path(id))?;
+        if file.metadata()?.len() > limit as u64 {
+            return Err(invalid_data("stored object exceeds its size limit"));
+        }
         let mut content = Vec::new();
-        File::open(self.object_path(id))?.read_to_end(&mut content)?;
+        file.take((limit as u64).saturating_add(1))
+            .read_to_end(&mut content)?;
+        if content.len() > limit {
+            return Err(invalid_data("stored object exceeds its size limit"));
+        }
         if ObjectId::for_content(&content) != *id {
             return Err(invalid_data("stored object does not match its content ID"));
         }
