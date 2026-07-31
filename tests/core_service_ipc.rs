@@ -906,6 +906,28 @@ fn pending_connection_capacity_rejects_excess_clients_and_shutdown_stays_bounded
     assert!(started.elapsed() < Duration::from_millis(300));
 }
 
+#[test]
+fn idle_server_shutdown_wakes_accept_without_dispatching_a_request() {
+    let mut harness = Harness::new();
+    std::thread::sleep(Duration::from_millis(30));
+    let started = Instant::now();
+
+    harness
+        .server
+        .shutdown()
+        .expect("the idle server should stop through its wake connection");
+
+    assert!(started.elapsed() < Duration::from_millis(200));
+    let state = harness.runtime.state();
+    assert_eq!(state.open_count, 0);
+    assert_eq!(state.apply_count, 0);
+    assert_eq!(state.status_count, 0);
+    assert_eq!(state.logs_count, 0);
+    assert_eq!(state.stop_count, 0);
+    assert_eq!(state.close_count, 0);
+    assert!(!harness.socket_path.exists());
+}
+
 fn write_bundle(root: &Path, generation: RuntimeGeneration) -> RuntimeBundle {
     fs::create_dir_all(root.join("providers"))
         .expect("the bundle fixture directories should be created");

@@ -17,6 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use mio::net::UnixListener as MioUnixListener;
+use mio::{Events, Interest, Poll, Token, Waker};
 use nix::fcntl::{OFlag, open, openat};
 use nix::sys::stat::{Mode, SFlag, fstat};
 use serde::{Deserialize, Serialize};
@@ -46,10 +48,11 @@ pub const CORE_SERVICE_IPC_PROTOCOL_VERSION: u16 = 1;
 const RUNTIME_MANIFEST_SCHEMA_VERSION: u16 = 1;
 const RUNTIME_MANIFEST_MAX_BYTES: usize = 64 * 1_024;
 const RUNTIME_PROVIDER_FILE_MAX: usize = 1_024;
-const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DEFAULT_SERVER_WORKERS: usize = 4;
 const DEFAULT_PENDING_CONNECTIONS: usize = 32;
 const CORE_SERVICE_LOG_BATCH_MAX: usize = IPC_FRAME_MAX_BYTES / CORE_LOG_LINE_MAX_BYTES / 2;
+const CORE_SERVICE_LISTENER_TOKEN: Token = Token(0);
+const CORE_SERVICE_SHUTDOWN_TOKEN: Token = Token(1);
 
 // -----------------------------------------------------------------------------
 // Synchronous client
@@ -299,6 +302,7 @@ pub struct CoreServiceServer {
     socket_path: PathBuf,
     socket_identity: SocketIdentity,
     shutdown: Arc<AtomicBool>,
+    waker: Arc<Waker>,
     thread: Option<JoinHandle<io::Result<()>>>,
 }
 
@@ -332,12 +336,13 @@ impl CoreServiceServer {
             device: metadata.dev(),
             inode: metadata.ino(),
         };
-        if let Err(error) = listener.set_nonblocking(true) {
-            drop(listener);
-            let _ = cleanup_socket(&socket_path, socket_identity);
-            return Err(error);
-        }
-
+        let (listener, poll, waker) = match prepare_accept_loop(listener) {
+            Ok(parts) => parts,
+            Err(error) => {
+                let _ = cleanup_socket(&socket_path, socket_identity);
+                return Err(error);
+            }
+        };
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
         let runtime: Arc<dyn CoreRuntime> = runtime;
@@ -347,10 +352,19 @@ impl CoreServiceServer {
             runtime_retention: Mutex::new(runtime_retention),
             session: Mutex::new(None),
         });
+        let thread_accept_metrics = CoreServiceAcceptMetrics::default();
         let thread = match thread::Builder::new()
             .name("hopash-core-service-accept".to_owned())
-            .spawn(move || run_server(listener, context, config, thread_shutdown))
-        {
+            .spawn(move || {
+                run_server(
+                    listener,
+                    poll,
+                    context,
+                    config,
+                    thread_shutdown,
+                    thread_accept_metrics,
+                )
+            }) {
             Ok(thread) => thread,
             Err(error) => {
                 let _ = cleanup_socket(&socket_path, socket_identity);
@@ -361,19 +375,42 @@ impl CoreServiceServer {
             socket_path,
             socket_identity,
             shutdown,
+            waker,
             thread: Some(thread),
         })
     }
 
     pub fn shutdown(&mut self) -> io::Result<()> {
         self.shutdown.store(true, Ordering::Release);
+        let wake_result = match self.thread.as_ref() {
+            Some(thread) if !thread.is_finished() => self.waker.wake(),
+            Some(_) | None => Ok(()),
+        };
         let thread_result = self.thread.take().map_or(Ok(()), |thread| {
             thread
                 .join()
                 .map_err(|_| io::Error::other("Core service IPC thread panicked"))?
         });
         let cleanup_result = cleanup_socket(&self.socket_path, self.socket_identity);
-        thread_result.and(cleanup_result)
+        wake_result.and(thread_result).and(cleanup_result)
+    }
+}
+
+#[derive(Clone, Default)]
+struct CoreServiceAcceptMetrics {
+    #[cfg(test)]
+    poll_returns: Arc<AtomicU64>,
+}
+
+impl CoreServiceAcceptMetrics {
+    fn record_poll_return(&self) {
+        #[cfg(test)]
+        self.poll_returns.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn poll_returns(&self) -> u64 {
+        self.poll_returns.load(Ordering::Relaxed)
     }
 }
 
@@ -503,11 +540,26 @@ fn validate_server_config(config: &CoreServiceServerConfig) -> io::Result<()> {
     Ok(())
 }
 
+fn prepare_accept_loop(listener: UnixListener) -> io::Result<(MioUnixListener, Poll, Arc<Waker>)> {
+    listener.set_nonblocking(true)?;
+    let mut listener = MioUnixListener::from_std(listener);
+    let poll = Poll::new()?;
+    poll.registry().register(
+        &mut listener,
+        CORE_SERVICE_LISTENER_TOKEN,
+        Interest::READABLE,
+    )?;
+    let waker = Arc::new(Waker::new(poll.registry(), CORE_SERVICE_SHUTDOWN_TOKEN)?);
+    Ok((listener, poll, waker))
+}
+
 fn run_server(
-    listener: UnixListener,
+    listener: MioUnixListener,
+    mut poll: Poll,
     context: Arc<ServerContext>,
     config: CoreServiceServerConfig,
     shutdown: Arc<AtomicBool>,
+    accept_metrics: CoreServiceAcceptMetrics,
 ) -> io::Result<()> {
     let (sender, receiver) = mpsc::sync_channel(config.pending_connection_capacity);
     let receiver = Arc::new(Mutex::new(receiver));
@@ -518,7 +570,14 @@ fn run_server(
         config.io_timeout,
         Arc::clone(&shutdown),
     )?;
-    let accept_result = accept_loop(&listener, &sender, config.allowed_owner_uid, &shutdown);
+    let accept_result = accept_loop(
+        &listener,
+        &mut poll,
+        &sender,
+        config.allowed_owner_uid,
+        &shutdown,
+        &accept_metrics,
+    );
     drop(sender);
     let mut worker_panicked = false;
     for worker in workers {
@@ -575,14 +634,54 @@ fn worker_loop(
 }
 
 fn accept_loop(
-    listener: &UnixListener,
+    listener: &MioUnixListener,
+    poll: &mut Poll,
+    sender: &SyncSender<AcceptedConnection>,
+    allowed_owner_uid: u32,
+    shutdown: &AtomicBool,
+    metrics: &CoreServiceAcceptMetrics,
+) -> io::Result<()> {
+    let mut events = Events::with_capacity(4);
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        events.clear();
+        match poll.poll(&mut events, None) {
+            Ok(()) => metrics.record_poll_return(),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+        if shutdown.load(Ordering::Acquire)
+            || events
+                .iter()
+                .any(|event| event.token() == CORE_SERVICE_SHUTDOWN_TOKEN)
+        {
+            return Ok(());
+        }
+        if events
+            .iter()
+            .any(|event| event.token() == CORE_SERVICE_LISTENER_TOKEN)
+        {
+            accept_ready_connections(listener, sender, allowed_owner_uid, shutdown)?;
+        }
+    }
+}
+
+fn accept_ready_connections(
+    listener: &MioUnixListener,
     sender: &SyncSender<AcceptedConnection>,
     allowed_owner_uid: u32,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
-    while !shutdown.load(Ordering::Acquire) {
+    loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                let stream = UnixStream::from(stream);
+                if shutdown.load(Ordering::Acquire) {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    return Ok(());
+                }
                 let peer_uid = match peer_uid(&stream) {
                     Ok(peer_uid) if peer_uid == allowed_owner_uid => peer_uid,
                     Err(_) => {
@@ -603,14 +702,11 @@ fn accept_loop(
                     }
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::park_timeout(SERVER_POLL_INTERVAL);
-            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
         }
     }
-    Ok(())
 }
 
 fn handle_connection(
@@ -2127,6 +2223,123 @@ fn unavailable_error(diagnostic: &'static str) -> CoreRuntimeError {
 
 fn unexpected_response() -> CoreRuntimeError {
     protocol_error("Core service IPC response operation mismatch")
+}
+
+#[cfg(test)]
+mod accept_loop_tests {
+    use super::*;
+
+    #[test]
+    fn idle_poll_blocks_without_periodic_wakes_and_shutdown_bypasses_the_worker_queue() {
+        let root = Path::new("/private/tmp").join(format!(
+            "hcs-accept-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).expect("the accept fixture root should be created");
+        let socket_path = root.join("core.sock");
+        let listener =
+            UnixListener::bind(&socket_path).expect("the idle accept fixture should bind");
+        let (listener, mut poll, waker) =
+            prepare_accept_loop(listener).expect("the idle accept loop should prepare");
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let metrics = CoreServiceAcceptMetrics::default();
+        let thread_metrics = metrics.clone();
+        let worker = thread::spawn(move || {
+            accept_loop(
+                &listener,
+                &mut poll,
+                &sender,
+                nix::unistd::geteuid().as_raw(),
+                &thread_shutdown,
+                &thread_metrics,
+            )
+        });
+        thread::sleep(Duration::from_millis(75));
+
+        assert_eq!(metrics.poll_returns(), 0);
+        shutdown.store(true, Ordering::Release);
+        waker
+            .wake()
+            .expect("the private shutdown waker should fire");
+        worker
+            .join()
+            .expect("the accept thread should finish")
+            .expect("the accept loop should stop cleanly");
+        assert_eq!(metrics.poll_returns(), 1);
+        assert!(receiver.try_recv().is_err());
+
+        fs::remove_dir_all(root).expect("the accept fixture root should be removed");
+    }
+
+    #[test]
+    fn private_waker_stops_accept_after_path_replacement_and_preserves_the_replacement() {
+        let root = Path::new("/private/tmp").join(format!(
+            "hcs-wake-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).expect("the wake fixture root should be created");
+        let socket_path = root.join("core.sock");
+        let original =
+            UnixListener::bind(&socket_path).expect("the original wake socket should bind");
+        let metadata = fs::symlink_metadata(&socket_path)
+            .expect("the original wake socket metadata should load");
+        let identity = SocketIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        let (listener, mut poll, waker) =
+            prepare_accept_loop(original).expect("the original accept loop should prepare");
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let metrics = CoreServiceAcceptMetrics::default();
+        let thread_metrics = metrics.clone();
+        let worker = thread::spawn(move || {
+            accept_loop(
+                &listener,
+                &mut poll,
+                &sender,
+                nix::unistd::geteuid().as_raw(),
+                &thread_shutdown,
+                &thread_metrics,
+            )
+        });
+        thread::sleep(Duration::from_millis(25));
+        let mut server = CoreServiceServer {
+            socket_path: socket_path.clone(),
+            socket_identity: identity,
+            shutdown,
+            waker,
+            thread: Some(worker),
+        };
+        fs::remove_file(&socket_path).expect("the original wake socket should be removed");
+        let replacement =
+            UnixListener::bind(&socket_path).expect("the replacement wake socket should bind");
+        replacement
+            .set_nonblocking(true)
+            .expect("the replacement listener should be observable");
+
+        let started = std::time::Instant::now();
+        let error = server
+            .shutdown()
+            .expect_err("shutdown cleanup should preserve the replacement socket");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(server.thread.is_none());
+        assert_eq!(metrics.poll_returns(), 1);
+        assert!(receiver.try_recv().is_err());
+        assert!(matches!(
+            replacement.accept(),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        drop(replacement);
+        fs::remove_dir_all(root).expect("the wake fixture root should be removed");
+    }
 }
 
 fn safe_io_error(error: io::Error, message: &'static str) -> io::Error {
