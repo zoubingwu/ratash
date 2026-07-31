@@ -8,8 +8,8 @@ use hopash::service::{
     CoreProcessController, CoreProcessLog, OwnedProcessIdentity, PrivilegedCoreRuntimeService,
     PrivilegedServiceConfig, PrivilegedServiceDependencies, PrivilegedServiceLifecycle,
     ProcessIdentityProbe, RuntimeManifestFileV1, RuntimeManifestV1, SecretGenerator,
-    ServicePlatformError, ServicePlatformErrorKind, SpawnedCoreProcess, TunCapabilityPreflight,
-    UnexpectedExitOutcome, VerifiedRuntimeBundle,
+    ServiceMaintenanceOutcome, ServicePlatformError, ServicePlatformErrorKind, SpawnedCoreProcess,
+    TunCapabilityPreflight, UnexpectedExitOutcome, VerifiedRuntimeBundle,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
@@ -514,6 +514,148 @@ fn every_core_request_requires_the_exact_session_proof_and_revoke_cleans_up() {
             .expect_err("the revoked proof should expire")
             .kind,
         CoreRuntimeErrorKind::Authentication
+    );
+}
+
+#[test]
+fn maintenance_revokes_a_dead_or_replaced_owner_and_stops_its_owned_core() {
+    for replacement_identity in [None, Some("replacement-process")] {
+        let harness = Harness::new();
+        let session = harness.open();
+        harness
+            .service
+            .apply_candidate(&session.proof, &harness.bundle(1))
+            .expect("the Core should spawn");
+        match replacement_identity {
+            Some(identity) => harness.identities.set(100, identity),
+            None => harness.identities.remove(100),
+        }
+
+        let outcome = harness
+            .service
+            .maintenance_tick()
+            .expect("maintenance should revoke the stale owner");
+
+        assert_eq!(outcome, ServiceMaintenanceOutcome::OwnerRevoked);
+        assert_eq!(harness.processes.stop_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            harness
+                .service
+                .status(&session.proof)
+                .expect_err("the stale owner proof should expire")
+                .kind,
+            CoreRuntimeErrorKind::Authentication
+        );
+        assert_eq!(
+            harness
+                .service
+                .maintenance_tick()
+                .expect("idle maintenance should remain available"),
+            ServiceMaintenanceOutcome::Unchanged(PrivilegedServiceLifecycle::Idle)
+        );
+    }
+}
+
+#[test]
+fn maintenance_restarts_an_unexpected_core_exit_with_the_bounded_policy() {
+    let harness = Harness::with_limits(3, 4, 8);
+    let session = harness.open();
+    let first = harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect("the initial Core should spawn");
+    harness.processes.mark_exited(first.managed_core.pid);
+    harness
+        .processes
+        .script_spawns([SpawnScript::Failure, SpawnScript::Success]);
+
+    let outcome = harness
+        .service
+        .maintenance_tick()
+        .expect("maintenance should recover the unexpected exit");
+
+    let ServiceMaintenanceOutcome::UnexpectedExit(UnexpectedExitOutcome::Restarted {
+        attempts,
+        managed_core,
+    }) = outcome
+    else {
+        panic!("maintenance should report the restarted Core");
+    };
+    assert_eq!(attempts, 2);
+    assert_eq!(managed_core.instance_generation, CoreInstanceGeneration(3));
+    assert_eq!(managed_core.runtime_generation, RuntimeGeneration(1));
+    assert_eq!(
+        harness
+            .service
+            .maintenance_tick()
+            .expect("the restarted Core should remain healthy"),
+        ServiceMaintenanceOutcome::Unchanged(PrivilegedServiceLifecycle::Running)
+    );
+}
+
+#[test]
+fn maintenance_preserves_the_degraded_restart_bound() {
+    let harness = Harness::with_limits(2, 4, 8);
+    let session = harness.open();
+    let first = harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect("the initial Core should spawn");
+    harness.processes.mark_exited(first.managed_core.pid);
+    harness
+        .processes
+        .script_spawns([SpawnScript::Failure, SpawnScript::Failure]);
+
+    assert_eq!(
+        harness
+            .service
+            .maintenance_tick()
+            .expect("maintenance should exhaust the bounded restart policy"),
+        ServiceMaintenanceOutcome::UnexpectedExit(UnexpectedExitOutcome::Degraded { attempts: 2 })
+    );
+    assert_eq!(
+        harness
+            .service
+            .maintenance_tick()
+            .expect("degraded maintenance should remain bounded"),
+        ServiceMaintenanceOutcome::Unchanged(PrivilegedServiceLifecycle::Degraded)
+    );
+    assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+fn service_shutdown_is_idempotent_and_clears_the_owner() {
+    let harness = Harness::new();
+    let session = harness.open();
+    harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect("the Core should spawn");
+
+    harness
+        .service
+        .shutdown_service()
+        .expect("service shutdown should stop the owned Core");
+    harness
+        .service
+        .shutdown_service()
+        .expect("repeated service shutdown should be idempotent");
+
+    assert_eq!(harness.processes.stop_count.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        harness
+            .service
+            .status(&session.proof)
+            .expect_err("shutdown should clear the owner proof")
+            .kind,
+        CoreRuntimeErrorKind::Authentication
+    );
+    assert_eq!(
+        harness
+            .service
+            .maintenance_tick()
+            .expect("maintenance should observe an idle service"),
+        ServiceMaintenanceOutcome::Unchanged(PrivilegedServiceLifecycle::Idle)
     );
 }
 

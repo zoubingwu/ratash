@@ -298,6 +298,13 @@ pub enum UnexpectedExitOutcome {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServiceMaintenanceOutcome {
+    Unchanged(PrivilegedServiceLifecycle),
+    OwnerRevoked,
+    UnexpectedExit(UnexpectedExitOutcome),
+}
+
 #[derive(Clone)]
 struct ServiceOwner {
     owner_uid: u32,
@@ -469,6 +476,51 @@ impl PrivilegedCoreRuntimeService {
         self.cleanup_owner(&mut state)
     }
 
+    pub fn maintenance_tick(&self) -> Result<ServiceMaintenanceOutcome, CoreRuntimeError> {
+        let mut state = self.lock_state()?;
+        let Some(owner) = state.owner.clone() else {
+            return Ok(ServiceMaintenanceOutcome::Unchanged(
+                PrivilegedServiceLifecycle::Idle,
+            ));
+        };
+        let owner_start_identity = self
+            .dependencies
+            .identities
+            .start_identity(owner.supervisor_pid)
+            .map_err(|_| {
+                service_error(
+                    CoreRuntimeErrorKind::Unavailable,
+                    "owner process identity inspection failed",
+                )
+            })?;
+        if owner_start_identity.as_deref() != Some(owner.supervisor_start_identity.as_str()) {
+            self.cleanup_owner(&mut state)?;
+            return Ok(ServiceMaintenanceOutcome::OwnerRevoked);
+        }
+        if state.degraded {
+            return Ok(ServiceMaintenanceOutcome::Unchanged(
+                PrivilegedServiceLifecycle::Degraded,
+            ));
+        }
+        let Some(record) = state.managed_core.as_ref() else {
+            return Ok(ServiceMaintenanceOutcome::Unchanged(
+                PrivilegedServiceLifecycle::Owned,
+            ));
+        };
+        if self.owned_process_is_live(&record.owned_identity)? {
+            return Ok(ServiceMaintenanceOutcome::Unchanged(
+                PrivilegedServiceLifecycle::Running,
+            ));
+        }
+        let outcome = self.restart_owned_core(&mut state, &owner)?;
+        Ok(ServiceMaintenanceOutcome::UnexpectedExit(outcome))
+    }
+
+    pub fn shutdown_service(&self) -> Result<(), CoreRuntimeError> {
+        let mut state = self.lock_state()?;
+        self.cleanup_owner(&mut state)
+    }
+
     pub fn handle_unexpected_exit(
         &self,
         proof: &OwnerSessionProof,
@@ -497,42 +549,7 @@ impl PrivilegedCoreRuntimeService {
                 "unexpected exit process remains live",
             ));
         }
-        let bundle = state.last_bundle.clone().ok_or_else(|| {
-            service_error(
-                CoreRuntimeErrorKind::Unavailable,
-                "unexpected exit has no runtime bundle",
-            )
-        })?;
-        state.managed_core = None;
-
-        for attempt in 1..=self.restart_limit {
-            state.consecutive_restart_failures = attempt;
-            let verified = match self.verify_bundle(&bundle) {
-                Ok(verified) => verified,
-                Err(_) => continue,
-            };
-            if self.dependencies.tun.check(owner.owner_uid).is_err() {
-                continue;
-            }
-            match self.spawn_verified(&mut state, &owner, &verified) {
-                Ok(record) => {
-                    let managed_core = record.handle.clone();
-                    state.managed_core = Some(record);
-                    state.degraded = false;
-                    state.consecutive_restart_failures = 0;
-                    return Ok(UnexpectedExitOutcome::Restarted {
-                        attempts: attempt,
-                        managed_core,
-                    });
-                }
-                Err(_) => continue,
-            }
-        }
-
-        state.degraded = true;
-        Ok(UnexpectedExitOutcome::Degraded {
-            attempts: self.restart_limit,
-        })
+        self.restart_owned_core(&mut state, &owner)
     }
 
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, ServiceState>, CoreRuntimeError> {
@@ -561,6 +578,49 @@ impl PrivilegedCoreRuntimeService {
         state.logs.clear();
         state.dropped_log_sequence = state.next_log_sequence.saturating_sub(1);
         Ok(())
+    }
+
+    fn restart_owned_core(
+        &self,
+        state: &mut ServiceState,
+        owner: &ServiceOwner,
+    ) -> Result<UnexpectedExitOutcome, CoreRuntimeError> {
+        let bundle = state.last_bundle.clone().ok_or_else(|| {
+            service_error(
+                CoreRuntimeErrorKind::Unavailable,
+                "unexpected exit has no runtime bundle",
+            )
+        })?;
+        state.managed_core = None;
+
+        for attempt in 1..=self.restart_limit {
+            state.consecutive_restart_failures = attempt;
+            let verified = match self.verify_bundle(&bundle) {
+                Ok(verified) => verified,
+                Err(_) => continue,
+            };
+            if self.dependencies.tun.check(owner.owner_uid).is_err() {
+                continue;
+            }
+            match self.spawn_verified(state, owner, &verified) {
+                Ok(record) => {
+                    let managed_core = record.handle.clone();
+                    state.managed_core = Some(record);
+                    state.degraded = false;
+                    state.consecutive_restart_failures = 0;
+                    return Ok(UnexpectedExitOutcome::Restarted {
+                        attempts: attempt,
+                        managed_core,
+                    });
+                }
+                Err(_) => continue,
+            }
+        }
+
+        state.degraded = true;
+        Ok(UnexpectedExitOutcome::Degraded {
+            attempts: self.restart_limit,
+        })
     }
 
     fn owned_process_is_live(
