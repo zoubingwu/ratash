@@ -1,24 +1,18 @@
 //! Live user-local IPC client and server adapters.
-//!
-//! The current application seam exposes one-shot operations. Streaming wire
-//! requests receive a stable unavailable response until application-level
-//! subscription and tail operations define their lifecycle and response flow.
 
 use std::fmt;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io;
 use std::net::Shutdown;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use mio::net::UnixStream as MioUnixStream;
-use mio::{Events, Interest, Poll, Token};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, SockAddr, Socket, Type};
 
@@ -34,7 +28,10 @@ use crate::application::{
     RuleSummary, RuntimeApplyOutcome, RuntimeApplyStatus, SelectorCandidate, SelectorIdentity,
     SelectorKind,
 };
-use crate::constants::IPC_REQUEST_TIMEOUT;
+use crate::constants::{
+    CORE_LOG_LINE_MAX_BYTES, IPC_FRAME_MAX_BYTES, IPC_REQUEST_TIMEOUT, LOG_CAPACITY,
+    LOG_SUBSCRIBER_CAPACITY, STATUS_SUBSCRIBER_CAPACITY,
+};
 use crate::domain::{
     ActiveProfileSummary, ApplyState, CoreInstanceGeneration, CoreLifecycle, CoreStatus,
     LatencySample, LocalRuleSetRevision, NodeRecordId, ProbeGeneration, ProfileId,
@@ -44,144 +41,24 @@ use crate::domain::{
 };
 use crate::error::ErrorCode;
 use crate::ipc::{
-    EmptyPayload, IpcError, IpcRequest, IpcResponse, NodeSelectorPayload, OperationConversionError,
-    PeerAuthorizationError, PeerAuthorizer, ProfileAddPayload, ProfileSelectorPayload,
-    ProxyListPayload, ProxySelectPayload, RequestId, RequestOperation, RuleAddPayload,
-    RulePlacement, RuleReplacePayload, RuleSelectorPayload, bind_private_listener, read_frame,
-    write_frame,
+    EmptyPayload, IpcError, IpcRequest, IpcResponse, IpcStreamFrame, IpcStreamPayload,
+    LogStreamItem, LogSubscriber, LogSubscriptionPayload, LogTailPayload, LogTailV1,
+    NodeSelectorPayload, OperationConversionError, PeerAuthorizationError, PeerAuthorizer,
+    ProfileAddPayload, ProfileSelectorPayload, ProxyListPayload, ProxySelectPayload, RequestId,
+    RequestOperation, RuleAddPayload, RulePlacement, RuleReplacePayload, RuleSelectorPayload,
+    StatusStreamItem, StatusSubscriber, StatusSubscriptionPayload, bind_private_listener,
+    read_frame, write_frame,
 };
+use crate::telemetry::CoreLogRecord;
+
+#[path = "unix_io.rs"]
+pub(crate) mod unix_io;
+
+use unix_io::DeadlineUnixStream;
 
 const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DEFAULT_SERVER_WORKERS: usize = 4;
 const DEFAULT_PENDING_CONNECTIONS: usize = 32;
-const IPC_IO_TOKEN: Token = Token(0);
-
-struct DeadlineUnixStream {
-    stream: MioUnixStream,
-    poll: Poll,
-    events: Events,
-    timeout: Duration,
-    read_deadline: Option<Instant>,
-    write_deadline: Option<Instant>,
-}
-
-impl DeadlineUnixStream {
-    fn new(stream: UnixStream, timeout: Duration) -> io::Result<Self> {
-        stream.set_nonblocking(true)?;
-        let mut stream = MioUnixStream::from_std(stream);
-        let poll = Poll::new()?;
-        poll.registry()
-            .register(&mut stream, IPC_IO_TOKEN, Interest::READABLE)?;
-        Ok(Self {
-            stream,
-            poll,
-            events: Events::with_capacity(4),
-            timeout,
-            read_deadline: None,
-            write_deadline: None,
-        })
-    }
-
-    fn begin_read(&mut self) -> io::Result<()> {
-        self.read_deadline = Some(deadline_after(self.timeout)?);
-        Ok(())
-    }
-
-    fn begin_write(&mut self) -> io::Result<()> {
-        self.write_deadline = Some(deadline_after(self.timeout)?);
-        Ok(())
-    }
-
-    fn remaining(deadline: Option<Instant>) -> io::Result<Duration> {
-        let deadline = deadline.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::TimedOut, "IPC deadline is unavailable")
-        })?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "IPC deadline expired",
-            ))
-        } else {
-            Ok(remaining)
-        }
-    }
-
-    fn wait(&mut self, interest: Interest, deadline: Option<Instant>) -> io::Result<()> {
-        self.poll
-            .registry()
-            .reregister(&mut self.stream, IPC_IO_TOKEN, interest)?;
-        loop {
-            let remaining = Self::remaining(deadline)?;
-            self.events.clear();
-            match self.poll.poll(&mut self.events, Some(remaining)) {
-                Ok(())
-                    if self
-                        .events
-                        .iter()
-                        .any(|event| event.token() == IPC_IO_TOKEN) =>
-                {
-                    return Ok(());
-                }
-                Ok(()) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "IPC deadline expired",
-                    ));
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
-        }
-    }
-}
-
-impl Read for DeadlineUnixStream {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        loop {
-            match self.stream.read(buffer) {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    self.wait(Interest::READABLE, self.read_deadline)?;
-                }
-                result => return result,
-            }
-        }
-    }
-}
-
-impl Write for DeadlineUnixStream {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        loop {
-            match self.stream.write(buffer) {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    self.wait(Interest::WRITABLE, self.write_deadline)?;
-                }
-                result => return result,
-            }
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        loop {
-            match self.stream.flush() {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    self.wait(Interest::WRITABLE, self.write_deadline)?;
-                }
-                result => return result,
-            }
-        }
-    }
-}
-
-fn deadline_after(timeout: Duration) -> io::Result<Instant> {
-    Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "IPC deadline is invalid"))
-}
-
 // -----------------------------------------------------------------------------
 // Synchronous client
 // -----------------------------------------------------------------------------
@@ -234,6 +111,854 @@ impl IpcClient {
         socket.connect_timeout(&address, self.connect_timeout)?;
         let stream = UnixStream::from(socket);
         Ok(stream)
+    }
+
+    pub fn subscribe_status(
+        &self,
+        after_sequence: Option<u64>,
+        connection_generation: u64,
+    ) -> Result<StatusStream, ApplicationError> {
+        let transport = self.open_stream(
+            RequestOperation::SubscribeStatus(StatusSubscriptionPayload { after_sequence }),
+            connection_generation,
+        )?;
+        Ok(StatusStream {
+            transport,
+            current_snapshot: None,
+            last_sequence: None,
+            finished: false,
+        })
+    }
+
+    pub fn follow_logs(
+        &self,
+        after_sequence: Option<u64>,
+        connection_generation: u64,
+    ) -> Result<LogStream, ApplicationError> {
+        let transport = self.open_stream(
+            RequestOperation::FollowLogs(LogSubscriptionPayload { after_sequence }),
+            connection_generation,
+        )?;
+        Ok(LogStream {
+            transport,
+            last_sequence: after_sequence,
+            finished: false,
+        })
+    }
+
+    pub fn log_tail(&self, after_sequence: Option<u64>) -> Result<LogTailV1, ApplicationError> {
+        let request_id = self.request_id();
+        let request = IpcRequest::new(
+            request_id,
+            RequestOperation::LogTail(LogTailPayload { after_sequence }),
+        );
+        let stream = self.connect().map_err(connect_error)?;
+        let mut stream = DeadlineUnixStream::new(stream, self.io_timeout).map_err(connect_error)?;
+        stream.begin_write().map_err(connect_error)?;
+        write_frame(&mut stream, &request).map_err(write_error)?;
+        stream.begin_read().map_err(connect_error)?;
+        let response: IpcResponse = read_frame(&mut stream).map_err(read_error)?;
+        response
+            .ensure_correlated(request_id)
+            .map_err(|_| protocol_error("The IPC response did not match the request"))?;
+        if let Some(error) = response.error() {
+            return Err(application_error(error));
+        }
+        serde_json::from_value(
+            response
+                .data()
+                .cloned()
+                .ok_or_else(|| protocol_error("The IPC response outcome is incomplete"))?,
+        )
+        .map_err(|_| protocol_error("The IPC log tail response is invalid"))
+    }
+
+    fn open_stream(
+        &self,
+        operation: RequestOperation,
+        connection_generation: u64,
+    ) -> Result<StreamTransport, ApplicationError> {
+        let request_id = self.request_id();
+        let request = IpcRequest::new(request_id, operation);
+        let stream = self.connect().map_err(connect_error)?;
+        let cancellation = IpcStreamCancellation::new(
+            stream
+                .try_clone()
+                .map_err(|_| connect_error(io::Error::other("IPC stream clone failed")))?,
+        );
+        let mut stream = DeadlineUnixStream::new(stream, self.io_timeout).map_err(connect_error)?;
+        stream.begin_write().map_err(connect_error)?;
+        write_frame(&mut stream, &request).map_err(write_error)?;
+        Ok(StreamTransport {
+            stream,
+            request_id,
+            connection_generation,
+            cancellation,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct IpcStreamCancellation {
+    inner: Arc<IpcStreamCancellationInner>,
+}
+
+struct IpcStreamCancellationInner {
+    cancelled: AtomicBool,
+    stream: UnixStream,
+}
+
+impl IpcStreamCancellation {
+    fn new(stream: UnixStream) -> Self {
+        Self {
+            inner: Arc::new(IpcStreamCancellationInner {
+                cancelled: AtomicBool::new(false),
+                stream,
+            }),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.inner.cancelled.store(true, Ordering::Release);
+        let _ = self.inner.stream.shutdown(Shutdown::Both);
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+}
+
+impl fmt::Debug for IpcStreamCancellation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IpcStreamCancellation")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GeneratedStreamItem<T> {
+    pub connection_generation: u64,
+    pub item: T,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StatusStreamUpdate {
+    Snapshot {
+        sequence: u64,
+        timestamp_unix_ms: u64,
+        snapshot: StatusSnapshot,
+    },
+    Delta {
+        sequence: u64,
+        timestamp_unix_ms: u64,
+        patch: serde_json::Value,
+        snapshot: StatusSnapshot,
+    },
+    ResyncRequired {
+        expected_sequence: u64,
+        observed_sequence: u64,
+    },
+}
+
+struct StreamTransport {
+    stream: DeadlineUnixStream,
+    request_id: RequestId,
+    connection_generation: u64,
+    cancellation: IpcStreamCancellation,
+}
+
+impl StreamTransport {
+    fn next_frame(&mut self) -> Result<Option<IpcStreamFrame>, ApplicationError> {
+        if self.cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        self.stream.begin_read().map_err(connect_error)?;
+        let value: serde_json::Value = match read_frame(&mut self.stream) {
+            Ok(value) => value,
+            Err(_) if self.cancellation.is_cancelled() => return Ok(None),
+            Err(error) => return Err(read_error(error)),
+        };
+        if let Ok(frame) = serde_json::from_value::<IpcStreamFrame>(value.clone()) {
+            frame
+                .ensure_correlated(self.request_id)
+                .map_err(|_| protocol_error("The IPC stream frame did not match the request"))?;
+            return Ok(Some(frame));
+        }
+        if let Ok(response) = serde_json::from_value::<IpcResponse>(value) {
+            response
+                .ensure_correlated(self.request_id)
+                .map_err(|_| protocol_error("The IPC response did not match the request"))?;
+            if let Some(error) = response.error() {
+                return Err(application_error(error));
+            }
+        }
+        Err(protocol_error("The IPC stream frame is invalid"))
+    }
+}
+
+impl Drop for StreamTransport {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
+pub struct StatusStream {
+    transport: StreamTransport,
+    current_snapshot: Option<serde_json::Value>,
+    last_sequence: Option<u64>,
+    finished: bool,
+}
+
+impl StatusStream {
+    #[must_use]
+    pub fn cancellation(&self) -> IpcStreamCancellation {
+        self.transport.cancellation.clone()
+    }
+
+    #[must_use]
+    pub fn connection_generation(&self) -> u64 {
+        self.transport.connection_generation
+    }
+
+    #[must_use]
+    pub fn resume_after_sequence(&self) -> Option<u64> {
+        self.last_sequence
+    }
+
+    pub fn next_item(
+        &mut self,
+    ) -> Result<Option<GeneratedStreamItem<StatusStreamUpdate>>, ApplicationError> {
+        if self.finished {
+            return Ok(None);
+        }
+        loop {
+            let Some(frame) = self.transport.next_frame()? else {
+                self.finished = true;
+                return Ok(None);
+            };
+            let update = match frame.payload {
+                IpcStreamPayload::Heartbeat => continue,
+                IpcStreamPayload::Logs(_) => {
+                    self.finished = true;
+                    return Err(protocol_error(
+                        "The status subscription received a log stream frame",
+                    ));
+                }
+                IpcStreamPayload::Status(item) => self.decode_item(item)?,
+            };
+            return Ok(Some(GeneratedStreamItem {
+                connection_generation: self.transport.connection_generation,
+                item: update,
+            }));
+        }
+    }
+
+    fn decode_item(
+        &mut self,
+        item: StatusStreamItem,
+    ) -> Result<StatusStreamUpdate, ApplicationError> {
+        match item {
+            StatusStreamItem::Snapshot {
+                sequence,
+                timestamp_unix_ms,
+                snapshot,
+            } => {
+                if self.current_snapshot.is_some() {
+                    self.finished = true;
+                    return Err(protocol_error(
+                        "The status subscription received an unexpected snapshot",
+                    ));
+                }
+                let decoded = decode_status_snapshot(snapshot.clone())?;
+                self.current_snapshot = Some(snapshot);
+                self.last_sequence = Some(sequence);
+                Ok(StatusStreamUpdate::Snapshot {
+                    sequence,
+                    timestamp_unix_ms,
+                    snapshot: decoded,
+                })
+            }
+            StatusStreamItem::Event {
+                sequence,
+                timestamp_unix_ms,
+                event,
+            } => {
+                let Some(expected_sequence) =
+                    self.last_sequence.and_then(|value| value.checked_add(1))
+                else {
+                    self.finished = true;
+                    return Err(protocol_error(
+                        "The status subscription requires a full snapshot",
+                    ));
+                };
+                if sequence != expected_sequence {
+                    self.finished = true;
+                    return Err(protocol_error(
+                        "The status subscription sequence is invalid",
+                    ));
+                }
+                let Some(current) = self.current_snapshot.as_mut() else {
+                    self.finished = true;
+                    return Err(protocol_error(
+                        "The status subscription started without a snapshot",
+                    ));
+                };
+                apply_json_merge_patch(current, &event);
+                let decoded = decode_status_snapshot(current.clone())?;
+                self.last_sequence = Some(sequence);
+                Ok(StatusStreamUpdate::Delta {
+                    sequence,
+                    timestamp_unix_ms,
+                    patch: event,
+                    snapshot: decoded,
+                })
+            }
+            StatusStreamItem::ResyncRequired {
+                expected_sequence,
+                observed_sequence,
+            } => {
+                let valid = self.last_sequence.is_some_and(|last| {
+                    last.checked_add(1)
+                        .is_some_and(|next| expected_sequence >= next)
+                }) && observed_sequence >= expected_sequence;
+                if !valid {
+                    self.finished = true;
+                    return Err(protocol_error(
+                        "The status resynchronization marker is invalid",
+                    ));
+                }
+                self.finished = true;
+                Ok(StatusStreamUpdate::ResyncRequired {
+                    expected_sequence,
+                    observed_sequence,
+                })
+            }
+        }
+    }
+}
+
+impl Iterator for StatusStream {
+    type Item = Result<GeneratedStreamItem<StatusStreamUpdate>, ApplicationError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_item().transpose()
+    }
+}
+
+pub struct LogStream {
+    transport: StreamTransport,
+    last_sequence: Option<u64>,
+    finished: bool,
+}
+
+impl LogStream {
+    #[must_use]
+    pub fn cancellation(&self) -> IpcStreamCancellation {
+        self.transport.cancellation.clone()
+    }
+
+    #[must_use]
+    pub fn connection_generation(&self) -> u64 {
+        self.transport.connection_generation
+    }
+
+    #[must_use]
+    pub fn resume_after_sequence(&self) -> Option<u64> {
+        self.last_sequence
+    }
+
+    pub fn next_item(
+        &mut self,
+    ) -> Result<Option<GeneratedStreamItem<LogStreamItem>>, ApplicationError> {
+        if self.finished {
+            return Ok(None);
+        }
+        loop {
+            let Some(frame) = self.transport.next_frame()? else {
+                self.finished = true;
+                return Ok(None);
+            };
+            let item = match frame.payload {
+                IpcStreamPayload::Heartbeat => continue,
+                IpcStreamPayload::Status(_) => {
+                    self.finished = true;
+                    return Err(protocol_error(
+                        "The log subscription received a status stream frame",
+                    ));
+                }
+                IpcStreamPayload::Logs(item) => item,
+            };
+            self.validate_log_item(&item)?;
+            if matches!(item, LogStreamItem::Gap { .. }) {
+                self.finished = true;
+            }
+            return Ok(Some(GeneratedStreamItem {
+                connection_generation: self.transport.connection_generation,
+                item,
+            }));
+        }
+    }
+
+    fn validate_log_item(&mut self, item: &LogStreamItem) -> Result<(), ApplicationError> {
+        match item {
+            LogStreamItem::Record { record } => {
+                if self.last_sequence.is_some_and(|sequence| {
+                    sequence
+                        .checked_add(1)
+                        .is_none_or(|expected| expected != record.sequence)
+                }) {
+                    self.finished = true;
+                    return Err(protocol_error("The log subscription sequence is invalid"));
+                }
+                self.last_sequence = Some(record.sequence);
+            }
+            LogStreamItem::Gap {
+                after_sequence,
+                latest_sequence,
+            } => {
+                if *after_sequence != self.last_sequence
+                    || after_sequence.is_some_and(|after| *latest_sequence <= after)
+                {
+                    self.finished = true;
+                    return Err(protocol_error("The log gap marker is invalid"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Iterator for LogStream {
+    type Item = Result<GeneratedStreamItem<LogStreamItem>, ApplicationError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_item().transpose()
+    }
+}
+
+fn encode_status_snapshot(status: StatusSnapshot) -> Result<serde_json::Value, StreamBrokerError> {
+    serde_json::to_value(WireStatusSnapshot::from(status)).map_err(|_| StreamBrokerError::Encoding)
+}
+
+fn decode_status_snapshot(value: serde_json::Value) -> Result<StatusSnapshot, ApplicationError> {
+    serde_json::from_value::<WireStatusSnapshot>(value)
+        .map_err(|_| protocol_error("The IPC status snapshot is invalid"))?
+        .try_into()
+        .map_err(|_| protocol_error("The IPC status snapshot is invalid"))
+}
+
+fn apply_json_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    let serde_json::Value::Object(patch) = patch else {
+        *target = patch.clone();
+        return;
+    };
+    if !target.is_object() {
+        *target = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let target = target
+        .as_object_mut()
+        .expect("the target was initialized as an object");
+    for (key, value) in patch {
+        if value.is_null() {
+            target.remove(key);
+        } else {
+            apply_json_merge_patch(
+                target.entry(key.clone()).or_insert(serde_json::Value::Null),
+                value,
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamBrokerError {
+    Encoding,
+    InvalidCapacity,
+    ItemTooLarge,
+    StatusSequence { expected: u64, actual: u64 },
+    LogSequence { expected: u64, actual: u64 },
+    SequenceExhausted,
+}
+
+impl fmt::Display for StreamBrokerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Encoding => formatter.write_str("IPC stream data could not be encoded"),
+            Self::InvalidCapacity => formatter.write_str("IPC stream capacity must be positive"),
+            Self::ItemTooLarge => formatter.write_str("IPC stream data exceeds the frame limit"),
+            Self::StatusSequence { expected, actual } => write!(
+                formatter,
+                "status stream sequence {actual} does not match expected sequence {expected}"
+            ),
+            Self::LogSequence { expected, actual } => write!(
+                formatter,
+                "log stream sequence {actual} does not match expected sequence {expected}"
+            ),
+            Self::SequenceExhausted => formatter.write_str("IPC stream sequence is exhausted"),
+        }
+    }
+}
+
+impl std::error::Error for StreamBrokerError {}
+
+#[derive(Clone)]
+pub struct IpcStreamBroker {
+    status: Arc<Mutex<StatusBrokerState>>,
+    logs: Arc<Mutex<LogBrokerState>>,
+}
+
+struct StatusBrokerState {
+    sequence: u64,
+    timestamp_unix_ms: u64,
+    snapshot: serde_json::Value,
+    subscribers: Vec<Weak<StatusSubscription>>,
+}
+
+struct LogBrokerState {
+    capacity: usize,
+    dropped_total: u64,
+    records: std::collections::VecDeque<CoreLogRecord>,
+    subscribers: Vec<Weak<LogSubscription>>,
+}
+
+struct StatusSubscription {
+    queue: Mutex<StatusSubscriber>,
+    ready: Condvar,
+}
+
+struct LogSubscription {
+    queue: Mutex<LogSubscriber>,
+    ready: Condvar,
+}
+
+impl IpcStreamBroker {
+    pub fn new(
+        sequence: u64,
+        timestamp_unix_ms: u64,
+        snapshot: StatusSnapshot,
+    ) -> Result<Self, StreamBrokerError> {
+        Self::with_log_capacity(sequence, timestamp_unix_ms, snapshot, LOG_CAPACITY)
+    }
+
+    pub fn with_log_capacity(
+        sequence: u64,
+        timestamp_unix_ms: u64,
+        snapshot: StatusSnapshot,
+        log_capacity: usize,
+    ) -> Result<Self, StreamBrokerError> {
+        if log_capacity == 0 {
+            return Err(StreamBrokerError::InvalidCapacity);
+        }
+        let snapshot = encode_status_snapshot(snapshot)?;
+        ensure_stream_item_size(&snapshot)?;
+        Ok(Self {
+            status: Arc::new(Mutex::new(StatusBrokerState {
+                sequence,
+                timestamp_unix_ms,
+                snapshot,
+                subscribers: Vec::new(),
+            })),
+            logs: Arc::new(Mutex::new(LogBrokerState {
+                capacity: log_capacity,
+                dropped_total: 0,
+                records: std::collections::VecDeque::with_capacity(log_capacity),
+                subscribers: Vec::new(),
+            })),
+        })
+    }
+
+    pub fn publish_status(
+        &self,
+        sequence: u64,
+        timestamp_unix_ms: u64,
+        snapshot: StatusSnapshot,
+    ) -> Result<(), StreamBrokerError> {
+        let snapshot = encode_status_snapshot(snapshot)?;
+        ensure_stream_item_size(&snapshot)?;
+        let mut state = self
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let expected = state
+            .sequence
+            .checked_add(1)
+            .ok_or(StreamBrokerError::SequenceExhausted)?;
+        if sequence != expected {
+            return Err(StreamBrokerError::StatusSequence {
+                expected,
+                actual: sequence,
+            });
+        }
+        let patch = json_merge_patch(&state.snapshot, &snapshot);
+        ensure_stream_item_size(&patch)?;
+        state.sequence = sequence;
+        state.timestamp_unix_ms = timestamp_unix_ms;
+        state.snapshot = snapshot;
+        state.subscribers.retain(|subscriber| {
+            let Some(subscriber) = subscriber.upgrade() else {
+                return false;
+            };
+            subscriber.publish(sequence, timestamp_unix_ms, patch.clone());
+            true
+        });
+        Ok(())
+    }
+
+    pub fn publish_log(&self, record: CoreLogRecord) -> Result<(), StreamBrokerError> {
+        if record.message().len() > CORE_LOG_LINE_MAX_BYTES {
+            return Err(StreamBrokerError::ItemTooLarge);
+        }
+        ensure_stream_item_size(&crate::ipc::LogRecordV1::from(&record))?;
+        let mut state = self
+            .logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(latest) = state.records.back().map(CoreLogRecord::sequence) {
+            let expected = latest
+                .checked_add(1)
+                .ok_or(StreamBrokerError::SequenceExhausted)?;
+            if record.sequence() != expected {
+                return Err(StreamBrokerError::LogSequence {
+                    expected,
+                    actual: record.sequence(),
+                });
+            }
+        }
+        if state.records.len() == state.capacity {
+            state.records.pop_front();
+            state.dropped_total = state.dropped_total.saturating_add(1);
+        }
+        state.records.push_back(record.clone());
+        state.subscribers.retain(|subscriber| {
+            let Some(subscriber) = subscriber.upgrade() else {
+                return false;
+            };
+            subscriber.publish(&record);
+            true
+        });
+        Ok(())
+    }
+
+    fn subscribe_status(&self) -> (StatusStreamItem, Arc<StatusSubscription>) {
+        let mut state = self
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .subscribers
+            .retain(|subscriber| subscriber.strong_count() > 0);
+        let mut queue = StatusSubscriber::new(
+            STATUS_SUBSCRIBER_CAPACITY,
+            state.sequence,
+            state.timestamp_unix_ms,
+            state.snapshot.clone(),
+        )
+        .expect("the status subscriber capacity is positive");
+        let initial = queue
+            .pop_front()
+            .expect("a new status subscriber contains its snapshot");
+        let subscriber = Arc::new(StatusSubscription {
+            queue: Mutex::new(queue),
+            ready: Condvar::new(),
+        });
+        state.subscribers.push(Arc::downgrade(&subscriber));
+        (initial, subscriber)
+    }
+
+    fn subscribe_logs(&self, after_sequence: Option<u64>) -> Arc<LogSubscription> {
+        let mut state = self
+            .logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .subscribers
+            .retain(|subscriber| subscriber.strong_count() > 0);
+        let anchor = after_sequence.or_else(|| state.records.back().map(CoreLogRecord::sequence));
+        let mut queue = LogSubscriber::new(LOG_SUBSCRIBER_CAPACITY, anchor)
+            .expect("the log subscriber capacity is positive");
+        if after_sequence.is_some() {
+            for record in state
+                .records
+                .iter()
+                .filter(|record| after_sequence.is_none_or(|sequence| record.sequence() > sequence))
+            {
+                queue.publish(record);
+            }
+        }
+        let subscriber = Arc::new(LogSubscription {
+            queue: Mutex::new(queue),
+            ready: Condvar::new(),
+        });
+        state.subscribers.push(Arc::downgrade(&subscriber));
+        subscriber
+    }
+
+    fn log_tail(&self, after_sequence: Option<u64>) -> LogTailV1 {
+        let state = self
+            .logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let earliest_sequence = state.records.front().map(CoreLogRecord::sequence);
+        let latest_sequence = state.records.back().map(CoreLogRecord::sequence);
+        let source_gap = after_sequence
+            .zip(earliest_sequence)
+            .is_some_and(|(after, earliest)| {
+                after.checked_add(1).is_some_and(|next| next < earliest)
+            });
+        let candidates = state
+            .records
+            .iter()
+            .filter(|record| after_sequence.is_none_or(|after| record.sequence() > after))
+            .collect::<Vec<_>>();
+        let mut records = Vec::new();
+        let mut encoded_bytes = 512_usize;
+        let payload_budget = IPC_FRAME_MAX_BYTES.saturating_sub(4_096);
+        for record in candidates.iter().rev() {
+            let projected = crate::ipc::LogRecordV1::from(*record);
+            let record_bytes = serde_json::to_vec(&projected)
+                .map_or(payload_budget, |value| value.len().saturating_add(1));
+            if encoded_bytes.saturating_add(record_bytes) > payload_budget {
+                break;
+            }
+            encoded_bytes = encoded_bytes.saturating_add(record_bytes);
+            records.push(projected);
+        }
+        records.reverse();
+        let truncated = records.len() < candidates.len();
+        LogTailV1 {
+            earliest_sequence: if truncated {
+                records.first().map(|record| record.sequence)
+            } else {
+                earliest_sequence
+            },
+            latest_sequence,
+            records,
+            dropped_total: state.dropped_total,
+            gap: source_gap || truncated,
+        }
+    }
+
+    fn notify_all(&self) {
+        let status = self
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for subscriber in status.subscribers.iter().filter_map(Weak::upgrade) {
+            subscriber.ready.notify_all();
+        }
+        drop(status);
+        let logs = self
+            .logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for subscriber in logs.subscribers.iter().filter_map(Weak::upgrade) {
+            subscriber.ready.notify_all();
+        }
+    }
+}
+
+impl fmt::Debug for IpcStreamBroker {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IpcStreamBroker")
+            .finish_non_exhaustive()
+    }
+}
+
+impl StatusSubscription {
+    fn publish(&self, sequence: u64, timestamp_unix_ms: u64, patch: serde_json::Value) {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .publish(sequence, timestamp_unix_ms, patch);
+        self.ready.notify_one();
+    }
+
+    fn wait_next(&self, shutdown: &AtomicBool, timeout: Duration) -> Option<StatusStreamItem> {
+        wait_for_item(&self.queue, &self.ready, shutdown, timeout, |queue| {
+            queue.pop_front()
+        })
+    }
+}
+
+impl LogSubscription {
+    fn publish(&self, record: &CoreLogRecord) {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .publish(record);
+        self.ready.notify_one();
+    }
+
+    fn wait_next(&self, shutdown: &AtomicBool, timeout: Duration) -> Option<LogStreamItem> {
+        wait_for_item(&self.queue, &self.ready, shutdown, timeout, |queue| {
+            queue.pop_front()
+        })
+    }
+}
+
+fn wait_for_item<Q, T>(
+    queue: &Mutex<Q>,
+    ready: &Condvar,
+    shutdown: &AtomicBool,
+    timeout: Duration,
+    mut pop: impl FnMut(&mut Q) -> Option<T>,
+) -> Option<T> {
+    let mut queue = queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(item) = pop(&mut queue) {
+        return Some(item);
+    }
+    if shutdown.load(Ordering::Acquire) {
+        return None;
+    }
+    let (mut queue, _) = ready
+        .wait_timeout(queue, timeout)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pop(&mut queue)
+}
+
+fn ensure_stream_item_size(value: &impl Serialize) -> Result<(), StreamBrokerError> {
+    let size = serde_json::to_vec(value)
+        .map_err(|_| StreamBrokerError::Encoding)?
+        .len();
+    if size > IPC_FRAME_MAX_BYTES.saturating_sub(4_096) {
+        Err(StreamBrokerError::ItemTooLarge)
+    } else {
+        Ok(())
+    }
+}
+
+fn json_merge_patch(
+    previous: &serde_json::Value,
+    current: &serde_json::Value,
+) -> serde_json::Value {
+    match (previous, current) {
+        (serde_json::Value::Object(previous), serde_json::Value::Object(current)) => {
+            let mut patch = serde_json::Map::new();
+            for key in previous.keys() {
+                if !current.contains_key(key) {
+                    patch.insert(key.clone(), serde_json::Value::Null);
+                }
+            }
+            for (key, value) in current {
+                match previous.get(key) {
+                    Some(previous) if previous == value => {}
+                    Some(previous) => {
+                        patch.insert(key.clone(), json_merge_patch(previous, value));
+                    }
+                    None => {
+                        patch.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            serde_json::Value::Object(patch)
+        }
+        _ => current.clone(),
     }
 }
 
@@ -595,6 +1320,7 @@ pub struct IpcServer {
     socket_path: PathBuf,
     socket_identity: SocketIdentity,
     shutdown: Arc<AtomicBool>,
+    streams: Option<Arc<IpcStreamBroker>>,
     thread: Option<JoinHandle<io::Result<()>>>,
 }
 
@@ -603,6 +1329,34 @@ impl IpcServer {
         socket_path: impl AsRef<Path>,
         application: Arc<A>,
         authorizer: Arc<P>,
+        config: IpcServerConfig,
+    ) -> io::Result<Self>
+    where
+        A: ApplicationClient + Send + Sync + 'static,
+        P: PeerAuthorizer + 'static,
+    {
+        Self::start_inner(socket_path, application, authorizer, None, config)
+    }
+
+    pub fn start_with_streams<A, P>(
+        socket_path: impl AsRef<Path>,
+        application: Arc<A>,
+        authorizer: Arc<P>,
+        streams: Arc<IpcStreamBroker>,
+        config: IpcServerConfig,
+    ) -> io::Result<Self>
+    where
+        A: ApplicationClient + Send + Sync + 'static,
+        P: PeerAuthorizer + 'static,
+    {
+        Self::start_inner(socket_path, application, authorizer, Some(streams), config)
+    }
+
+    fn start_inner<A, P>(
+        socket_path: impl AsRef<Path>,
+        application: Arc<A>,
+        authorizer: Arc<P>,
+        streams: Option<Arc<IpcStreamBroker>>,
         config: IpcServerConfig,
     ) -> io::Result<Self>
     where
@@ -633,10 +1387,19 @@ impl IpcServer {
         let thread_shutdown = Arc::clone(&shutdown);
         let application: Arc<dyn ApplicationClient + Send + Sync> = application;
         let authorizer: Arc<dyn PeerAuthorizer> = authorizer;
+        let thread_streams = streams.clone();
         let thread = match thread::Builder::new()
             .name("hopash-ipc-accept".to_owned())
-            .spawn(move || run_server(listener, application, authorizer, config, thread_shutdown))
-        {
+            .spawn(move || {
+                run_server(
+                    listener,
+                    application,
+                    authorizer,
+                    thread_streams,
+                    config,
+                    thread_shutdown,
+                )
+            }) {
             Ok(thread) => thread,
             Err(error) => {
                 let _ = cleanup_socket(&socket_path, socket_identity);
@@ -647,12 +1410,16 @@ impl IpcServer {
             socket_path,
             socket_identity,
             shutdown,
+            streams,
             thread: Some(thread),
         })
     }
 
     pub fn shutdown(&mut self) -> io::Result<()> {
         self.shutdown.store(true, Ordering::Release);
+        if let Some(streams) = &self.streams {
+            streams.notify_all();
+        }
         let thread_result = self.thread.take().map_or(Ok(()), |thread| {
             thread
                 .join()
@@ -696,18 +1463,23 @@ fn run_server(
     listener: UnixListener,
     application: Arc<dyn ApplicationClient + Send + Sync>,
     authorizer: Arc<dyn PeerAuthorizer>,
+    streams: Option<Arc<IpcStreamBroker>>,
     config: IpcServerConfig,
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
     let (sender, receiver) = mpsc::sync_channel(config.pending_connection_capacity);
     let receiver = Arc::new(Mutex::new(receiver));
-    let workers = spawn_workers(
-        config.worker_count,
-        Arc::clone(&receiver),
+    let active_streams = Arc::new(AtomicUsize::new(0));
+    let stream_limit = config.worker_count.saturating_sub(1);
+    let workers_context = WorkerContext {
         application,
-        config.io_timeout,
-        Arc::clone(&shutdown),
-    )?;
+        streams,
+        active_streams,
+        stream_limit,
+        io_timeout: config.io_timeout,
+        shutdown: Arc::clone(&shutdown),
+    };
+    let workers = spawn_workers(config.worker_count, Arc::clone(&receiver), workers_context)?;
 
     let accept_result = accept_loop(&listener, &authorizer, &sender, &shutdown);
     drop(sender);
@@ -721,39 +1493,49 @@ fn run_server(
     accept_result
 }
 
+#[derive(Clone)]
+struct WorkerContext {
+    application: Arc<dyn ApplicationClient + Send + Sync>,
+    streams: Option<Arc<IpcStreamBroker>>,
+    active_streams: Arc<AtomicUsize>,
+    stream_limit: usize,
+    io_timeout: Duration,
+    shutdown: Arc<AtomicBool>,
+}
+
 fn spawn_workers(
     count: usize,
     receiver: Arc<Mutex<Receiver<UnixStream>>>,
-    application: Arc<dyn ApplicationClient + Send + Sync>,
-    io_timeout: Duration,
-    shutdown: Arc<AtomicBool>,
+    context: WorkerContext,
 ) -> io::Result<Vec<JoinHandle<()>>> {
     (0..count)
         .map(|index| {
             let receiver = Arc::clone(&receiver);
-            let application = Arc::clone(&application);
-            let shutdown = Arc::clone(&shutdown);
+            let context = context.clone();
             thread::Builder::new()
                 .name(format!("hopash-ipc-worker-{index}"))
-                .spawn(move || worker_loop(receiver, application, io_timeout, shutdown))
+                .spawn(move || worker_loop(receiver, context))
         })
         .collect()
 }
 
-fn worker_loop(
-    receiver: Arc<Mutex<Receiver<UnixStream>>>,
-    application: Arc<dyn ApplicationClient + Send + Sync>,
-    io_timeout: Duration,
-    shutdown: Arc<AtomicBool>,
-) {
+fn worker_loop(receiver: Arc<Mutex<Receiver<UnixStream>>>, context: WorkerContext) {
     loop {
         let received = receiver
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .recv();
         match received {
-            Ok(stream) if !shutdown.load(Ordering::Acquire) => {
-                handle_connection(stream, application.as_ref(), io_timeout);
+            Ok(stream) if !context.shutdown.load(Ordering::Acquire) => {
+                handle_connection(
+                    stream,
+                    context.application.as_ref(),
+                    context.streams.as_deref(),
+                    &context.active_streams,
+                    context.stream_limit,
+                    context.io_timeout,
+                    &context.shutdown,
+                );
             }
             Ok(_) | Err(_) => break,
         }
@@ -793,7 +1575,11 @@ fn accept_loop(
 fn handle_connection(
     stream: UnixStream,
     application: &(dyn ApplicationClient + Send + Sync),
+    streams: Option<&IpcStreamBroker>,
+    active_streams: &AtomicUsize,
+    stream_limit: usize,
     io_timeout: Duration,
+    shutdown: &AtomicBool,
 ) {
     let mut stream = match DeadlineUnixStream::new(stream, io_timeout) {
         Ok(stream) => stream,
@@ -822,13 +1608,84 @@ fn handle_connection(
         return;
     }
     let request_id = request.request_id;
-    let operation = match request.operation.into_application_operation() {
-        Ok(operation) => operation,
-        Err(error) => {
-            let response = IpcResponse::failure(request_id, conversion_error(error));
+    let operation = match request.operation {
+        RequestOperation::SubscribeStatus(_) => {
+            let Some(streams) = streams else {
+                write_response(
+                    &mut stream,
+                    &IpcResponse::failure(
+                        request_id,
+                        conversion_error(OperationConversionError::StreamingOperation),
+                    ),
+                );
+                return;
+            };
+            let Some(_slot) = StreamSlot::acquire(active_streams, stream_limit) else {
+                write_response(&mut stream, &stream_capacity_response(request_id));
+                return;
+            };
+            serve_status_stream(&mut stream, request_id, streams, io_timeout, shutdown);
+            return;
+        }
+        RequestOperation::FollowLogs(LogSubscriptionPayload { after_sequence }) => {
+            let Some(streams) = streams else {
+                write_response(
+                    &mut stream,
+                    &IpcResponse::failure(
+                        request_id,
+                        conversion_error(OperationConversionError::StreamingOperation),
+                    ),
+                );
+                return;
+            };
+            let Some(_slot) = StreamSlot::acquire(active_streams, stream_limit) else {
+                write_response(&mut stream, &stream_capacity_response(request_id));
+                return;
+            };
+            serve_log_stream(
+                &mut stream,
+                request_id,
+                streams,
+                after_sequence,
+                io_timeout,
+                shutdown,
+            );
+            return;
+        }
+        RequestOperation::LogTail(LogTailPayload { after_sequence }) => {
+            let Some(streams) = streams else {
+                write_response(
+                    &mut stream,
+                    &IpcResponse::failure(
+                        request_id,
+                        conversion_error(OperationConversionError::StreamingOperation),
+                    ),
+                );
+                return;
+            };
+            let data = serde_json::to_value(streams.log_tail(after_sequence));
+            let response = match data {
+                Ok(data) => IpcResponse::success(request_id, data),
+                Err(_) => IpcResponse::failure(
+                    request_id,
+                    IpcError::new(
+                        ErrorCode::Internal,
+                        "The log tail response could not be encoded",
+                        false,
+                    ),
+                ),
+            };
             write_response(&mut stream, &response);
             return;
         }
+        operation => match operation.into_application_operation() {
+            Ok(operation) => operation,
+            Err(error) => {
+                let response = IpcResponse::failure(request_id, conversion_error(error));
+                write_response(&mut stream, &response);
+                return;
+            }
+        },
     };
     let response = match application.execute(operation) {
         Ok(output) => match WireApplicationOutput::try_from(output)
@@ -847,6 +1704,129 @@ fn handle_connection(
         Err(error) => IpcResponse::failure(request_id, wire_error(error)),
     };
     write_response(&mut stream, &response);
+}
+
+struct StreamSlot<'a> {
+    active: &'a AtomicUsize,
+}
+
+impl<'a> StreamSlot<'a> {
+    fn acquire(active: &'a AtomicUsize, limit: usize) -> Option<Self> {
+        let mut current = active.load(Ordering::Acquire);
+        loop {
+            if current >= limit {
+                return None;
+            }
+            match active.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self { active }),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for StreamSlot<'_> {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn stream_capacity_response(request_id: RequestId) -> IpcResponse {
+    IpcResponse::failure(
+        request_id,
+        IpcError::new(
+            ErrorCode::OperationUnavailable,
+            "The IPC stream subscriber capacity is reached",
+            true,
+        ),
+    )
+}
+
+fn serve_status_stream(
+    stream: &mut DeadlineUnixStream,
+    request_id: RequestId,
+    streams: &IpcStreamBroker,
+    io_timeout: Duration,
+    shutdown: &AtomicBool,
+) {
+    let (initial, subscription) = streams.subscribe_status();
+    if !write_stream_frame(
+        stream,
+        &IpcStreamFrame::new(request_id, IpcStreamPayload::Status(initial)),
+    ) {
+        return;
+    }
+    let heartbeat_interval = heartbeat_interval(io_timeout);
+    while !shutdown.load(Ordering::Acquire) {
+        let Some(item) = subscription.wait_next(shutdown, heartbeat_interval) else {
+            if shutdown.load(Ordering::Acquire)
+                || !write_stream_frame(
+                    stream,
+                    &IpcStreamFrame::new(request_id, IpcStreamPayload::Heartbeat),
+                )
+            {
+                return;
+            }
+            continue;
+        };
+        let terminal = matches!(item, StatusStreamItem::ResyncRequired { .. });
+        if !write_stream_frame(
+            stream,
+            &IpcStreamFrame::new(request_id, IpcStreamPayload::Status(item)),
+        ) || terminal
+        {
+            return;
+        }
+    }
+}
+
+fn serve_log_stream(
+    stream: &mut DeadlineUnixStream,
+    request_id: RequestId,
+    streams: &IpcStreamBroker,
+    after_sequence: Option<u64>,
+    io_timeout: Duration,
+    shutdown: &AtomicBool,
+) {
+    let subscription = streams.subscribe_logs(after_sequence);
+    let heartbeat_interval = heartbeat_interval(io_timeout);
+    while !shutdown.load(Ordering::Acquire) {
+        let Some(item) = subscription.wait_next(shutdown, heartbeat_interval) else {
+            if shutdown.load(Ordering::Acquire)
+                || !write_stream_frame(
+                    stream,
+                    &IpcStreamFrame::new(request_id, IpcStreamPayload::Heartbeat),
+                )
+            {
+                return;
+            }
+            continue;
+        };
+        let terminal = matches!(item, LogStreamItem::Gap { .. });
+        if !write_stream_frame(
+            stream,
+            &IpcStreamFrame::new(request_id, IpcStreamPayload::Logs(item)),
+        ) || terminal
+        {
+            return;
+        }
+    }
+}
+
+fn heartbeat_interval(io_timeout: Duration) -> Duration {
+    io_timeout
+        .checked_div(2)
+        .unwrap_or(Duration::from_millis(1))
+        .max(Duration::from_millis(1))
+}
+
+fn write_stream_frame(stream: &mut DeadlineUnixStream, frame: &IpcStreamFrame) -> bool {
+    stream.begin_write().is_ok() && write_frame(stream, frame).is_ok()
 }
 
 fn write_response(stream: &mut DeadlineUnixStream, response: &IpcResponse) {

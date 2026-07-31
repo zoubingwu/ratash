@@ -269,6 +269,58 @@ pub struct IpcResponse {
     outcome: ResponseOutcome,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IpcStreamFrame {
+    pub protocol_version: u16,
+    pub request_id: RequestId,
+    #[serde(flatten)]
+    pub payload: IpcStreamPayload,
+}
+
+impl IpcStreamFrame {
+    #[must_use]
+    pub fn new(request_id: RequestId, payload: IpcStreamPayload) -> Self {
+        Self {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            request_id,
+            payload,
+        }
+    }
+
+    pub fn ensure_correlated(
+        &self,
+        expected_request_id: RequestId,
+    ) -> Result<(), CorrelationError> {
+        if self.protocol_version != IPC_PROTOCOL_VERSION {
+            return Err(CorrelationError::ProtocolMismatch {
+                expected: IPC_PROTOCOL_VERSION,
+                actual: self.protocol_version,
+            });
+        }
+        if self.request_id != expected_request_id {
+            return Err(CorrelationError::RequestIdMismatch {
+                expected: expected_request_id,
+                actual: self.request_id,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(
+    tag = "stream",
+    content = "item",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum IpcStreamPayload {
+    Status(StatusStreamItem),
+    Logs(LogStreamItem),
+    Heartbeat,
+}
+
 impl IpcResponse {
     #[must_use]
     pub fn success(request_id: RequestId, data: serde_json::Value) -> Self {
@@ -620,7 +672,7 @@ impl std::error::Error for AcceptError {}
 // -----------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StatusStreamItem {
     Snapshot {
         sequence: u64,
@@ -766,6 +818,7 @@ pub enum SubscriberError {
 // -----------------------------------------------------------------------------
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogRecordV1 {
     pub sequence: u64,
     pub timestamp_unix_ms: u64,
@@ -800,7 +853,7 @@ impl fmt::Debug for LogRecordV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LogStreamItem {
     Record {
         record: LogRecordV1,
@@ -812,6 +865,7 @@ pub enum LogStreamItem {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogTailV1 {
     pub records: Vec<LogRecordV1>,
     pub dropped_total: u64,
