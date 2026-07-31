@@ -12,6 +12,9 @@ use hopash::persistence::{
     TransactionId,
 };
 use hopash::profile::{ActiveProfileRevision, ProfileRevision, ProfileSnapshot, SnapshotLimits};
+use hopash::runtime_bundle::{
+    RuntimeGenerationPruneResult, RuntimeGenerationRetention, prune_runtime_generations,
+};
 use hopash::transaction::{
     ApplyPath, CandidateRevisionSource, CandidateRevisions, ConfigTransactionCandidate,
     ConfigTransactionCoordinator, ConfigTransactionDependencies, ConfigTransactionErrorKind,
@@ -21,6 +24,7 @@ use hopash::transaction::{
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -394,10 +398,18 @@ fn core_handle(
 
 struct FakeBundleResolver {
     bundles: Mutex<BTreeMap<RuntimeGeneration, RuntimeBundle>>,
+    runtime_root: PathBuf,
 }
 
 impl FakeBundleResolver {
     fn register(&self, bundle: RuntimeBundle) {
+        let generation_root = self
+            .runtime_root
+            .join(format!("generation-{:020}", bundle.generation.0));
+        fs::create_dir_all(&generation_root)
+            .expect("the retained Runtime Generation should be created");
+        fs::set_permissions(&generation_root, fs::Permissions::from_mode(0o700))
+            .expect("the retained Runtime Generation should be private");
         self.bundles
             .lock()
             .expect("bundle lock")
@@ -416,6 +428,14 @@ impl RuntimeBundleResolver for FakeBundleResolver {
             .get(&transaction.runtime_generation)
             .cloned()
             .ok_or(RuntimeBundleResolveError)
+    }
+
+    fn prune_generations(
+        &self,
+        retention: RuntimeGenerationRetention,
+    ) -> Result<RuntimeGenerationPruneResult, RuntimeBundleResolveError> {
+        prune_runtime_generations(&self.runtime_root, retention)
+            .map_err(|_| RuntimeBundleResolveError)
     }
 }
 
@@ -474,8 +494,13 @@ impl Harness {
         let revisions = Arc::new(MutableRevisions {
             current: Mutex::new(initial_revisions),
         });
+        let runtime_root = directory.path.join("retained-runtime");
+        fs::create_dir(&runtime_root).expect("the retained runtime root should be created");
+        fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700))
+            .expect("the retained runtime root should be private");
         let bundles = Arc::new(FakeBundleResolver {
             bundles: Mutex::new(BTreeMap::new()),
+            runtime_root,
         });
         let coordinator = Arc::new(ConfigTransactionCoordinator::new(
             ConfigTransactionDependencies {
@@ -613,6 +638,22 @@ impl Harness {
     fn events(&self) -> Vec<String> {
         self.events.lock().expect("event lock").clone()
     }
+
+    fn retained_generations(&self) -> Vec<u64> {
+        let mut generations = fs::read_dir(&self.bundles.runtime_root)
+            .expect("the retained runtime root should be readable")
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("generation-"))
+                    .and_then(|generation| generation.parse::<u64>().ok())
+            })
+            .collect::<Vec<_>>();
+        generations.sort_unstable();
+        generations
+    }
 }
 
 #[test]
@@ -638,6 +679,87 @@ fn successful_transaction_orders_prepare_validation_apply_health_commit_and_clea
             "prepare", "validate", "apply:1", "status", "health:1", "commit", "clear",
         ],
     );
+}
+
+#[test]
+fn sequential_commits_retain_only_current_and_previous_runtime_generations() {
+    let harness = Harness::new();
+    for generation in 1..=5 {
+        let candidate = harness.candidate(generation);
+        harness
+            .coordinator
+            .execute(&candidate)
+            .expect("the transaction should commit");
+    }
+
+    assert_eq!(harness.retained_generations(), vec![4, 5]);
+}
+
+#[test]
+fn validation_keeps_current_previous_and_prepared_runtime_generations() {
+    let harness = Harness::new();
+    harness.commit_initial();
+    let second = harness.candidate(2);
+    harness
+        .coordinator
+        .execute(&second)
+        .expect("the second transaction should commit");
+    let third = harness.candidate(3);
+    let (point, entered) = BlockPoint::new();
+    harness.validator.block_next(point.clone());
+    let coordinator = Arc::clone(&harness.coordinator);
+    let worker = std::thread::spawn(move || coordinator.execute(&third));
+
+    entered
+        .recv_timeout(Duration::from_secs(1))
+        .expect("validation should start");
+    assert_eq!(harness.retained_generations(), vec![1, 2, 3]);
+    point.release();
+    worker
+        .join()
+        .expect("the transaction thread should finish")
+        .expect("the prepared transaction should commit");
+    assert_eq!(harness.retained_generations(), vec![2, 3]);
+}
+
+#[test]
+fn failed_apply_removes_the_candidate_runtime_generation_after_rollback() {
+    let harness = Harness::new();
+    harness.commit_initial();
+    let second = harness.candidate(2);
+    harness
+        .coordinator
+        .execute(&second)
+        .expect("the second transaction should commit");
+    let third = harness.candidate(3);
+    harness.runtime.script([ApplyScript::DefiniteFailure]);
+
+    let error = harness
+        .coordinator
+        .execute(&third)
+        .expect_err("the third Runtime Apply should fail");
+
+    assert_eq!(error.kind, ConfigTransactionErrorKind::Apply);
+    assert_eq!(harness.retained_generations(), vec![1, 2]);
+}
+
+#[test]
+fn unsafe_runtime_entry_blocks_apply_and_preserves_all_entries() {
+    let harness = Harness::new();
+    harness.commit_initial();
+    let candidate = harness.candidate(2);
+    let unknown = harness.bundles.runtime_root.join("unexpected-entry");
+    fs::write(&unknown, b"preserve").expect("the unknown entry should be written");
+
+    let error = harness
+        .coordinator
+        .execute(&candidate)
+        .expect_err("unsafe runtime cleanup should block apply");
+
+    assert_eq!(error.kind, ConfigTransactionErrorKind::Cleanup);
+    assert_eq!(harness.runtime.generation(), Some(RuntimeGeneration(1)));
+    assert!(unknown.exists());
+    assert_eq!(harness.retained_generations(), vec![1, 2]);
 }
 
 #[test]

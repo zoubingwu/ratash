@@ -35,6 +35,10 @@ use crate::core::{
 };
 use crate::domain::{CoreInstanceGeneration, RuntimeGeneration};
 use crate::ipc::{FrameError, read_frame, write_frame};
+use crate::runtime_bundle::{
+    RuntimeGenerationRetention, inspect_runtime_generations_with_reserved,
+    prune_runtime_generations_with_reserved,
+};
 use crate::unix_io::DeadlineUnixStream;
 
 pub const CORE_SERVICE_IPC_PROTOCOL_VERSION: u16 = 1;
@@ -310,6 +314,10 @@ impl CoreServiceServer {
         validate_server_config(&config)?;
         let runtime_staging_root = prepare_runtime_root(&config.runtime_staging_root)
             .map_err(|error| safe_io_error(error, "Core service runtime root setup failed"))?;
+        let runtime_retention =
+            ServiceRuntimeRetention::load(&runtime_staging_root).map_err(|_| {
+                io::Error::other("Core service Runtime Generation retention state is unsafe")
+            })?;
         let socket_path = socket_path.as_ref().to_path_buf();
         let listener = bind_service_listener(&socket_path, config.allowed_owner_uid)?;
         let metadata = match fs::symlink_metadata(&socket_path) {
@@ -336,6 +344,7 @@ impl CoreServiceServer {
         let context = Arc::new(ServerContext {
             runtime,
             runtime_staging_root,
+            runtime_retention: Mutex::new(runtime_retention),
             session: Mutex::new(None),
         });
         let thread = match thread::Builder::new()
@@ -387,7 +396,87 @@ impl Drop for CoreServiceServer {
 struct ServerContext {
     runtime: Arc<dyn CoreRuntime>,
     runtime_staging_root: PathBuf,
+    runtime_retention: Mutex<ServiceRuntimeRetention>,
     session: Mutex<Option<BoundSession>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ServiceRuntimeRetention {
+    current: Option<RuntimeGeneration>,
+    previous: Option<RuntimeGeneration>,
+    prepared: Option<RuntimeGeneration>,
+}
+
+impl ServiceRuntimeRetention {
+    fn load(root: &Path) -> Result<Self, ()> {
+        let generations =
+            inspect_runtime_generations_with_reserved(root, &["control"]).map_err(|_| ())?;
+        let mut newest = generations.into_iter().rev();
+        let retention = Self {
+            prepared: newest.next(),
+            current: newest.next(),
+            previous: newest.next(),
+        };
+        prune_runtime_generations_with_reserved(root, retention.into(), &["control"])
+            .map_err(|_| ())?;
+        Ok(retention)
+    }
+
+    fn plan(self, generation: RuntimeGeneration) -> Result<Self, BundleIngressError> {
+        if generation.0 == 0 {
+            return Err(BundleIngressError::Invalid);
+        }
+        if self.prepared == Some(generation) {
+            return Ok(self);
+        }
+        if self.current == Some(generation) {
+            return Ok(Self {
+                prepared: None,
+                ..self
+            });
+        }
+        if self.previous == Some(generation) {
+            return Ok(Self {
+                current: Some(generation),
+                previous: None,
+                prepared: None,
+            });
+        }
+        let highest = [self.current, self.previous, self.prepared]
+            .into_iter()
+            .flatten()
+            .max();
+        if highest.is_some_and(|highest| generation <= highest) {
+            return Err(BundleIngressError::Invalid);
+        }
+        let (current, previous) = self
+            .prepared
+            .map_or((self.current, self.previous), |prepared| {
+                (Some(prepared), self.current)
+            });
+        Ok(Self {
+            current,
+            previous,
+            prepared: Some(generation),
+        })
+    }
+
+    fn discard_failed(self, generation: RuntimeGeneration) -> Self {
+        if self.prepared == Some(generation) {
+            Self {
+                prepared: None,
+                ..self
+            }
+        } else {
+            self
+        }
+    }
+}
+
+impl From<ServiceRuntimeRetention> for RuntimeGenerationRetention {
+    fn from(retention: ServiceRuntimeRetention) -> Self {
+        Self::new(retention.current, retention.previous, retention.prepared)
+    }
 }
 
 struct BoundSession {
@@ -594,11 +683,37 @@ fn dispatch(
             let owner = request.owner.into_core();
             authorize_bound_session(binding.as_ref(), peer_uid, &owner)?;
             let bundle = request.bundle.into_core();
+            let mut retention = context.runtime_retention.lock().map_err(|_| {
+                unavailable_error("Core service Runtime Generation state is unavailable")
+            })?;
+            let planned = retention
+                .plan(bundle.generation)
+                .map_err(|error| error.into_core())?;
             let staged = stage_runtime_bundle(&context.runtime_staging_root, peer_uid, &bundle)?;
-            context
-                .runtime
-                .apply_candidate(&owner, &staged)
-                .map(|result| WireSuccess::ApplyCandidate((&result).into()))
+            prune_runtime_generations_with_reserved(
+                &context.runtime_staging_root,
+                planned.into(),
+                &["control"],
+            )
+            .map_err(|_| unavailable_error("Core service Runtime Generation cleanup failed"))?;
+            *retention = planned;
+            match context.runtime.apply_candidate(&owner, &staged) {
+                Ok(result) => Ok(WireSuccess::ApplyCandidate((&result).into())),
+                Err(error) if runtime_apply_is_indeterminate(error.kind) => Err(error),
+                Err(error) => {
+                    let retained = retention.discard_failed(bundle.generation);
+                    prune_runtime_generations_with_reserved(
+                        &context.runtime_staging_root,
+                        retained.into(),
+                        &["control"],
+                    )
+                    .map_err(|_| {
+                        unavailable_error("Core service Runtime Generation cleanup failed")
+                    })?;
+                    *retention = retained;
+                    Err(error)
+                }
+            }
         }
         WireOperation::Status(request) => {
             let owner = request.owner.into_core();
@@ -1250,6 +1365,13 @@ impl BundleIngressError {
             ),
         }
     }
+}
+
+const fn runtime_apply_is_indeterminate(kind: CoreRuntimeErrorKind) -> bool {
+    matches!(
+        kind,
+        CoreRuntimeErrorKind::ReloadTimeout | CoreRuntimeErrorKind::Unavailable
+    )
 }
 
 fn stage_runtime_bundle(

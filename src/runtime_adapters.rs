@@ -9,6 +9,9 @@ use crate::core::{
     CoreRuntimeError, CoreRuntimeErrorKind, ManagedCoreHandle, MihomoAdapter, MihomoReadiness,
     RuntimeBundle,
 };
+use crate::runtime_bundle::{
+    RuntimeGenerationPruneResult, RuntimeGenerationRetention, prune_runtime_generations,
+};
 use crate::service::RuntimeManifestV1;
 use crate::transaction::{
     RuntimeApplyFailure, RuntimeBundleResolveError, RuntimeBundleResolver, RuntimeHealthError,
@@ -134,6 +137,13 @@ impl RuntimeBundleResolver for StagedRuntimeBundleResolver {
         transaction: &crate::persistence::TransactionBundle,
     ) -> Result<RuntimeBundle, RuntimeBundleResolveError> {
         self.resolve_generation(transaction.runtime_generation)
+    }
+
+    fn prune_generations(
+        &self,
+        retention: RuntimeGenerationRetention,
+    ) -> Result<RuntimeGenerationPruneResult, RuntimeBundleResolveError> {
+        prune_runtime_generations(&self.root, retention).map_err(|_| RuntimeBundleResolveError)
     }
 }
 

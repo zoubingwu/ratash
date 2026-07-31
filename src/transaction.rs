@@ -10,6 +10,7 @@ use crate::persistence::{
     RecoveryState, TransactionBundle, TransactionId,
 };
 use crate::profile::{ActiveProfileRevision, ProfileRevision};
+use crate::runtime_bundle::{RuntimeGenerationPruneResult, RuntimeGenerationRetention};
 use std::fmt;
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
@@ -157,6 +158,13 @@ pub trait RuntimeBundleResolver: Send + Sync {
         &self,
         transaction: &TransactionBundle,
     ) -> Result<RuntimeBundle, RuntimeBundleResolveError>;
+
+    fn prune_generations(
+        &self,
+        _retention: RuntimeGenerationRetention,
+    ) -> Result<RuntimeGenerationPruneResult, RuntimeBundleResolveError> {
+        Ok(RuntimeGenerationPruneResult::default())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -386,6 +394,17 @@ impl ConfigTransactionCoordinator {
             .generation_from_manifest(state.committed.as_ref())
             .map_err(|_| ConfigTransactionError::simple(ConfigTransactionErrorKind::Recovery))?;
 
+        self.prune_runtime_state(&state).map_err(|_| {
+            ConfigTransactionError::new(
+                ConfigTransactionErrorKind::Cleanup,
+                None,
+                committed_generation,
+                RecoveryOutcome::Pending {
+                    target: committed_generation,
+                },
+            )
+        })?;
+
         if self.converge_to_manifest(state.committed.as_ref()).is_err() {
             return Err(ConfigTransactionError::new(
                 ConfigTransactionErrorKind::Recovery,
@@ -430,6 +449,16 @@ impl ConfigTransactionCoordinator {
         let committed_generation = self
             .generation_from_manifest(state.committed.as_ref())
             .map_err(|_| ConfigTransactionError::simple(ConfigTransactionErrorKind::Recovery))?;
+        self.prune_runtime_state(&state).map_err(|_| {
+            ConfigTransactionError::new(
+                ConfigTransactionErrorKind::Cleanup,
+                None,
+                committed_generation,
+                RecoveryOutcome::Pending {
+                    target: committed_generation,
+                },
+            )
+        })?;
         if committed_generation != expected_committed_generation {
             return Err(ConfigTransactionError::new(
                 ConfigTransactionErrorKind::Recovery,
@@ -524,6 +553,29 @@ impl ConfigTransactionCoordinator {
         }
 
         self.validate_candidate(candidate, committed_generation)?;
+        let retention = self
+            .runtime_retention(
+                initial_state.committed.as_ref(),
+                Some(candidate.runtime.generation),
+            )
+            .map_err(|_| {
+                ConfigTransactionError::new(
+                    ConfigTransactionErrorKind::Recovery,
+                    Some(candidate.runtime.generation),
+                    committed_generation,
+                    RecoveryOutcome::Failed {
+                        target: committed_generation,
+                    },
+                )
+            })?;
+        self.bundles.prune_generations(retention).map_err(|_| {
+            ConfigTransactionError::new(
+                ConfigTransactionErrorKind::Cleanup,
+                Some(candidate.runtime.generation),
+                committed_generation,
+                RecoveryOutcome::NotRequired,
+            )
+        })?;
         let prepared = match self.store.prepare(&candidate.transaction) {
             Ok(prepared) => prepared,
             Err(_) => {
@@ -898,9 +950,50 @@ impl ConfigTransactionCoordinator {
             .transpose()
     }
 
+    fn runtime_retention(
+        &self,
+        committed: Option<&CommittedManifest>,
+        prepared: Option<RuntimeGeneration>,
+    ) -> Result<RuntimeGenerationRetention, ()> {
+        let current = committed
+            .map(|manifest| self.generation_from_transaction(&manifest.current))
+            .transpose()?;
+        let previous = committed
+            .and_then(|manifest| manifest.previous.as_ref())
+            .map(|transaction| self.generation_from_transaction(transaction))
+            .transpose()?;
+        Ok(RuntimeGenerationRetention::new(current, previous, prepared))
+    }
+
+    fn generation_from_transaction(
+        &self,
+        transaction: &TransactionId,
+    ) -> Result<RuntimeGeneration, ()> {
+        self.store
+            .load_transaction(transaction)
+            .map(|transaction| transaction.runtime_generation)
+            .map_err(|_| ())
+    }
+
+    fn prune_runtime_state(&self, state: &RecoveryState) -> Result<(), ()> {
+        let prepared = state
+            .prepared
+            .as_ref()
+            .map(|prepared| self.generation_from_transaction(&prepared.candidate))
+            .transpose()?;
+        let retention = self.runtime_retention(state.committed.as_ref(), prepared)?;
+        self.bundles
+            .prune_generations(retention)
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+
     fn clear_prepared_and_prune(&self, prepared: &PreparedTransaction) -> io::Result<()> {
         self.store.clear_prepared(prepared)?;
         let _ = self.store.prune_unreachable();
+        let state = self.store.recover()?;
+        self.prune_runtime_state(&state)
+            .map_err(|()| io::Error::other("Runtime Generation cleanup failed"))?;
         Ok(())
     }
 }

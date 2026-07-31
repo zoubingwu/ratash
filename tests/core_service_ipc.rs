@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -53,6 +53,7 @@ struct FakeRuntimeState {
     status_delay: Option<Duration>,
     status_diagnostic: Option<String>,
     oversized_logs: bool,
+    apply_failures: VecDeque<CoreRuntimeErrorKind>,
 }
 
 struct FakeRuntime {
@@ -93,6 +94,10 @@ impl FakeRuntime {
         self.state
             .lock()
             .expect("the fake runtime lock should work")
+    }
+
+    fn fail_next_apply(&self, kind: CoreRuntimeErrorKind) {
+        self.state().apply_failures.push_back(kind);
     }
 }
 
@@ -137,6 +142,9 @@ impl CoreRuntime for FakeRuntime {
         };
         let mut state = self.state();
         state.apply_count += 1;
+        if let Some(kind) = state.apply_failures.pop_front() {
+            return Err(CoreRuntimeError::new(kind, "fixture Runtime Apply failure"));
+        }
         state
             .staged_bundles
             .insert(bundle.generation.0, bundle.clone());
@@ -402,6 +410,116 @@ fn all_core_runtime_operations_round_trip_through_staged_service_owned_state() {
         .shutdown()
         .expect("the server should shut down cleanly");
     assert!(!harness.socket_path.exists());
+}
+
+#[test]
+fn service_ingress_retains_only_two_successful_generations_and_one_candidate() {
+    let harness = Harness::new();
+    let session = harness
+        .client
+        .open_owner_session(&harness.owner_request())
+        .expect("the owner session should open");
+
+    for generation in 1..=5 {
+        harness
+            .client
+            .apply_candidate(&session.proof, &harness.source_bundle(generation))
+            .expect("the candidate should apply");
+    }
+
+    assert_eq!(
+        service_generation_names(&harness.runtime_root),
+        vec![3, 4, 5]
+    );
+}
+
+#[test]
+fn definite_apply_failure_discards_the_service_ingress_candidate() {
+    let harness = Harness::new();
+    let session = harness
+        .client
+        .open_owner_session(&harness.owner_request())
+        .expect("the owner session should open");
+    for generation in 1..=2 {
+        harness
+            .client
+            .apply_candidate(&session.proof, &harness.source_bundle(generation))
+            .expect("the candidate should apply");
+    }
+    harness.runtime.fail_next_apply(CoreRuntimeErrorKind::Apply);
+
+    let error = harness
+        .client
+        .apply_candidate(&session.proof, &harness.source_bundle(3))
+        .expect_err("the candidate should fail");
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Apply);
+    assert_eq!(service_generation_names(&harness.runtime_root), vec![1, 2]);
+}
+
+#[test]
+fn service_startup_recovers_to_the_three_newest_strict_generations() {
+    let directory = TestDirectory::new();
+    let service_root = directory.path.join("service-owned");
+    let runtime_root = service_root.join("runtime");
+    fs::create_dir_all(&runtime_root).expect("the service runtime root should be created");
+    fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o711))
+        .expect("the service runtime root should be traversable");
+    for generation in 1..=5 {
+        let path = runtime_root.join(format!("generation-{generation:020}"));
+        fs::create_dir(&path).expect("the service generation should be created");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("the service generation should be private");
+    }
+    let socket_path = directory.path.join("ipc/core-runtime.sock");
+    let runtime = Arc::new(FakeRuntime::new(runtime_root.clone(), &service_root));
+    let mut server = CoreServiceServer::start(
+        &socket_path,
+        runtime,
+        CoreServiceServerConfig::new(&runtime_root, nix::unistd::geteuid().as_raw()),
+    )
+    .expect("the Core service should recover strict historical generations");
+
+    assert_eq!(service_generation_names(&runtime_root), vec![3, 4, 5]);
+    server
+        .shutdown()
+        .expect("the recovered Core service should stop");
+}
+
+#[test]
+fn unsafe_service_ingress_entry_blocks_startup_without_deleting_state() {
+    let directory = TestDirectory::new();
+    let service_root = directory.path.join("service-owned");
+    let runtime_root = service_root.join("runtime");
+    fs::create_dir_all(&runtime_root).expect("the service runtime root should be created");
+    let generation = runtime_root.join("generation-00000000000000000001");
+    fs::create_dir(&generation).expect("the service generation should be created");
+    fs::set_permissions(&generation, fs::Permissions::from_mode(0o700))
+        .expect("the service generation should be private");
+    let unknown = runtime_root.join("unexpected-entry");
+    fs::write(&unknown, b"preserve").expect("the unknown service entry should be written");
+    let socket_path = directory.path.join("ipc/core-runtime.sock");
+    let runtime = Arc::new(FakeRuntime::new(runtime_root.clone(), &service_root));
+
+    let error = CoreServiceServer::start(
+        &socket_path,
+        runtime,
+        CoreServiceServerConfig::new(&runtime_root, nix::unistd::geteuid().as_raw()),
+    )
+    .expect_err("an unsafe service Runtime Generation root should block startup");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert!(generation.exists());
+    assert_eq!(
+        fs::read(unknown).expect("the unknown entry should remain"),
+        b"preserve"
+    );
+    assert!(
+        !error
+            .to_string()
+            .contains(&directory.path.display().to_string())
+    );
+    assert!(!socket_path.exists());
 }
 
 #[test]
@@ -835,6 +953,22 @@ fn write_bundle(root: &Path, generation: RuntimeGeneration) -> RuntimeBundle {
             .expect("the binary digest should be a string")
             .to_owned(),
     }
+}
+
+fn service_generation_names(root: &Path) -> Vec<u64> {
+    let mut generations = fs::read_dir(root)
+        .expect("the service runtime root should be readable")
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix("generation-"))
+                .and_then(|generation| generation.parse::<u64>().ok())
+        })
+        .collect::<Vec<_>>();
+    generations.sort_unstable();
+    generations
 }
 
 fn sha256(content: &[u8]) -> String {

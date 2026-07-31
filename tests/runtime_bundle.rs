@@ -1,7 +1,10 @@
 use hopash::config::{AuthoritativeConfig, ConfigCompiler, EffectiveConfiguration};
 use hopash::domain::RuntimeGeneration;
 use hopash::profile::{ProfileSnapshot, SnapshotLimits};
-use hopash::runtime_bundle::{RuntimeBundleStageErrorKind, RuntimeBundleStager};
+use hopash::runtime_bundle::{
+    RuntimeBundleStageErrorKind, RuntimeBundleStager, RuntimeGenerationPruneErrorKind,
+    RuntimeGenerationRetention, prune_runtime_generations,
+};
 use hopash::service::RuntimeManifestV1;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -186,6 +189,109 @@ fn rejects_a_different_compiler_policy() {
     );
 }
 
+#[test]
+fn prunes_runtime_generations_to_current_previous_and_prepared() {
+    let directory = TestDirectory::new("bounded-retention");
+    let runtime_root = directory.path.join("runtime");
+    fs::create_dir(&runtime_root).expect("the runtime root should be created");
+    fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700))
+        .expect("the runtime root should be private");
+    for generation in 1..=6 {
+        create_generation_directory(&runtime_root, generation);
+    }
+
+    let result = prune_runtime_generations(
+        &runtime_root,
+        RuntimeGenerationRetention::new(
+            Some(RuntimeGeneration(5)),
+            Some(RuntimeGeneration(4)),
+            Some(RuntimeGeneration(6)),
+        ),
+    )
+    .expect("strict stale generations should be removed");
+
+    assert_eq!(result.scanned_entries, 6);
+    assert_eq!(result.removed_generations, 3);
+    assert_eq!(generation_names(&runtime_root), vec![4, 5, 6]);
+}
+
+#[test]
+fn unsafe_runtime_entries_preserve_every_generation_and_redact_paths() {
+    for unsafe_kind in ["unknown", "symlink", "non-strict"] {
+        let directory = TestDirectory::new(unsafe_kind);
+        let runtime_root = directory.path.join("runtime");
+        fs::create_dir(&runtime_root).expect("the runtime root should be created");
+        fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700))
+            .expect("the runtime root should be private");
+        create_generation_directory(&runtime_root, 1);
+        create_generation_directory(&runtime_root, 2);
+        match unsafe_kind {
+            "unknown" => {
+                fs::write(runtime_root.join("unexpected.txt"), b"preserve")
+                    .expect("the unknown entry should be written");
+            }
+            "symlink" => {
+                symlink(
+                    runtime_root.join("generation-00000000000000000002"),
+                    runtime_root.join("generation-00000000000000000003"),
+                )
+                .expect("the generation symlink should be created");
+            }
+            "non-strict" => {
+                fs::create_dir(runtime_root.join("generation-3"))
+                    .expect("the non-strict generation should be created");
+            }
+            _ => unreachable!(),
+        }
+
+        let error = prune_runtime_generations(
+            &runtime_root,
+            RuntimeGenerationRetention::new(Some(RuntimeGeneration(2)), None, None),
+        )
+        .expect_err("an unsafe entry should stop cleanup");
+
+        assert_eq!(error.kind(), RuntimeGenerationPruneErrorKind::UnsafeEntry);
+        assert!(
+            runtime_root
+                .join("generation-00000000000000000001")
+                .exists()
+        );
+        assert!(
+            runtime_root
+                .join("generation-00000000000000000002")
+                .exists()
+        );
+        let diagnostic = format!("{error:?} {error}");
+        assert!(!diagnostic.contains(&directory.path.display().to_string()));
+        assert!(!diagnostic.contains(unsafe_kind));
+    }
+}
+
+#[test]
+fn recovers_a_strict_crash_left_pruning_quarantine() {
+    let directory = TestDirectory::new("pruning-recovery");
+    let runtime_root = directory.path.join("runtime");
+    fs::create_dir(&runtime_root).expect("the runtime root should be created");
+    fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700))
+        .expect("the runtime root should be private");
+    create_generation_directory(&runtime_root, 2);
+    let quarantine = runtime_root
+        .join(".generation-00000000000000000001-00000000-0000-4000-8000-000000000000.pruning");
+    fs::create_dir(&quarantine).expect("the pruning quarantine should be created");
+    fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o700))
+        .expect("the pruning quarantine should be private");
+
+    let result = prune_runtime_generations(
+        &runtime_root,
+        RuntimeGenerationRetention::new(Some(RuntimeGeneration(2)), None, None),
+    )
+    .expect("a strict pruning quarantine should be recovered");
+
+    assert_eq!(result.removed_generations, 1);
+    assert!(!quarantine.exists());
+    assert_eq!(generation_names(&runtime_root), vec![2]);
+}
+
 fn effective_configuration(root: &Path) -> EffectiveConfiguration {
     let profile_root = root.join("profile");
     fs::create_dir_all(profile_root.join("providers/nested"))
@@ -230,6 +336,31 @@ fn mode(path: &Path) -> u32 {
         .permissions()
         .mode()
         & 0o777
+}
+
+fn create_generation_directory(root: &Path, generation: u64) {
+    let path = root.join(format!("generation-{generation:020}"));
+    fs::create_dir(&path).expect("the generation directory should be created");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .expect("the generation directory should be private");
+}
+
+fn generation_names(root: &Path) -> Vec<u64> {
+    let mut generations = fs::read_dir(root)
+        .expect("the runtime root should be readable")
+        .map(|entry| {
+            entry
+                .expect("the runtime entry should be readable")
+                .file_name()
+                .to_string_lossy()
+                .strip_prefix("generation-")
+                .expect("the entry should be a generation")
+                .parse::<u64>()
+                .expect("the generation should parse")
+        })
+        .collect::<Vec<_>>();
+    generations.sort_unstable();
+    generations
 }
 
 fn sha256(content: &[u8]) -> String {

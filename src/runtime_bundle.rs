@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use crate::config::{EffectiveConfiguration, ProviderKind};
@@ -14,6 +14,7 @@ use crate::domain::RuntimeGeneration;
 use crate::service::{RuntimeManifestFileV1, RuntimeManifestV1};
 
 const MANIFEST_MAX_BYTES: usize = 64 * 1_024;
+const RUNTIME_GENERATION_SCAN_LIMIT: usize = 4_096;
 
 struct ProviderStagingPlan {
     destinations: Vec<PathBuf>,
@@ -112,6 +113,328 @@ impl std::error::Error for RuntimeBundleStageError {
             .as_ref()
             .map(|source| source as &(dyn std::error::Error + 'static))
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeGenerationRetention {
+    pub current: Option<RuntimeGeneration>,
+    pub previous: Option<RuntimeGeneration>,
+    pub prepared: Option<RuntimeGeneration>,
+}
+
+impl RuntimeGenerationRetention {
+    #[must_use]
+    pub const fn new(
+        current: Option<RuntimeGeneration>,
+        previous: Option<RuntimeGeneration>,
+        prepared: Option<RuntimeGeneration>,
+    ) -> Self {
+        Self {
+            current,
+            previous,
+            prepared,
+        }
+    }
+
+    fn retained(self) -> BTreeSet<RuntimeGeneration> {
+        [self.current, self.previous, self.prepared]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeGenerationPruneResult {
+    pub scanned_entries: usize,
+    pub removed_generations: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeGenerationPruneErrorKind {
+    RootUnavailable,
+    UnsafeEntry,
+    Io,
+}
+
+pub struct RuntimeGenerationPruneError {
+    kind: RuntimeGenerationPruneErrorKind,
+}
+
+impl RuntimeGenerationPruneError {
+    #[must_use]
+    pub const fn kind(&self) -> RuntimeGenerationPruneErrorKind {
+        self.kind
+    }
+
+    const fn new(kind: RuntimeGenerationPruneErrorKind) -> Self {
+        Self { kind }
+    }
+}
+
+impl fmt::Debug for RuntimeGenerationPruneError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeGenerationPruneError")
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+impl fmt::Display for RuntimeGenerationPruneError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self.kind {
+            RuntimeGenerationPruneErrorKind::RootUnavailable => {
+                "the Runtime Generation root is unavailable"
+            }
+            RuntimeGenerationPruneErrorKind::UnsafeEntry => {
+                "the Runtime Generation root contains an unsafe entry"
+            }
+            RuntimeGenerationPruneErrorKind::Io => "Runtime Generation cleanup failed",
+        })
+    }
+}
+
+impl std::error::Error for RuntimeGenerationPruneError {}
+
+#[derive(Clone)]
+struct RuntimeGenerationEntry {
+    generation: RuntimeGeneration,
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    owner_uid: u32,
+}
+
+pub fn prune_runtime_generations(
+    root: &Path,
+    retention: RuntimeGenerationRetention,
+) -> Result<RuntimeGenerationPruneResult, RuntimeGenerationPruneError> {
+    prune_runtime_generations_with_reserved(root, retention, &[])
+}
+
+pub(crate) fn inspect_runtime_generations_with_reserved(
+    root: &Path,
+    reserved_directories: &[&str],
+) -> Result<Vec<RuntimeGeneration>, RuntimeGenerationPruneError> {
+    let (entries, _, _) = scan_runtime_generations(root, reserved_directories)?;
+    Ok(entries.into_iter().map(|entry| entry.generation).collect())
+}
+
+pub(crate) fn prune_runtime_generations_with_reserved(
+    root: &Path,
+    retention: RuntimeGenerationRetention,
+    reserved_directories: &[&str],
+) -> Result<RuntimeGenerationPruneResult, RuntimeGenerationPruneError> {
+    prune_runtime_generations_with_reserved_and_hook(root, retention, reserved_directories, |_| {})
+}
+
+fn prune_runtime_generations_with_reserved_and_hook(
+    root: &Path,
+    retention: RuntimeGenerationRetention,
+    reserved_directories: &[&str],
+    mut before_quarantine: impl FnMut(&Path),
+) -> Result<RuntimeGenerationPruneResult, RuntimeGenerationPruneError> {
+    let (entries, quarantines, scanned_entries) =
+        scan_runtime_generations(root, reserved_directories)?;
+    let retained = retention.retained();
+    let stale = entries
+        .into_iter()
+        .filter(|entry| !retained.contains(&entry.generation))
+        .collect::<Vec<_>>();
+
+    for quarantine in &quarantines {
+        verify_generation_identity(quarantine)?;
+    }
+    for entry in &stale {
+        verify_generation_identity(entry)?;
+    }
+    for quarantine in &quarantines {
+        fs::remove_dir_all(&quarantine.path)
+            .map_err(|_| RuntimeGenerationPruneError::new(RuntimeGenerationPruneErrorKind::Io))?;
+    }
+
+    let mut removed_generations = quarantines.len();
+    for entry in &stale {
+        before_quarantine(&entry.path);
+        let quarantine = root.join(format!(
+            ".generation-{:020}-{}.pruning",
+            entry.generation.0,
+            uuid::Uuid::new_v4()
+        ));
+        match fs::symlink_metadata(&quarantine) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) | Err(_) => {
+                return Err(RuntimeGenerationPruneError::new(
+                    RuntimeGenerationPruneErrorKind::UnsafeEntry,
+                ));
+            }
+        }
+        fs::rename(&entry.path, &quarantine)
+            .map_err(|_| RuntimeGenerationPruneError::new(RuntimeGenerationPruneErrorKind::Io))?;
+        let quarantined = RuntimeGenerationEntry {
+            path: quarantine,
+            ..entry.clone()
+        };
+        verify_generation_identity(&quarantined)?;
+        fs::remove_dir_all(&quarantined.path)
+            .map_err(|_| RuntimeGenerationPruneError::new(RuntimeGenerationPruneErrorKind::Io))?;
+        removed_generations += 1;
+    }
+    if removed_generations > 0 {
+        File::open(root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| RuntimeGenerationPruneError::new(RuntimeGenerationPruneErrorKind::Io))?;
+    }
+
+    Ok(RuntimeGenerationPruneResult {
+        scanned_entries,
+        removed_generations,
+    })
+}
+
+fn scan_runtime_generations(
+    root: &Path,
+    reserved_directories: &[&str],
+) -> Result<
+    (
+        Vec<RuntimeGenerationEntry>,
+        Vec<RuntimeGenerationEntry>,
+        usize,
+    ),
+    RuntimeGenerationPruneError,
+> {
+    let root_metadata = fs::symlink_metadata(root).map_err(|_| {
+        RuntimeGenerationPruneError::new(RuntimeGenerationPruneErrorKind::RootUnavailable)
+    })?;
+    if root_metadata.file_type().is_symlink()
+        || !root_metadata.is_dir()
+        || root_metadata.mode() & 0o022 != 0
+    {
+        return Err(RuntimeGenerationPruneError::new(
+            RuntimeGenerationPruneErrorKind::RootUnavailable,
+        ));
+    }
+    let owner_uid = root_metadata.uid();
+    let mut entries = Vec::new();
+    let mut quarantines = Vec::new();
+    let mut scanned_entries = 0_usize;
+    let directory = fs::read_dir(root).map_err(|_| {
+        RuntimeGenerationPruneError::new(RuntimeGenerationPruneErrorKind::RootUnavailable)
+    })?;
+    for entry in directory {
+        let entry = entry
+            .map_err(|_| RuntimeGenerationPruneError::new(RuntimeGenerationPruneErrorKind::Io))?;
+        scanned_entries = scanned_entries.checked_add(1).ok_or_else(|| {
+            RuntimeGenerationPruneError::new(RuntimeGenerationPruneErrorKind::UnsafeEntry)
+        })?;
+        if scanned_entries > RUNTIME_GENERATION_SCAN_LIMIT {
+            return Err(RuntimeGenerationPruneError::new(
+                RuntimeGenerationPruneErrorKind::UnsafeEntry,
+            ));
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(RuntimeGenerationPruneError::new(
+                RuntimeGenerationPruneErrorKind::UnsafeEntry,
+            ));
+        };
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|_| {
+            RuntimeGenerationPruneError::new(RuntimeGenerationPruneErrorKind::UnsafeEntry)
+        })?;
+        if reserved_directories.contains(&name) {
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || metadata.uid() != owner_uid
+                || metadata.mode() & 0o022 != 0
+            {
+                return Err(RuntimeGenerationPruneError::new(
+                    RuntimeGenerationPruneErrorKind::UnsafeEntry,
+                ));
+            }
+            continue;
+        }
+        let (generation, quarantine) = if let Some(generation) = parse_runtime_generation_name(name)
+        {
+            (generation, false)
+        } else if let Some(generation) = parse_runtime_quarantine_name(name) {
+            (generation, true)
+        } else {
+            return Err(RuntimeGenerationPruneError::new(
+                RuntimeGenerationPruneErrorKind::UnsafeEntry,
+            ));
+        };
+        if !strict_generation_metadata(&metadata, owner_uid) {
+            return Err(RuntimeGenerationPruneError::new(
+                RuntimeGenerationPruneErrorKind::UnsafeEntry,
+            ));
+        }
+        let entry = RuntimeGenerationEntry {
+            generation,
+            path: entry.path(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            owner_uid,
+        };
+        if quarantine {
+            quarantines.push(entry);
+        } else {
+            entries.push(entry);
+        }
+    }
+    entries.sort_by_key(|entry| entry.generation);
+    quarantines.sort_by_key(|entry| entry.generation);
+    Ok((entries, quarantines, scanned_entries))
+}
+
+fn parse_runtime_generation_name(name: &str) -> Option<RuntimeGeneration> {
+    let digits = name.strip_prefix("generation-")?;
+    if digits.len() != 20 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let generation = digits.parse::<u64>().ok()?;
+    (generation > 0 && name == format!("generation-{generation:020}"))
+        .then_some(RuntimeGeneration(generation))
+}
+
+fn parse_runtime_quarantine_name(name: &str) -> Option<RuntimeGeneration> {
+    let value = name.strip_prefix(".generation-")?;
+    let (generation, suffix) = value.split_once('-')?;
+    let uuid = suffix.strip_suffix(".pruning")?;
+    if generation.len() != 20
+        || !generation.bytes().all(|byte| byte.is_ascii_digit())
+        || uuid.len() != 36
+    {
+        return None;
+    }
+    let generation = generation.parse::<u64>().ok()?;
+    let parsed_uuid = uuid::Uuid::parse_str(uuid).ok()?;
+    (generation > 0 && name == format!(".generation-{generation:020}-{parsed_uuid}.pruning"))
+        .then_some(RuntimeGeneration(generation))
+}
+
+fn verify_generation_identity(
+    entry: &RuntimeGenerationEntry,
+) -> Result<(), RuntimeGenerationPruneError> {
+    let metadata = fs::symlink_metadata(&entry.path).map_err(|_| {
+        RuntimeGenerationPruneError::new(RuntimeGenerationPruneErrorKind::UnsafeEntry)
+    })?;
+    if !strict_generation_metadata(&metadata, entry.owner_uid)
+        || metadata.dev() != entry.device
+        || metadata.ino() != entry.inode
+    {
+        return Err(RuntimeGenerationPruneError::new(
+            RuntimeGenerationPruneErrorKind::UnsafeEntry,
+        ));
+    }
+    Ok(())
+}
+
+fn strict_generation_metadata(metadata: &fs::Metadata, owner_uid: u32) -> bool {
+    !metadata.file_type().is_symlink()
+        && metadata.is_dir()
+        && metadata.uid() == owner_uid
+        && metadata.mode() & 0o777 == 0o700
 }
 
 pub struct RuntimeBundleStager {
@@ -596,4 +919,57 @@ fn valid_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+#[cfg(test)]
+mod generation_prune_tests {
+    use super::*;
+
+    #[test]
+    fn a_generation_replaced_after_preflight_is_quarantined_without_deletion() {
+        let root = std::env::temp_dir().join(format!(
+            "hopash-runtime-prune-race-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).expect("the fixture root should be created");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("the fixture root should be private");
+        let generation = root.join("generation-00000000000000000001");
+        fs::create_dir(&generation).expect("the generation should be created");
+        fs::set_permissions(&generation, fs::Permissions::from_mode(0o700))
+            .expect("the generation should be private");
+        let original = root.join("original-generation");
+
+        let error = prune_runtime_generations_with_reserved_and_hook(
+            &root,
+            RuntimeGenerationRetention::default(),
+            &[],
+            |source| {
+                fs::rename(source, &original).expect("the original should be moved");
+                fs::create_dir(source).expect("the replacement should be created");
+                fs::set_permissions(source, fs::Permissions::from_mode(0o700))
+                    .expect("the replacement should be private");
+            },
+        )
+        .expect_err("the identity replacement should stop deletion");
+
+        assert_eq!(error.kind(), RuntimeGenerationPruneErrorKind::UnsafeEntry);
+        assert!(original.exists());
+        let quarantines = fs::read_dir(&root)
+            .expect("the fixture root should be readable")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".pruning"))
+            })
+            .count();
+        assert_eq!(quarantines, 1);
+        let diagnostic = format!("{error:?} {error}");
+        assert!(!diagnostic.contains(&root.display().to_string()));
+
+        fs::remove_dir_all(root).expect("the fixture root should be removed");
+    }
 }
