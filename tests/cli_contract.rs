@@ -271,3 +271,32 @@ fn root_help_lists_the_public_surface_only() {
     assert!(!help.contains("supervisor-internal"));
     assert!(!help.contains("service-internal"));
 }
+
+#[test]
+fn every_public_command_argument_and_flag_has_help_text() {
+    let mut command = Cli::command();
+    command.build();
+    assert_help_tree(&command, "hopash");
+}
+
+fn assert_help_tree(command: &clap::Command, path: &str) {
+    for argument in command.get_arguments() {
+        assert!(
+            argument
+                .get_help()
+                .is_some_and(|help| !help.to_string().trim().is_empty()),
+            "{path} argument {} has no help text",
+            argument.get_id()
+        );
+    }
+    for subcommand in command.get_subcommands() {
+        let subcommand_path = format!("{path} {}", subcommand.get_name());
+        assert!(
+            subcommand
+                .get_about()
+                .is_some_and(|about| !about.to_string().trim().is_empty()),
+            "{subcommand_path} has no description"
+        );
+        assert_help_tree(subcommand, &subcommand_path);
+    }
+}

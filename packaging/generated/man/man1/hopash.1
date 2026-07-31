@@ -1,0 +1,51 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH HOPASH 1 2026-08-01 "Hopash RS 0.1.0" "Hopash RS User Commands"
+.SH NAME
+hopash \- Manage Mihomo from the command line and a terminal interface
+.SH SYNOPSIS
+\fBhopash\fR [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fIsubcommands\fR]
+.SH DESCRIPTION
+Manage Mihomo from the command line and a terminal interface
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+hopash\-start(1)
+Start the background Supervisor and wait until it is ready
+.TP
+hopash\-stop(1)
+Stop the Supervisor and its Managed Core
+.TP
+hopash\-restart(1)
+Restart the Supervisor and restore its committed runtime
+.TP
+hopash\-status(1)
+Open the Status Interface or print one JSON status snapshot
+.TP
+hopash\-profile(1)
+Add, list, activate, and remove subscription Profiles
+.TP
+hopash\-proxy(1)
+List Proxy Groups and select Nodes
+.TP
+hopash\-latency(1)
+Inspect latency for Active Profile Nodes
+.TP
+hopash\-rule(1)
+List and atomically mutate the Local Rule Set
+.TP
+hopash\-logs(1)
+Follow the live Core Log stream
+.TP
+hopash\-help(1)
+Show command help or the AI Agent operation contract
+.SH EXTRA
+For automation guidance, run: hopash help agent
+.SH VERSION
+v0.1.0

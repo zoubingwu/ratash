@@ -68,7 +68,7 @@
 - `src/runtime_bundle.rs` atomically stages private Runtime Generations and binds the Effective Configuration, bundled Mihomo executable, and local provider files to one verified manifest.
 - `src/runtime_adapters.rs` confirms pinned Mihomo readiness, classifies uncertain CoreRuntime outcomes, and resolves previously staged Runtime Generations for recovery.
 - `fixtures/mihomo/v1.19.28/*.json` are the pinned Core API contract fixtures for projection, readiness, probes, and telemetry.
-- `fixtures/release/product-contract-v1.json` freezes protocol versions, user-visible timing, capacities, size limits, and process exit codes for the first release contract.
+- `fixtures/release/product-contract-v1.json` freezes protocol versions, user-visible timing, capacities, size limits, and process exit codes for the first release contract; `benchmark-metadata-v1.json` freezes the release workload and measurement schema.
 - `src/rule.rs` owns Rule String parsing, ordered Local Rule Set mutations, revisions, and deterministic `rules.yaml` serialization.
 - `src/scheduler.rs` owns deterministic bounded Profile Refresh and Active Profile Delay Probe scheduling state.
 - `src/telemetry.rs` owns generation-scoped latest values, fixed traffic history, and the bounded Core Log ring.
@@ -81,6 +81,9 @@
 - `src/cli/help.rs` generates Agent Help from the Clap command tree plus the fixed recovery workflow.
 - `src/cli/runner.rs` executes typed invocations against an injected application client and owns stdout/stderr formatting.
 - `skills/hopash/` is the packaged AI Skill and treats `hopash help agent` as the live command authority.
+- `examples/generate-release-assets.rs` derives Bash, Zsh, Fish, and `hopash(1)` assets from the public Clap command tree and verifies committed copies.
+- `packaging/macos/` and `scripts/package-macos.sh` define the signed per-architecture installer payload, pinned Mihomo artifacts, LaunchDaemon, and uninstaller without performing installation during development.
+- `.github/workflows/ci.yml` validates formatting, linting, tests, generated assets, and release-scale bounds; `.github/workflows/release.yml` builds, signs, notarizes, checksums, and publishes both macOS installer targets.
 - `src/main.rs` remains the thin executable composition root.
 
 ## Product Constraints

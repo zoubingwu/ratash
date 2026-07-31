@@ -90,29 +90,25 @@ pub trait ProfileFetchPort: Send + Sync {
 }
 
 pub struct BlockingProfileFetchPort {
-    runtime: Mutex<tokio::runtime::Runtime>,
+    runtime: tokio::runtime::Runtime,
     source: Arc<dyn ProfileSource>,
 }
 
 impl BlockingProfileFetchPort {
     pub fn new(source: Arc<dyn ProfileSource>) -> io::Result<Self> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(crate::constants::PROFILE_REFRESH_CONCURRENCY)
+            .thread_name("hopash-profile-download")
             .enable_all()
             .build()?;
-        Ok(Self {
-            runtime: Mutex::new(runtime),
-            source,
-        })
+        Ok(Self { runtime, source })
     }
 }
 
 impl ProfileFetchPort for BlockingProfileFetchPort {
     fn fetch(&self, url: &SubscriptionUrl) -> Result<FetchedProfile, ProfileFetchError> {
-        let runtime = self
+        let download = self
             .runtime
-            .lock()
-            .map_err(|_| ProfileFetchError::new("Profile download runtime is unavailable", true))?;
-        let download = runtime
             .block_on(self.source.download(url))
             .map_err(|error| ProfileFetchError::new(error.to_string(), error.retryable()))?;
         Ok(FetchedProfile {
@@ -2645,6 +2641,67 @@ fn internal_error() -> ApplicationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile_source::{ProfileDownload, ProfileSource, ProfileSourceError};
+    use async_trait::async_trait;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ConcurrentSource {
+        active: AtomicUsize,
+        maximum: AtomicUsize,
+        entered: Barrier,
+    }
+
+    #[async_trait]
+    impl ProfileSource for ConcurrentSource {
+        async fn download(
+            &self,
+            subscription_url: &SubscriptionUrl,
+        ) -> Result<ProfileDownload, ProfileSourceError> {
+            let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+            self.maximum.fetch_max(active, Ordering::AcqRel);
+            self.entered.wait();
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            Ok(ProfileDownload::from_parts(
+                b"rules: [MATCH,DIRECT]".to_vec(),
+                None,
+                subscription_url.redacted(),
+            ))
+        }
+    }
+
+    #[test]
+    fn blocking_adapter_runs_two_profile_downloads_concurrently() {
+        let source = Arc::new(ConcurrentSource {
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+            entered: Barrier::new(crate::constants::PROFILE_REFRESH_CONCURRENCY),
+        });
+        let adapter = Arc::new(
+            BlockingProfileFetchPort::new(source.clone())
+                .expect("the Profile download runtime should start"),
+        );
+        let url = SubscriptionUrl::parse("https://example.test/profile.yaml")
+            .expect("the fixture URL should be valid");
+        let workers = (0..crate::constants::PROFILE_REFRESH_CONCURRENCY)
+            .map(|_| {
+                let adapter = Arc::clone(&adapter);
+                let url = url.clone();
+                std::thread::spawn(move || adapter.fetch(&url))
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            worker
+                .join()
+                .expect("the download worker should finish")
+                .expect("the fixture download should succeed");
+        }
+        assert_eq!(
+            source.maximum.load(Ordering::Acquire),
+            crate::constants::PROFILE_REFRESH_CONCURRENCY
+        );
+    }
 
     #[test]
     fn activation_queue_keeps_only_the_latest_pending_target() {

@@ -1,0 +1,397 @@
+#compdef hopash
+
+autoload -U is-at-least
+
+_hopash() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_hopash_commands" \
+"*::: :->hopash" \
+&& ret=0
+    case $state in
+    (hopash)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:hopash-command-$line[1]:"
+        case $line[1] in
+            (start)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit a versioned JSON document or NDJSON stream]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(stop)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit a versioned JSON document or NDJSON stream]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(restart)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit a versioned JSON document or NDJSON stream]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit a versioned JSON document or NDJSON stream]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(profile)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_hopash__subcmd__profile_commands" \
+"*::: :->profile" \
+&& ret=0
+
+    case $state in
+    (profile)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:hopash-profile-command-$line[1]:"
+        case $line[1] in
+            (add)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit a versioned JSON document or NDJSON stream]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':subscription_url -- HTTP(S) subscription URL:_default' \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit a versioned JSON document or NDJSON stream]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(use)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit a versioned JSON document or NDJSON stream]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':profile -- Opaque Profile ID or unique case-sensitive display name:_default' \
+&& ret=0
+;;
+(remove)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit a versioned JSON document or NDJSON stream]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':profile -- Opaque Profile ID or unique case-sensitive display name:_default' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(proxy)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_hopash__subcmd__proxy_commands" \
+"*::: :->proxy" \
+&& ret=0
+
+    case $state in
+    (proxy)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:hopash-proxy-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit a versioned JSON document or NDJSON stream]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':group -- Opaque Proxy Group ID or unique case-sensitive display name:_default' \
+&& ret=0
+;;
+(select)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit a versioned JSON document or NDJSON stream]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':group -- Opaque Proxy Group ID or unique case-sensitive display name:_default' \
+':node -- Source-aware Node ID or unique case-sensitive display name:_default' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(latency)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_hopash__subcmd__latency_commands" \
+"*::: :->latency" \
+&& ret=0
+
+    case $state in
+    (latency)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:hopash-latency-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit a versioned JSON document or NDJSON stream]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(show)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit a versioned JSON document or NDJSON stream]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':node -- Source-aware Node ID or unique case-sensitive display name:_default' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(rule)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_hopash__subcmd__rule_commands" \
+"*::: :->rule" \
+&& ret=0
+
+    case $state in
+    (rule)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:hopash-rule-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit a versioned JSON document or NDJSON stream]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(add)
+_arguments "${_arguments_options[@]}" : \
+'--before=[Insert before this exact, complete Rule String]:BEFORE:_default' \
+'--after=[Insert after this exact, complete Rule String]:AFTER:_default' \
+'--prepend[Insert before every existing rule]' \
+'--append[Insert after every existing rule]' \
+'--json[Emit a versioned JSON document or NDJSON stream]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':rule -- Complete, case-sensitive Mihomo Rule String to insert:_default' \
+&& ret=0
+;;
+(replace)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit a versioned JSON document or NDJSON stream]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':old_rule -- Exact, complete Rule String to replace:_default' \
+':new_rule -- Complete Rule String to insert in its place:_default' \
+&& ret=0
+;;
+(remove)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit a versioned JSON document or NDJSON stream]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':rule -- Exact, complete Rule String to remove:_default' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(logs)
+_arguments "${_arguments_options[@]}" : \
+'--follow[Continue streaming until interrupted]' \
+'--json[Emit a versioned JSON document or NDJSON stream]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'::topic -- Optional audience-specific help topic:((agent\:"Stable operation guidance for AI Agents and scripts"))' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_hopash_commands] )) ||
+_hopash_commands() {
+    local commands; commands=(
+'start:Start the background Supervisor and wait until it is ready' \
+'stop:Stop the Supervisor and its Managed Core' \
+'restart:Restart the Supervisor and restore its committed runtime' \
+'status:Open the Status Interface or print one JSON status snapshot' \
+'profile:Add, list, activate, and remove subscription Profiles' \
+'proxy:List Proxy Groups and select Nodes' \
+'latency:Inspect latency for Active Profile Nodes' \
+'rule:List and atomically mutate the Local Rule Set' \
+'logs:Follow the live Core Log stream' \
+'help:Show command help or the AI Agent operation contract' \
+    )
+    _describe -t commands 'hopash commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__help_commands] )) ||
+_hopash__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'hopash help commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__latency_commands] )) ||
+_hopash__subcmd__latency_commands() {
+    local commands; commands=(
+'list:List latency samples for all Active Profile Nodes' \
+'show:Show the latency sample for one Active Profile Node' \
+    )
+    _describe -t commands 'hopash latency commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__latency__subcmd__list_commands] )) ||
+_hopash__subcmd__latency__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'hopash latency list commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__latency__subcmd__show_commands] )) ||
+_hopash__subcmd__latency__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'hopash latency show commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__logs_commands] )) ||
+_hopash__subcmd__logs_commands() {
+    local commands; commands=()
+    _describe -t commands 'hopash logs commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__profile_commands] )) ||
+_hopash__subcmd__profile_commands() {
+    local commands; commands=(
+'add:Download, validate, and save an HTTP(S) subscription' \
+'list:List saved Profiles and their refresh state' \
+'use:Activate a validated Profile Snapshot' \
+'remove:Remove an Inactive Profile' \
+    )
+    _describe -t commands 'hopash profile commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__profile__subcmd__add_commands] )) ||
+_hopash__subcmd__profile__subcmd__add_commands() {
+    local commands; commands=()
+    _describe -t commands 'hopash profile add commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__profile__subcmd__list_commands] )) ||
+_hopash__subcmd__profile__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'hopash profile list commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__profile__subcmd__remove_commands] )) ||
+_hopash__subcmd__profile__subcmd__remove_commands() {
+    local commands; commands=()
+    _describe -t commands 'hopash profile remove commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__profile__subcmd__use_commands] )) ||
+_hopash__subcmd__profile__subcmd__use_commands() {
+    local commands; commands=()
+    _describe -t commands 'hopash profile use commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__proxy_commands] )) ||
+_hopash__subcmd__proxy_commands() {
+    local commands; commands=(
+'list:List the Nodes exposed by one Proxy Group' \
+'select:Select one Node in a Proxy Group' \
+    )
+    _describe -t commands 'hopash proxy commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__proxy__subcmd__list_commands] )) ||
+_hopash__subcmd__proxy__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'hopash proxy list commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__proxy__subcmd__select_commands] )) ||
+_hopash__subcmd__proxy__subcmd__select_commands() {
+    local commands; commands=()
+    _describe -t commands 'hopash proxy select commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__restart_commands] )) ||
+_hopash__subcmd__restart_commands() {
+    local commands; commands=()
+    _describe -t commands 'hopash restart commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__rule_commands] )) ||
+_hopash__subcmd__rule_commands() {
+    local commands; commands=(
+'list:List Local Rule Set entries in effective order' \
+'add:Insert one complete Rule String at an explicit position' \
+'replace:Replace one exact, complete Rule String' \
+'remove:Remove one exact, complete Rule String' \
+    )
+    _describe -t commands 'hopash rule commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__rule__subcmd__add_commands] )) ||
+_hopash__subcmd__rule__subcmd__add_commands() {
+    local commands; commands=()
+    _describe -t commands 'hopash rule add commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__rule__subcmd__list_commands] )) ||
+_hopash__subcmd__rule__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'hopash rule list commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__rule__subcmd__remove_commands] )) ||
+_hopash__subcmd__rule__subcmd__remove_commands() {
+    local commands; commands=()
+    _describe -t commands 'hopash rule remove commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__rule__subcmd__replace_commands] )) ||
+_hopash__subcmd__rule__subcmd__replace_commands() {
+    local commands; commands=()
+    _describe -t commands 'hopash rule replace commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__start_commands] )) ||
+_hopash__subcmd__start_commands() {
+    local commands; commands=()
+    _describe -t commands 'hopash start commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__status_commands] )) ||
+_hopash__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'hopash status commands' commands "$@"
+}
+(( $+functions[_hopash__subcmd__stop_commands] )) ||
+_hopash__subcmd__stop_commands() {
+    local commands; commands=()
+    _describe -t commands 'hopash stop commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_hopash" ]; then
+    _hopash "$@"
+else
+    compdef _hopash hopash
+fi

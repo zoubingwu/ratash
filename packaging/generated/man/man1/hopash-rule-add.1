@@ -1,0 +1,31 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH HOPASH-RULE-ADD 1 2026-08-01 "Hopash RS 0.1.0" "Hopash RS User Commands"
+.SH NAME
+hopash\-rule\-add \- Insert one complete Rule String at an explicit position
+.SH SYNOPSIS
+\fBhopash rule add\fR [\fB\-\-prepend\fR] [\fB\-\-append\fR] [\fB\-\-before\fR] [\fB\-\-after\fR] [\fB\-\-json\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIRULE\fR>
+.SH DESCRIPTION
+Insert one complete Rule String at an explicit position
+.SH OPTIONS
+.TP
+\fB\-\-prepend\fR
+Insert before every existing rule
+.TP
+\fB\-\-append\fR
+Insert after every existing rule
+.TP
+\fB\-\-before\fR \fI<BEFORE>\fR
+Insert before this exact, complete Rule String
+.TP
+\fB\-\-after\fR \fI<AFTER>\fR
+Insert after this exact, complete Rule String
+.TP
+\fB\-\-json\fR
+Emit a versioned JSON document or NDJSON stream
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIRULE\fR>
+Complete, case\-sensitive Mihomo Rule String to insert

@@ -1,0 +1,22 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH HOPASH-PROXY-SELECT 1 2026-08-01 "Hopash RS 0.1.0" "Hopash RS User Commands"
+.SH NAME
+hopash\-proxy\-select \- Select one Node in a Proxy Group
+.SH SYNOPSIS
+\fBhopash proxy select\fR [\fB\-\-json\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIGROUP\fR> <\fINODE\fR>
+.SH DESCRIPTION
+Select one Node in a Proxy Group
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Emit a versioned JSON document or NDJSON stream
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIGROUP\fR>
+Opaque Proxy Group ID or unique case\-sensitive display name
+.TP
+<\fINODE\fR>
+Source\-aware Node ID or unique case\-sensitive display name

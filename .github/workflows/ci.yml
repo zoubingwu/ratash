@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Format, lint, and test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+      - name: Install the stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Run all tests
+        run: cargo test --locked --all-targets
+      - name: Check generated completion and manual assets
+        run: cargo run --locked --example generate-release-assets -- --check
+
+  macos-contract:
+    name: macOS contract (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+      - name: Install the stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - name: Run the macOS contract suite
+        run: cargo test --locked --all-targets
+      - name: Build the release executable
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Exercise a representative cold CLI start
+        run: /usr/bin/time -p "target/${{ matrix.target }}/release/hopash" --version
+
+  release-scale:
+    name: Release-scale boundedness
+    runs-on: macos-15
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+      - name: Install the stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Check 10,000-Node Probe Queue bounds
+        run: cargo test --locked --release --test scheduler probe_workers_and_node_membership_remain_bounded_at_ten_thousand_nodes -- --exact
+      - name: Check the 20,000-rule boundary
+        run: cargo test --locked --release --test rule_parser rules_yaml_accepts_the_twenty_thousand_rule_regression_boundary -- --exact
+      - name: Check sustained telemetry bounds
+        run: cargo test --locked --release --test telemetry_buffers sustained_traffic_input_keeps_a_fixed_capacity_series -- --exact
+      - name: Check release-scale Status Interface caches
+        run: cargo test --locked --release --test tui_contract view_caches_remain_bounded_at_release_scale -- --exact

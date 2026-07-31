@@ -119,15 +119,25 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Start the background Supervisor and wait until it is ready.
     Start(OutputArgs),
+    /// Stop the Supervisor and its Managed Core.
     Stop(OutputArgs),
+    /// Restart the Supervisor and restore its committed runtime.
     Restart(OutputArgs),
+    /// Open the Status Interface or print one JSON status snapshot.
     Status(OutputArgs),
+    /// Add, list, activate, and remove subscription Profiles.
     Profile(ProfileArgs),
+    /// List Proxy Groups and select Nodes.
     Proxy(ProxyArgs),
+    /// Inspect latency for Active Profile Nodes.
     Latency(LatencyArgs),
+    /// List and atomically mutate the Local Rule Set.
     Rule(RuleArgs),
+    /// Follow the live Core Log stream.
     Logs(LogsArgs),
+    /// Show command help or the AI Agent operation contract.
     Help(HelpArgs),
 }
 
@@ -139,14 +149,19 @@ struct ProfileArgs {
 
 #[derive(Debug, Subcommand)]
 enum ProfileCommand {
+    /// Download, validate, and save an HTTP(S) subscription.
     Add(ProfileAddArgs),
+    /// List saved Profiles and their refresh state.
     List(OutputArgs),
+    /// Activate a validated Profile Snapshot.
     Use(ProfileSelectorArgs),
+    /// Remove an Inactive Profile.
     Remove(ProfileSelectorArgs),
 }
 
 #[derive(Debug, Args)]
 struct ProfileAddArgs {
+    /// HTTP(S) subscription URL.
     #[arg(value_parser = parse_http_subscription_url)]
     subscription_url: SubscriptionUrl,
     #[command(flatten)]
@@ -155,6 +170,7 @@ struct ProfileAddArgs {
 
 #[derive(Debug, Args)]
 struct ProfileSelectorArgs {
+    /// Opaque Profile ID or unique case-sensitive display name.
     profile: String,
     #[command(flatten)]
     output: OutputArgs,
@@ -172,12 +188,15 @@ struct ProxyArgs {
 
 #[derive(Debug, Subcommand)]
 enum ProxyCommand {
+    /// List the Nodes exposed by one Proxy Group.
     List(GroupSelectorArgs),
+    /// Select one Node in a Proxy Group.
     Select(ProxySelectArgs),
 }
 
 #[derive(Debug, Args)]
 struct GroupSelectorArgs {
+    /// Opaque Proxy Group ID or unique case-sensitive display name.
     group: String,
     #[command(flatten)]
     output: OutputArgs,
@@ -185,7 +204,9 @@ struct GroupSelectorArgs {
 
 #[derive(Debug, Args)]
 struct ProxySelectArgs {
+    /// Opaque Proxy Group ID or unique case-sensitive display name.
     group: String,
+    /// Source-aware Node ID or unique case-sensitive display name.
     node: String,
     #[command(flatten)]
     output: OutputArgs,
@@ -199,12 +220,15 @@ struct LatencyArgs {
 
 #[derive(Debug, Subcommand)]
 enum LatencyCommand {
+    /// List latency samples for all Active Profile Nodes.
     List(OutputArgs),
+    /// Show the latency sample for one Active Profile Node.
     Show(NodeSelectorArgs),
 }
 
 #[derive(Debug, Args)]
 struct NodeSelectorArgs {
+    /// Source-aware Node ID or unique case-sensitive display name.
     node: String,
     #[command(flatten)]
     output: OutputArgs,
@@ -218,9 +242,13 @@ struct RuleArgs {
 
 #[derive(Debug, Subcommand)]
 enum RuleCommand {
+    /// List Local Rule Set entries in effective order.
     List(OutputArgs),
+    /// Insert one complete Rule String at an explicit position.
     Add(RuleAddArgs),
+    /// Replace one exact, complete Rule String.
     Replace(RuleReplaceArgs),
+    /// Remove one exact, complete Rule String.
     Remove(RuleRemoveArgs),
 }
 
@@ -232,13 +260,18 @@ enum RuleCommand {
         .args(["prepend", "append", "before", "after"])
 ))]
 struct RuleAddArgs {
+    /// Complete, case-sensitive Mihomo Rule String to insert.
     rule: String,
+    /// Insert before every existing rule.
     #[arg(long)]
     prepend: bool,
+    /// Insert after every existing rule.
     #[arg(long)]
     append: bool,
+    /// Insert before this exact, complete Rule String.
     #[arg(long)]
     before: Option<String>,
+    /// Insert after this exact, complete Rule String.
     #[arg(long)]
     after: Option<String>,
     #[command(flatten)]
@@ -263,7 +296,9 @@ impl RuleAddArgs {
 
 #[derive(Debug, Args)]
 struct RuleReplaceArgs {
+    /// Exact, complete Rule String to replace.
     old_rule: String,
+    /// Complete Rule String to insert in its place.
     new_rule: String,
     #[command(flatten)]
     output: OutputArgs,
@@ -271,6 +306,7 @@ struct RuleReplaceArgs {
 
 #[derive(Debug, Args)]
 struct RuleRemoveArgs {
+    /// Exact, complete Rule String to remove.
     rule: String,
     #[command(flatten)]
     output: OutputArgs,
@@ -278,6 +314,7 @@ struct RuleRemoveArgs {
 
 #[derive(Debug, Args)]
 struct LogsArgs {
+    /// Continue streaming until interrupted.
     #[arg(long, required = true)]
     follow: bool,
     #[command(flatten)]
@@ -286,17 +323,20 @@ struct LogsArgs {
 
 #[derive(Debug, Args)]
 struct HelpArgs {
+    /// Optional audience-specific help topic.
     #[arg(value_enum)]
     topic: Option<HelpTopic>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum HelpTopic {
+    /// Stable operation guidance for AI Agents and scripts.
     Agent,
 }
 
 #[derive(Clone, Copy, Debug, Default, Args)]
 struct OutputArgs {
+    /// Emit a versioned JSON document or NDJSON stream.
     #[arg(long)]
     json: bool,
 }

@@ -1,0 +1,22 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH HOPASH-RULE-REPLACE 1 2026-08-01 "Hopash RS 0.1.0" "Hopash RS User Commands"
+.SH NAME
+hopash\-rule\-replace \- Replace one exact, complete Rule String
+.SH SYNOPSIS
+\fBhopash rule replace\fR [\fB\-\-json\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIOLD_RULE\fR> <\fINEW_RULE\fR>
+.SH DESCRIPTION
+Replace one exact, complete Rule String
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Emit a versioned JSON document or NDJSON stream
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIOLD_RULE\fR>
+Exact, complete Rule String to replace
+.TP
+<\fINEW_RULE\fR>
+Complete Rule String to insert in its place

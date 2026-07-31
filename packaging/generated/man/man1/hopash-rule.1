@@ -1,0 +1,26 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH HOPASH-RULE 1 2026-08-01 "Hopash RS 0.1.0" "Hopash RS User Commands"
+.SH NAME
+hopash\-rule \- List and atomically mutate the Local Rule Set
+.SH SYNOPSIS
+\fBhopash rule\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+List and atomically mutate the Local Rule Set
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH SUBCOMMANDS
+.TP
+hopash\-rule\-list(1)
+List Local Rule Set entries in effective order
+.TP
+hopash\-rule\-add(1)
+Insert one complete Rule String at an explicit position
+.TP
+hopash\-rule\-replace(1)
+Replace one exact, complete Rule String
+.TP
+hopash\-rule\-remove(1)
+Remove one exact, complete Rule String

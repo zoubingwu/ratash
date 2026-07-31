@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "package_identifier": "io.hopash.rs",
+  "service_label": "io.hopash.core-runtime",
+  "mihomo_version": "v1.19.28",
+  "paths": {
+    "cli": "/usr/local/bin/hopash",
+    "service_executable": "/Library/PrivilegedHelperTools/io.hopash.core-runtime",
+    "service_plist": "/Library/LaunchDaemons/io.hopash.core-runtime.plist",
+    "service_socket": "/var/run/hopash-rs/core-service.sock",
+    "service_runtime_root": "/Library/Application Support/Hopash RS/runtime",
+    "mihomo": "/Library/Application Support/Hopash RS/bin/mihomo",
+    "shared_assets": "/usr/local/share/hopash"
+  },
+  "internal_service": {
+    "mode": "__core-service",
+    "arguments": [
+      "--owner-uid",
+      "@OWNER_UID@",
+      "--socket",
+      "/var/run/hopash-rs/core-service.sock",
+      "--runtime-root",
+      "/Library/Application Support/Hopash RS/runtime",
+      "--mihomo",
+      "/Library/Application Support/Hopash RS/bin/mihomo"
+    ]
+  },
+  "targets": {
+    "aarch64-apple-darwin": {
+      "architecture": "arm64",
+      "asset": "mihomo-darwin-arm64-v1.19.28.gz",
+      "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.28/mihomo-darwin-arm64-v1.19.28.gz",
+      "sha256": "40cdae2fab4b18df15f40eaa9dc3af70ab3d8be7f77164ae1e5f1af3a2a4fb44"
+    },
+    "x86_64-apple-darwin": {
+      "architecture": "x86_64",
+      "asset": "mihomo-darwin-amd64-v1.19.28.gz",
+      "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.28/mihomo-darwin-amd64-v1.19.28.gz",
+      "sha256": "03e0ce01921f1bcc75e51e6505853330e2956e4dac123564a37620e2a68f823f"
+    }
+  }
+}

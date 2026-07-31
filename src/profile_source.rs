@@ -48,6 +48,19 @@ pub struct ProfileDownload {
 
 impl ProfileDownload {
     #[must_use]
+    pub(crate) fn from_parts(
+        body: Vec<u8>,
+        metadata_name: Option<String>,
+        safe_final_url: String,
+    ) -> Self {
+        Self {
+            body,
+            metadata_name,
+            safe_final_url,
+        }
+    }
+
+    #[must_use]
     pub fn body(&self) -> &[u8] {
         &self.body
     }

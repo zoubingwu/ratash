@@ -1,0 +1,36 @@
+#!/bin/sh
+set -eu
+
+SERVICE_LABEL='io.hopash.core-runtime'
+SERVICE_PLIST='/Library/LaunchDaemons/io.hopash.core-runtime.plist'
+SERVICE_EXECUTABLE='/Library/PrivilegedHelperTools/io.hopash.core-runtime'
+SERVICE_ROOT='/Library/Application Support/Hopash RS'
+
+owner_uid=${HOPASH_OWNER_UID:-}
+if [ -z "$owner_uid" ]; then
+    owner_uid=$(/usr/bin/stat -f '%u' /dev/console)
+fi
+case "$owner_uid" in
+    ''|*[!0-9]*)
+        echo 'Hopash RS requires a numeric HOPASH_OWNER_UID.' >&2
+        exit 1
+        ;;
+esac
+if [ "$owner_uid" -eq 0 ]; then
+    echo 'Hopash RS must be assigned to a non-root local user.' >&2
+    exit 1
+fi
+
+/bin/chmod 0755 "$SERVICE_EXECUTABLE" "$SERVICE_ROOT/bin/mihomo"
+/usr/sbin/chown root:wheel "$SERVICE_EXECUTABLE" "$SERVICE_ROOT/bin/mihomo"
+/bin/chmod 0644 "$SERVICE_PLIST"
+/usr/sbin/chown root:wheel "$SERVICE_PLIST"
+/usr/bin/sed -i '' "s/@OWNER_UID@/$owner_uid/g" "$SERVICE_PLIST"
+/usr/bin/plutil -lint "$SERVICE_PLIST" >/dev/null
+
+/bin/launchctl bootout "system/$SERVICE_LABEL" >/dev/null 2>&1 || true
+/bin/launchctl bootstrap system "$SERVICE_PLIST"
+/bin/launchctl enable "system/$SERVICE_LABEL"
+/bin/launchctl kickstart -k "system/$SERVICE_LABEL"
+
+exit 0
