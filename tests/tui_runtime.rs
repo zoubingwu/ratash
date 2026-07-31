@@ -17,16 +17,16 @@ use hopash::domain::{
 };
 use hopash::ipc::RequestId;
 use hopash::tui::{
-    Command, FullViewSnapshot, KeyInput, TerminalAction, TerminalControl, TerminalInput, UiEvent,
-    ViewLogRecord,
+    Command, FullViewSnapshot, KeyInput, ProfileRow, ProxyRow, TerminalAction, TerminalControl,
+    TerminalInput, UiEvent, ViewLogRecord,
 };
 use hopash::tui_runtime::{
     ApplicationSnapshotSource, BackgroundCommandDispatcher, BoundedReconnectTimer,
     CancellationToken, CommandDispatchError, CommandDispatcher, DispatchedEvent,
     FullSnapshotSource, LogTail, NoShutdownSignal, RatatuiStatusRenderer, ReconnectTiming,
-    RenderedFrame, RuntimeClock, ShutdownSignal, StatusInterfaceError, StatusInterfaceErrorKind,
-    StatusInterfacePorts, StatusInterfaceRuntime, StatusInterfaceSources, StatusLogEvent,
-    StatusLogEventSource, StatusRenderer, TerminalEventSource, UiCommandExecutor,
+    RenderedFrame, RuntimeClock, RuntimeWaiter, RuntimeWaker, ShutdownSignal, StatusInterfaceError,
+    StatusInterfaceErrorKind, StatusInterfacePorts, StatusInterfaceRuntime, StatusInterfaceSources,
+    StatusLogEvent, StatusLogEventSource, StatusRenderer, TerminalEventSource, UiCommandExecutor,
     bootstrap_status_interface, run_with_terminal_session,
 };
 use ratatui::backend::TestBackend;
@@ -134,6 +134,20 @@ fn application_snapshot_adapter_reads_the_complete_initial_view() {
 }
 
 #[test]
+fn background_snapshot_adapter_skips_the_core_log_tail() {
+    let client = Arc::new(SnapshotClient::default());
+    let events = Arc::new(FakeEvents::default());
+    let source = ApplicationSnapshotSource::new(client, events.clone());
+
+    let refreshed = source
+        .refresh_view_snapshot(8, &CancellationToken::default())
+        .expect("background collection snapshot should load");
+
+    assert!(refreshed.logs.is_empty());
+    assert!(events.tail_requests().is_empty());
+}
+
+#[test]
 fn event_loop_coalesces_status_updates_into_one_frame() {
     let events = Arc::new(FakeEvents::default());
     for upload in [20, 30, 40] {
@@ -148,6 +162,7 @@ fn event_loop_coalesces_status_updates_into_one_frame() {
     let clock = FixedClock(Duration::from_secs(1));
     let signal = NoShutdownSignal;
     let mut renderer = RecordingRenderer::new();
+    let waker = RuntimeWaker::default();
 
     {
         let mut runtime = StatusInterfaceRuntime::new(
@@ -158,6 +173,8 @@ fn event_loop_coalesces_status_updates_into_one_frame() {
                 dispatcher: &mut dispatcher,
                 reconnect: &mut reconnect,
                 input: &mut input,
+                waiter: &waker,
+                waker: waker.clone(),
                 clock: &clock,
                 signal: &signal,
                 renderer: &mut renderer,
@@ -181,6 +198,281 @@ fn event_loop_coalesces_status_updates_into_one_frame() {
 }
 
 #[test]
+fn idle_event_loop_waits_without_a_resident_deadline_or_extra_frame() {
+    let events = Arc::new(FakeEvents::default());
+    let mut dispatcher = RecordingDispatcher::default();
+    let mut reconnect = PassiveReconnect;
+    let mut input = ScriptedInput::quit_on_poll(2);
+    let clock = FixedClock(Duration::from_secs(1));
+    let signal = NoShutdownSignal;
+    let mut renderer = RecordingRenderer::new();
+    let waiter = RecordingWaiter::default();
+    let waker = RuntimeWaker::default();
+
+    let mut runtime = StatusInterfaceRuntime::new(
+        1,
+        snapshot(10),
+        StatusInterfacePorts {
+            events,
+            dispatcher: &mut dispatcher,
+            reconnect: &mut reconnect,
+            input: &mut input,
+            waiter: &waiter,
+            waker,
+            clock: &clock,
+            signal: &signal,
+            renderer: &mut renderer,
+        },
+    );
+    runtime
+        .run()
+        .expect("scripted idle wait should exit cleanly");
+    drop(runtime);
+
+    assert_eq!(waiter.waits(), vec![None]);
+    assert_eq!(renderer.uploads, vec![10]);
+}
+
+#[test]
+fn runtime_waker_preserves_a_wakeup_that_arrives_before_wait() {
+    let waker = RuntimeWaker::default();
+    let checkpoint = waker.checkpoint();
+
+    waker.wake();
+    waker.wait(checkpoint, None);
+
+    assert_ne!(waker.checkpoint(), checkpoint);
+}
+
+#[test]
+fn disconnected_event_loop_waits_until_the_exact_reconnect_deadline() {
+    let events = Arc::new(FakeEvents::default());
+    events.push(StatusLogEvent::Disconnected {
+        connection_generation: 1,
+    });
+    let mut dispatcher = RecordingDispatcher::default();
+    let mut reconnect =
+        BoundedReconnectTimer::new(Duration::from_millis(250), Duration::from_secs(10))
+            .expect("fixture reconnect bounds should be valid");
+    let mut input = ScriptedInput::quit_on_poll(3);
+    let clock = FixedClock(Duration::from_secs(1));
+    let signal = NoShutdownSignal;
+    let mut renderer = RecordingRenderer::new();
+    let waiter = RecordingWaiter::default();
+    let waker = RuntimeWaker::default();
+
+    let mut runtime = StatusInterfaceRuntime::new(
+        1,
+        snapshot(10),
+        StatusInterfacePorts {
+            events,
+            dispatcher: &mut dispatcher,
+            reconnect: &mut reconnect,
+            input: &mut input,
+            waiter: &waiter,
+            waker,
+            clock: &clock,
+            signal: &signal,
+            renderer: &mut renderer,
+        },
+    );
+    runtime
+        .run()
+        .expect("scripted reconnect wait should exit cleanly");
+    drop(runtime);
+
+    assert_eq!(waiter.waits(), vec![Some(Duration::from_millis(250))]);
+}
+
+#[test]
+fn live_status_revisions_coalesce_into_one_background_snapshot_refresh() {
+    let events = Arc::new(FakeEvents::default());
+    for upload in [20, 30, 40] {
+        let mut changed = status(upload);
+        changed.runtime_generation = Some(hopash::domain::RuntimeGeneration(upload));
+        events.push(StatusLogEvent::Status {
+            connection_generation: 1,
+            status: Box::new(changed),
+        });
+    }
+    let mut dispatcher = RecordingDispatcher::default();
+    let mut reconnect = PassiveReconnect;
+    let mut input = ScriptedInput::quit_on_poll(4);
+    let clock = AdjustableClock::new(Duration::from_secs(1), 10_000);
+    let waiter = AdvancingWaiter::new(clock.clone());
+    let signal = NoShutdownSignal;
+    let mut renderer = RecordingRenderer::new();
+    let waker = RuntimeWaker::default();
+
+    let mut runtime = StatusInterfaceRuntime::new(
+        1,
+        snapshot(10),
+        StatusInterfacePorts {
+            events,
+            dispatcher: &mut dispatcher,
+            reconnect: &mut reconnect,
+            input: &mut input,
+            waiter: &waiter,
+            waker,
+            clock: &clock,
+            signal: &signal,
+            renderer: &mut renderer,
+        },
+    );
+    runtime
+        .run()
+        .expect("coalesced snapshot refresh should remain live");
+    drop(runtime);
+
+    assert!(matches!(
+        dispatcher.submitted.as_slice(),
+        [Command::RefreshSnapshot {
+            connection_generation: 1
+        }]
+    ));
+    assert_eq!(waiter.waits(), vec![Some(Duration::from_millis(100))]);
+}
+
+#[test]
+fn profile_refresh_deadline_requests_a_bounded_full_snapshot() {
+    let events = Arc::new(FakeEvents::default());
+    let mut initial = snapshot(10);
+    initial.profiles.push(profile_row(10_000));
+    let mut dispatcher = RecordingDispatcher::default();
+    let mut reconnect = PassiveReconnect;
+    let mut input = ScriptedInput::quit_on_poll(3);
+    let clock = AdjustableClock::new(Duration::ZERO, 10_000);
+    let waiter = AdvancingWaiter::new(clock.clone());
+    let signal = NoShutdownSignal;
+    let mut renderer = RecordingRenderer::new();
+    let waker = RuntimeWaker::default();
+
+    let mut runtime = StatusInterfaceRuntime::new(
+        1,
+        initial,
+        StatusInterfacePorts {
+            events,
+            dispatcher: &mut dispatcher,
+            reconnect: &mut reconnect,
+            input: &mut input,
+            waiter: &waiter,
+            waker,
+            clock: &clock,
+            signal: &signal,
+            renderer: &mut renderer,
+        },
+    );
+    runtime
+        .run()
+        .expect("scheduled Profile freshness should remain bounded");
+    drop(runtime);
+
+    assert!(matches!(
+        dispatcher.submitted.as_slice(),
+        [Command::RefreshSnapshot {
+            connection_generation: 1
+        }]
+    ));
+    assert_eq!(waiter.waits(), vec![Some(Duration::from_secs(1))]);
+}
+
+#[test]
+fn background_snapshot_refresh_replaces_profiles_and_proxies() {
+    let events = Arc::new(FakeEvents::default());
+    let mut refreshed = snapshot(90);
+    refreshed.profiles.push(profile_row(40_000));
+    refreshed.proxies.push(ProxyRow {
+        group: "Automatic".to_owned(),
+        node_id: Some(NodeRecordId::for_core("Berlin")),
+        name: "Berlin".to_owned(),
+        node_type: "ss".to_owned(),
+        available: true,
+        selected: true,
+        delay_ms: Some(24),
+        sampled_at_unix_ms: Some(30_000),
+    });
+    let mut dispatcher = RecordingDispatcher::default();
+    dispatcher.results.push_back(DispatchedEvent {
+        source: hopash::tui::EventSource::CommandResult,
+        event: UiEvent::SnapshotRefreshed {
+            connection_generation: 1,
+            snapshot: refreshed,
+        },
+    });
+    let mut reconnect = PassiveReconnect;
+    let mut input = ScriptedInput::quit_on_poll(2);
+    let clock = FixedClock(Duration::ZERO);
+    let signal = NoShutdownSignal;
+    let mut renderer = RecordingRenderer::new();
+    let waker = RuntimeWaker::default();
+
+    let mut runtime = StatusInterfaceRuntime::new(
+        1,
+        snapshot(10),
+        StatusInterfacePorts {
+            events,
+            dispatcher: &mut dispatcher,
+            reconnect: &mut reconnect,
+            input: &mut input,
+            waiter: &waker,
+            waker: waker.clone(),
+            clock: &clock,
+            signal: &signal,
+            renderer: &mut renderer,
+        },
+    );
+    runtime
+        .run()
+        .expect("background snapshot should update the visible collections");
+
+    assert_eq!(runtime.state().profiles.rows.len(), 1);
+    assert_eq!(runtime.state().proxies.rows.len(), 1);
+    assert_eq!(runtime.state().proxies.rows[0].delay_ms, Some(24));
+}
+
+#[test]
+fn identical_background_snapshot_does_not_render_an_extra_frame() {
+    let events = Arc::new(FakeEvents::default());
+    let initial = snapshot(10);
+    let mut dispatcher = RecordingDispatcher::default();
+    dispatcher.results.push_back(DispatchedEvent {
+        source: hopash::tui::EventSource::CommandResult,
+        event: UiEvent::SnapshotRefreshed {
+            connection_generation: 1,
+            snapshot: initial.clone(),
+        },
+    });
+    let mut reconnect = PassiveReconnect;
+    let mut input = ScriptedInput::quit_on_poll(2);
+    let clock = FixedClock(Duration::ZERO);
+    let signal = NoShutdownSignal;
+    let mut renderer = RecordingRenderer::new();
+    let waker = RuntimeWaker::default();
+
+    let mut runtime = StatusInterfaceRuntime::new(
+        1,
+        initial,
+        StatusInterfacePorts {
+            events,
+            dispatcher: &mut dispatcher,
+            reconnect: &mut reconnect,
+            input: &mut input,
+            waiter: &waker,
+            waker: waker.clone(),
+            clock: &clock,
+            signal: &signal,
+            renderer: &mut renderer,
+        },
+    );
+    runtime
+        .run()
+        .expect("identical background snapshot should remain clean");
+    drop(runtime);
+
+    assert_eq!(renderer.uploads, vec![10]);
+}
+
+#[test]
 fn reconnect_deadline_dispatches_the_next_connection_generation() {
     let events = Arc::new(FakeEvents::default());
     events.push(StatusLogEvent::Disconnected {
@@ -192,6 +484,7 @@ fn reconnect_deadline_dispatches_the_next_connection_generation() {
     let clock = FixedClock(Duration::from_secs(5));
     let signal = NoShutdownSignal;
     let mut renderer = RecordingRenderer::new();
+    let waker = RuntimeWaker::default();
 
     {
         let mut runtime = StatusInterfaceRuntime::new(
@@ -202,6 +495,8 @@ fn reconnect_deadline_dispatches_the_next_connection_generation() {
                 dispatcher: &mut dispatcher,
                 reconnect: &mut reconnect,
                 input: &mut input,
+                waiter: &waker,
+                waker: waker.clone(),
                 clock: &clock,
                 signal: &signal,
                 renderer: &mut renderer,
@@ -243,6 +538,7 @@ fn live_log_batches_keep_only_the_bounded_tail() {
     let clock = FixedClock(Duration::ZERO);
     let signal = NoShutdownSignal;
     let mut renderer = RecordingRenderer::new();
+    let waker = RuntimeWaker::default();
 
     {
         let mut runtime = StatusInterfaceRuntime::new(
@@ -253,6 +549,8 @@ fn live_log_batches_keep_only_the_bounded_tail() {
                 dispatcher: &mut dispatcher,
                 reconnect: &mut reconnect,
                 input: &mut input,
+                waiter: &waker,
+                waker: waker.clone(),
                 clock: &clock,
                 signal: &signal,
                 renderer: &mut renderer,
@@ -346,6 +644,9 @@ fn successful_mutation_dispatches_a_refreshed_full_snapshot() {
     };
     let mut dispatcher =
         BackgroundCommandDispatcher::new(sources).expect("fixture command workers should start");
+    let waker = RuntimeWaker::default();
+    dispatcher.install_waker(waker.clone());
+    let checkpoint = waker.checkpoint();
 
     dispatcher
         .submit(Command::SelectNode {
@@ -355,17 +656,10 @@ fn successful_mutation_dispatches_a_refreshed_full_snapshot() {
             node_id: NodeRecordId::for_core("Berlin"),
         })
         .expect("fixture command should enter the bounded queue");
-
-    let dispatched = (0..100)
-        .find_map(|_| {
-            let event = dispatcher
-                .try_next()
-                .expect("result queue should remain open");
-            if event.is_none() {
-                thread::sleep(Duration::from_millis(5));
-            }
-            event
-        })
+    waker.wait(checkpoint, Some(Duration::from_secs(1)));
+    let dispatched = dispatcher
+        .try_next()
+        .expect("result queue should remain open")
         .expect("successful mutation should dispatch a bounded result");
 
     match dispatched.event {
@@ -401,6 +695,7 @@ fn shutdown_signal_exits_and_restores_every_terminal_mode() {
     let signal = ImmediateShutdown;
     let mut renderer = RecordingRenderer::new();
     let mut terminal = RecordingTerminal::default();
+    let waker = RuntimeWaker::default();
 
     run_with_terminal_session(&mut terminal, || {
         let mut runtime = StatusInterfaceRuntime::new(
@@ -411,6 +706,8 @@ fn shutdown_signal_exits_and_restores_every_terminal_mode() {
                 dispatcher: &mut dispatcher,
                 reconnect: &mut reconnect,
                 input: &mut input,
+                waiter: &waker,
+                waker: waker.clone(),
                 clock: &clock,
                 signal: &signal,
                 renderer: &mut renderer,
@@ -468,6 +765,18 @@ fn snapshot(upload: u64) -> FullViewSnapshot {
         profiles: Vec::new(),
         logs: Vec::new(),
         dropped_logs: 0,
+    }
+}
+
+fn profile_row(next_refresh_at_unix_ms: u64) -> ProfileRow {
+    ProfileRow {
+        id: ProfileId::new(),
+        name: "Fixture".to_owned(),
+        active: true,
+        fresh: true,
+        last_success_at_unix_ms: 1,
+        next_refresh_at_unix_ms,
+        error: None,
     }
 }
 
@@ -555,6 +864,7 @@ struct FakeEvents {
     order: Option<Arc<Mutex<Vec<&'static str>>>>,
     events: Mutex<VecDeque<StatusLogEvent>>,
     disconnected: Mutex<Vec<u64>>,
+    tail_requests: Mutex<Vec<Option<u64>>>,
 }
 
 impl FakeEvents {
@@ -576,6 +886,13 @@ impl FakeEvents {
         self.disconnected
             .lock()
             .expect("disconnect lock should be available")
+            .clone()
+    }
+
+    fn tail_requests(&self) -> Vec<Option<u64>> {
+        self.tail_requests
+            .lock()
+            .expect("tail request lock should be available")
             .clone()
     }
 }
@@ -606,9 +923,13 @@ impl StatusLogEventSource for FakeEvents {
     fn fetch_log_tail(
         &self,
         _connection_generation: u64,
-        _after_sequence: Option<u64>,
+        after_sequence: Option<u64>,
         _cancellation: &CancellationToken,
     ) -> Result<LogTail, StatusInterfaceError> {
+        self.tail_requests
+            .lock()
+            .expect("tail request lock should be available")
+            .push(after_sequence);
         Ok(LogTail {
             records: Vec::new(),
             gap: false,
@@ -784,6 +1105,111 @@ impl RuntimeClock for FixedClock {
     fn now(&self) -> Duration {
         self.0
     }
+
+    fn now_unix_ms(&self) -> u64 {
+        0
+    }
+}
+
+#[derive(Clone)]
+struct AdjustableClock {
+    state: Arc<Mutex<(Duration, u64)>>,
+}
+
+impl AdjustableClock {
+    fn new(monotonic: Duration, unix_ms: u64) -> Self {
+        Self {
+            state: Arc::new(Mutex::new((monotonic, unix_ms))),
+        }
+    }
+
+    fn advance(&self, duration: Duration) {
+        let mut state = self.state.lock().expect("clock state should be available");
+        state.0 = state.0.saturating_add(duration);
+        state.1 = state
+            .1
+            .saturating_add(duration.as_millis().try_into().unwrap_or(u64::MAX));
+    }
+}
+
+impl RuntimeClock for AdjustableClock {
+    fn now(&self) -> Duration {
+        self.state
+            .lock()
+            .expect("clock state should be available")
+            .0
+    }
+
+    fn now_unix_ms(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("clock state should be available")
+            .1
+    }
+}
+
+struct AdvancingWaiter {
+    clock: AdjustableClock,
+    waits: Mutex<Vec<Option<Duration>>>,
+}
+
+impl AdvancingWaiter {
+    fn new(clock: AdjustableClock) -> Self {
+        Self {
+            clock,
+            waits: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn waits(&self) -> Vec<Option<Duration>> {
+        self.waits
+            .lock()
+            .expect("wait recording should be available")
+            .clone()
+    }
+}
+
+impl RuntimeWaiter for AdvancingWaiter {
+    fn checkpoint(&self) -> u64 {
+        0
+    }
+
+    fn wait(&self, _checkpoint: u64, timeout: Option<Duration>) {
+        self.waits
+            .lock()
+            .expect("wait recording should be available")
+            .push(timeout);
+        if let Some(timeout) = timeout {
+            self.clock.advance(timeout);
+        }
+    }
+}
+
+#[derive(Default)]
+struct RecordingWaiter {
+    waits: Mutex<Vec<Option<Duration>>>,
+}
+
+impl RecordingWaiter {
+    fn waits(&self) -> Vec<Option<Duration>> {
+        self.waits
+            .lock()
+            .expect("wait recording should be available")
+            .clone()
+    }
+}
+
+impl RuntimeWaiter for RecordingWaiter {
+    fn checkpoint(&self) -> u64 {
+        0
+    }
+
+    fn wait(&self, _checkpoint: u64, timeout: Option<Duration>) {
+        self.waits
+            .lock()
+            .expect("wait recording should be available")
+            .push(timeout);
+    }
 }
 
 struct ImmediateShutdown;
@@ -816,7 +1242,7 @@ impl ScriptedInput {
 }
 
 impl TerminalEventSource for ScriptedInput {
-    fn poll_event(&mut self, _timeout: Duration) -> Result<Option<UiEvent>, StatusInterfaceError> {
+    fn try_event(&mut self) -> Result<Option<UiEvent>, StatusInterfaceError> {
         self.polls += 1;
         Ok(
             (self.quit_on == Some(self.polls)).then_some(UiEvent::Terminal(TerminalInput::Key(

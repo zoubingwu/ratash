@@ -1,14 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::panic::{self, AssertUnwindSafe, PanicHookInfo};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event as CrosstermEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 
@@ -25,12 +26,15 @@ use crate::tui::{
     TerminalSession, UiEvent, ViewLogRecord, from_crossterm_event, render, update,
 };
 
-const LOOP_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const COMMAND_QUEUE_CAPACITY: usize = 32;
 const COMMAND_WORKER_COUNT: usize = 2;
 const COMMAND_RESULTS_PER_ROUND: usize = 8;
 const STREAM_EVENTS_PER_ROUND: usize = 64;
+const TERMINAL_EVENTS_PER_ROUND: usize = 8;
 const TOAST_MAX_CHARACTERS: usize = 256;
+const SNAPSHOT_REFRESH_COALESCE: Duration = Duration::from_millis(100);
+const SNAPSHOT_REFRESH_MIN_INTERVAL: Duration = Duration::from_millis(500);
+const PROFILE_REFRESH_SETTLE_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatusInterfaceErrorKind {
@@ -83,6 +87,71 @@ impl std::error::Error for StatusInterfaceError {}
 // -----------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Default)]
+pub struct RuntimeWaker {
+    inner: Arc<RuntimeWakeState>,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeWakeState {
+    revision: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl RuntimeWaker {
+    pub fn wake(&self) {
+        let mut revision = self
+            .inner
+            .revision
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *revision = revision.wrapping_add(1);
+        self.inner.changed.notify_one();
+    }
+}
+
+pub trait RuntimeWaiter {
+    fn checkpoint(&self) -> u64;
+    fn wait(&self, checkpoint: u64, timeout: Option<Duration>);
+}
+
+impl RuntimeWaiter for RuntimeWaker {
+    fn checkpoint(&self) -> u64 {
+        *self
+            .inner
+            .revision
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn wait(&self, checkpoint: u64, timeout: Option<Duration>) {
+        let revision = self
+            .inner
+            .revision
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *revision != checkpoint {
+            return;
+        }
+        match timeout {
+            Some(timeout) => {
+                let _ = self
+                    .inner
+                    .changed
+                    .wait_timeout_while(revision, timeout, |revision| *revision == checkpoint)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            None => {
+                let _guard = self
+                    .inner
+                    .changed
+                    .wait_while(revision, |revision| *revision == checkpoint)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
 }
@@ -104,6 +173,14 @@ pub trait FullSnapshotSource: Send + Sync {
         connection_generation: u64,
         cancellation: &CancellationToken,
     ) -> Result<FullViewSnapshot, StatusInterfaceError>;
+
+    fn refresh_view_snapshot(
+        &self,
+        connection_generation: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<FullViewSnapshot, StatusInterfaceError> {
+        self.fetch_full_snapshot(connection_generation, cancellation)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -161,6 +238,8 @@ impl StatusLogEvent {
 }
 
 pub trait StatusLogEventSource: Send + Sync {
+    fn install_waker(&self, _waker: RuntimeWaker) {}
+
     fn connect(
         &self,
         connection_generation: u64,
@@ -258,15 +337,16 @@ impl<C: ?Sized, E: ?Sized> ApplicationSnapshotSource<C, E> {
     }
 }
 
-impl<C, E> FullSnapshotSource for ApplicationSnapshotSource<C, E>
+impl<C, E> ApplicationSnapshotSource<C, E>
 where
     C: ApplicationClient + Send + Sync + ?Sized,
     E: StatusLogEventSource + ?Sized,
 {
-    fn fetch_full_snapshot(
+    fn fetch_snapshot(
         &self,
         connection_generation: u64,
         cancellation: &CancellationToken,
+        include_logs: bool,
     ) -> Result<FullViewSnapshot, StatusInterfaceError> {
         check_snapshot_cancellation(cancellation)?;
         let status = match self
@@ -331,10 +411,17 @@ where
             Vec::new()
         };
 
-        check_snapshot_cancellation(cancellation)?;
-        let tail = self
-            .events
-            .fetch_log_tail(connection_generation, None, cancellation)?;
+        let tail = if include_logs {
+            check_snapshot_cancellation(cancellation)?;
+            self.events
+                .fetch_log_tail(connection_generation, None, cancellation)?
+        } else {
+            LogTail {
+                records: Vec::new(),
+                gap: false,
+                dropped_total: 0,
+            }
+        };
         Ok(FullViewSnapshot {
             status,
             proxies,
@@ -342,6 +429,28 @@ where
             logs: bounded_log_records(tail.records),
             dropped_logs: tail.dropped_total,
         })
+    }
+}
+
+impl<C, E> FullSnapshotSource for ApplicationSnapshotSource<C, E>
+where
+    C: ApplicationClient + Send + Sync + ?Sized,
+    E: StatusLogEventSource + ?Sized,
+{
+    fn fetch_full_snapshot(
+        &self,
+        connection_generation: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<FullViewSnapshot, StatusInterfaceError> {
+        self.fetch_snapshot(connection_generation, cancellation, true)
+    }
+
+    fn refresh_view_snapshot(
+        &self,
+        connection_generation: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<FullViewSnapshot, StatusInterfaceError> {
+        self.fetch_snapshot(connection_generation, cancellation, false)
     }
 }
 
@@ -426,6 +535,8 @@ impl fmt::Display for CommandDispatchError {
 impl std::error::Error for CommandDispatchError {}
 
 pub trait CommandDispatcher {
+    fn install_waker(&mut self, _waker: RuntimeWaker) {}
+
     fn submit(&mut self, command: Command) -> Result<(), CommandDispatchError>;
     fn cancel(&mut self, request_id: RequestId);
     fn cancel_all(&mut self);
@@ -450,6 +561,7 @@ pub struct BackgroundCommandDispatcher {
     receiver: Receiver<DispatchedEvent>,
     cancellations: Arc<Mutex<CancellationRegistry>>,
     stopping: Arc<AtomicBool>,
+    wake: Arc<Mutex<Option<RuntimeWaker>>>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -525,15 +637,15 @@ impl BackgroundCommandDispatcher {
         let (result_sender, receiver) = mpsc::sync_channel(crate::tui::EVENT_SOURCE_CAPACITY);
         let cancellations = Arc::new(Mutex::new(CancellationRegistry::new()));
         let stopping = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(Mutex::new(None));
         let mut workers: Vec<JoinHandle<()>> = Vec::with_capacity(worker_count);
         for index in 0..worker_count {
             let receiver = Arc::clone(&work_receiver);
             let result_sender = result_sender.clone();
             let cancellations = Arc::clone(&cancellations);
             let worker_stopping = Arc::clone(&stopping);
-            let snapshots = Arc::clone(&sources.snapshots);
-            let events = Arc::clone(&sources.events);
-            let commands = Arc::clone(&sources.commands);
+            let worker_wake = Arc::clone(&wake);
+            let worker_sources = sources.clone();
             let worker = thread::Builder::new()
                 .name(format!("hopash-tui-command-{index}"))
                 .spawn(move || {
@@ -542,9 +654,8 @@ impl BackgroundCommandDispatcher {
                         &result_sender,
                         &cancellations,
                         &worker_stopping,
-                        &snapshots,
-                        &events,
-                        &commands,
+                        &worker_wake,
+                        &worker_sources,
                     );
                 })
                 .map_err(|_| {
@@ -564,12 +675,20 @@ impl BackgroundCommandDispatcher {
             receiver,
             cancellations,
             stopping,
+            wake,
             workers,
         })
     }
 }
 
 impl CommandDispatcher for BackgroundCommandDispatcher {
+    fn install_waker(&mut self, waker: RuntimeWaker) {
+        *self
+            .wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(waker);
+    }
+
     fn submit(&mut self, command: Command) -> Result<(), CommandDispatchError> {
         if self.stopping.load(Ordering::Acquire) {
             return Err(CommandDispatchError);
@@ -649,9 +768,8 @@ fn command_worker(
     result_sender: &SyncSender<DispatchedEvent>,
     cancellations: &Arc<Mutex<CancellationRegistry>>,
     stopping: &AtomicBool,
-    snapshots: &Arc<dyn FullSnapshotSource>,
-    events: &Arc<dyn StatusLogEventSource>,
-    commands: &Arc<dyn UiCommandExecutor>,
+    wake: &Arc<Mutex<Option<RuntimeWaker>>>,
+    sources: &StatusInterfaceSources,
 ) {
     while !stopping.load(Ordering::Acquire) {
         let message = match receiver.lock() {
@@ -667,10 +785,15 @@ fn command_worker(
             remove_cancellation(cancellations, work.task_id, work.request_id);
             continue;
         }
-        let result = execute_work(&work, snapshots, events, commands);
+        let result = execute_work(
+            &work,
+            &sources.snapshots,
+            &sources.events,
+            &sources.commands,
+        );
         remove_cancellation(cancellations, work.task_id, work.request_id);
-        if !work.cancellation.is_cancelled() {
-            let _ = result_sender.try_send(result);
+        if !work.cancellation.is_cancelled() && result_sender.try_send(result).is_ok() {
+            wake_runtime(wake);
         }
     }
 }
@@ -762,6 +885,23 @@ fn execute_work(
                 },
             }
         }
+        Command::RefreshSnapshot {
+            connection_generation,
+        } => match snapshots.refresh_view_snapshot(*connection_generation, &work.cancellation) {
+            Ok(snapshot) => DispatchedEvent {
+                source: EventSource::CommandResult,
+                event: UiEvent::SnapshotRefreshed {
+                    connection_generation: *connection_generation,
+                    snapshot,
+                },
+            },
+            Err(_) => DispatchedEvent {
+                source: EventSource::CommandResult,
+                event: UiEvent::Disconnected {
+                    connection_generation: *connection_generation,
+                },
+            },
+        },
         Command::ScheduleReconnect {
             connection_generation,
         } => DispatchedEvent {
@@ -824,7 +964,8 @@ fn command_request_id(command: &Command) -> Option<RequestId> {
         | Command::Cancel { request_id } => Some(*request_id),
         Command::Connect { .. }
         | Command::ScheduleReconnect { .. }
-        | Command::FetchLogTail { .. } => None,
+        | Command::FetchLogTail { .. }
+        | Command::RefreshSnapshot { .. } => None,
     }
 }
 
@@ -863,17 +1004,25 @@ fn short_terminal_text(value: &str) -> String {
 
 pub trait RuntimeClock {
     fn now(&self) -> Duration;
+    fn now_unix_ms(&self) -> u64;
 }
 
 #[derive(Debug)]
 pub struct MonotonicClock {
     started_at: Instant,
+    started_at_unix_ms: u64,
 }
 
 impl Default for MonotonicClock {
     fn default() -> Self {
         Self {
             started_at: Instant::now(),
+            started_at_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
         }
     }
 }
@@ -882,10 +1031,22 @@ impl RuntimeClock for MonotonicClock {
     fn now(&self) -> Duration {
         self.started_at.elapsed()
     }
+
+    fn now_unix_ms(&self) -> u64 {
+        self.started_at_unix_ms.saturating_add(
+            self.started_at
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        )
+    }
 }
 
 pub trait ShutdownSignal {
     fn shutdown_requested(&self) -> bool;
+
+    fn install_waker(&self, _waker: RuntimeWaker) {}
 }
 
 #[derive(Debug, Default)]
@@ -899,6 +1060,7 @@ impl ShutdownSignal for NoShutdownSignal {
 
 pub struct ProcessSignalSource {
     requested: Arc<AtomicBool>,
+    wake: Arc<Mutex<Option<RuntimeWaker>>>,
     stop_sender: Option<tokio::sync::oneshot::Sender<()>>,
     worker: Option<JoinHandle<()>>,
 }
@@ -909,10 +1071,12 @@ impl ProcessSignalSource {
         let (stop_sender, stop_receiver) = tokio::sync::oneshot::channel();
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let worker_requested = Arc::clone(&requested);
+        let wake = Arc::new(Mutex::new(None));
+        let worker_wake = Arc::clone(&wake);
         let worker = thread::Builder::new()
             .name("hopash-tui-signals".to_owned())
             .spawn(move || {
-                run_signal_worker(worker_requested, stop_receiver, ready_sender);
+                run_signal_worker(worker_requested, worker_wake, stop_receiver, ready_sender);
             })
             .map_err(|_| {
                 StatusInterfaceError::new(
@@ -923,6 +1087,7 @@ impl ProcessSignalSource {
         match ready_receiver.recv() {
             Ok(Ok(())) => Ok(Self {
                 requested,
+                wake,
                 stop_sender: Some(stop_sender),
                 worker: Some(worker),
             }),
@@ -945,6 +1110,13 @@ impl ShutdownSignal for ProcessSignalSource {
     fn shutdown_requested(&self) -> bool {
         self.requested.load(Ordering::Acquire)
     }
+
+    fn install_waker(&self, waker: RuntimeWaker) {
+        *self
+            .wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(waker);
+    }
 }
 
 impl Drop for ProcessSignalSource {
@@ -961,6 +1133,7 @@ impl Drop for ProcessSignalSource {
 #[cfg(unix)]
 fn run_signal_worker(
     requested: Arc<AtomicBool>,
+    wake: Arc<Mutex<Option<RuntimeWaker>>>,
     mut stop_receiver: tokio::sync::oneshot::Receiver<()>,
     ready_sender: SyncSender<Result<(), StatusInterfaceError>>,
 ) {
@@ -1007,9 +1180,11 @@ fn run_signal_worker(
         tokio::select! {
             _ = interrupt.recv() => {
                 requested.store(true, Ordering::Release);
+                wake_runtime(&wake);
             }
             _ = terminate.recv() => {
                 requested.store(true, Ordering::Release);
+                wake_runtime(&wake);
             }
             _ = &mut stop_receiver => {}
         }
@@ -1019,6 +1194,7 @@ fn run_signal_worker(
 #[cfg(not(unix))]
 fn run_signal_worker(
     requested: Arc<AtomicBool>,
+    wake: Arc<Mutex<Option<RuntimeWaker>>>,
     mut stop_receiver: tokio::sync::oneshot::Receiver<()>,
     ready_sender: SyncSender<Result<(), StatusInterfaceError>>,
 ) {
@@ -1042,6 +1218,7 @@ fn run_signal_worker(
             result = tokio::signal::ctrl_c() => {
                 if result.is_ok() {
                     requested.store(true, Ordering::Release);
+                    wake_runtime(&wake);
                 }
             }
             _ = &mut stop_receiver => {}
@@ -1049,30 +1226,179 @@ fn run_signal_worker(
     });
 }
 
-pub trait TerminalEventSource {
-    fn poll_event(&mut self, timeout: Duration) -> Result<Option<UiEvent>, StatusInterfaceError>;
+fn wake_runtime(wake: &Mutex<Option<RuntimeWaker>>) {
+    if let Some(waker) = wake
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+    {
+        waker.wake();
+    }
 }
 
-#[derive(Debug, Default)]
-pub struct CrosstermEventSource;
+pub trait TerminalEventSource {
+    fn install_waker(&mut self, _waker: RuntimeWaker) {}
+
+    fn try_event(&mut self) -> Result<Option<UiEvent>, StatusInterfaceError>;
+
+    fn shutdown(&mut self) {}
+}
+
+pub struct CrosstermEventSource {
+    buffer: Arc<TerminalEventBuffer>,
+    wake: Arc<Mutex<Option<RuntimeWaker>>>,
+    stop_sender: Option<tokio::sync::oneshot::Sender<()>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct TerminalEventBuffer {
+    events: Mutex<VecDeque<Result<UiEvent, StatusInterfaceError>>>,
+}
+
+impl CrosstermEventSource {
+    pub fn new() -> Result<Self, StatusInterfaceError> {
+        let buffer = Arc::new(TerminalEventBuffer::default());
+        let wake = Arc::new(Mutex::new(None));
+        let (stop_sender, stop_receiver) = tokio::sync::oneshot::channel();
+        let worker_buffer = Arc::clone(&buffer);
+        let worker_wake = Arc::clone(&wake);
+        let worker = thread::Builder::new()
+            .name("hopash-tui-terminal-events".to_owned())
+            .spawn(move || run_terminal_event_worker(worker_buffer, worker_wake, stop_receiver))
+            .map_err(|_| {
+                StatusInterfaceError::new(
+                    StatusInterfaceErrorKind::TerminalInput,
+                    "The Status Interface terminal listener could not start",
+                )
+            })?;
+        Ok(Self {
+            buffer,
+            wake,
+            stop_sender: Some(stop_sender),
+            worker: Some(worker),
+        })
+    }
+}
 
 impl TerminalEventSource for CrosstermEventSource {
-    fn poll_event(&mut self, timeout: Duration) -> Result<Option<UiEvent>, StatusInterfaceError> {
-        if !event::poll(timeout).map_err(terminal_input_error)? {
-            return Ok(None);
-        }
-        let event = event::read().map_err(terminal_input_error)?;
-        if matches!(
-            event,
-            CrosstermEvent::Key(key)
-                if key.kind == KeyEventKind::Press
-                    && key.code == KeyCode::Char('c')
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-        ) {
-            return Ok(Some(UiEvent::Shutdown));
-        }
-        Ok(from_crossterm_event(event))
+    fn install_waker(&mut self, waker: RuntimeWaker) {
+        *self
+            .wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(waker);
     }
+
+    fn try_event(&mut self) -> Result<Option<UiEvent>, StatusInterfaceError> {
+        self.buffer
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+            .transpose()
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(stop_sender) = self.stop_sender.take() {
+            let _ = stop_sender.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for CrosstermEventSource {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn run_terminal_event_worker(
+    buffer: Arc<TerminalEventBuffer>,
+    wake: Arc<Mutex<Option<RuntimeWaker>>>,
+    mut stop_receiver: tokio::sync::oneshot::Receiver<()>,
+) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            publish_terminal_event(
+                &buffer,
+                &wake,
+                Err(StatusInterfaceError::new(
+                    StatusInterfaceErrorKind::TerminalInput,
+                    "The Status Interface terminal listener could not initialize",
+                )),
+            );
+            return;
+        }
+    };
+    runtime.block_on(async move {
+        let mut stream = EventStream::new();
+        loop {
+            tokio::select! {
+                _ = &mut stop_receiver => return,
+                event = stream.next() => {
+                    let Some(event) = event else {
+                        publish_terminal_event(
+                            &buffer,
+                            &wake,
+                            Err(StatusInterfaceError::new(
+                                StatusInterfaceErrorKind::TerminalInput,
+                                "The Status Interface terminal listener stopped",
+                            )),
+                        );
+                        return;
+                    };
+                    match event {
+                        Ok(event) => {
+                            if let Some(event) = terminal_ui_event(event) {
+                                publish_terminal_event(&buffer, &wake, Ok(event));
+                            }
+                        }
+                        Err(error) => {
+                            publish_terminal_event(&buffer, &wake, Err(terminal_input_error(error)));
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn terminal_ui_event(event: CrosstermEvent) -> Option<UiEvent> {
+    if matches!(
+        event,
+        CrosstermEvent::Key(key)
+            if key.kind == KeyEventKind::Press
+                && key.code == KeyCode::Char('c')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+    ) {
+        Some(UiEvent::Shutdown)
+    } else {
+        from_crossterm_event(event)
+    }
+}
+
+fn publish_terminal_event(
+    buffer: &TerminalEventBuffer,
+    wake: &Mutex<Option<RuntimeWaker>>,
+    event: Result<UiEvent, StatusInterfaceError>,
+) {
+    let mut events = buffer
+        .events
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if events.len() == crate::tui::EVENT_SOURCE_CAPACITY {
+        events.pop_front();
+    }
+    events.push_back(event);
+    drop(events);
+    wake_runtime(wake);
 }
 
 fn terminal_input_error(_error: io::Error) -> StatusInterfaceError {
@@ -1137,6 +1463,10 @@ pub trait ReconnectTiming {
     fn schedule(&mut self, connection_generation: u64, now: Duration);
     fn take_due(&mut self, now: Duration) -> Option<u64>;
     fn reset(&mut self);
+
+    fn deadline(&self) -> Option<Duration> {
+        None
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1197,11 +1527,170 @@ impl ReconnectTiming for BoundedReconnectTimer {
         self.attempts = 0;
         self.scheduled = None;
     }
+
+    fn deadline(&self) -> Option<Duration> {
+        self.deadline()
+    }
 }
 
 // -----------------------------------------------------------------------------
 // Status Interface event loop
 // -----------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+struct SnapshotFreshness {
+    generation: u64,
+    request_in_flight: bool,
+    refresh_pending: bool,
+    refresh_deadline: Option<Duration>,
+    profile_deadline: Option<Duration>,
+    next_allowed_at: Duration,
+}
+
+impl SnapshotFreshness {
+    fn connected(
+        generation: u64,
+        next_profile_refresh_at_unix_ms: Option<u64>,
+        now: Duration,
+        now_unix_ms: u64,
+    ) -> Self {
+        let mut freshness = Self {
+            generation,
+            ..Self::default()
+        };
+        freshness.schedule_profile_deadline(next_profile_refresh_at_unix_ms, now, now_unix_ms);
+        freshness
+    }
+
+    fn reset_connected(
+        &mut self,
+        generation: u64,
+        next_profile_refresh_at_unix_ms: Option<u64>,
+        now: Duration,
+        now_unix_ms: u64,
+    ) {
+        *self = Self::connected(
+            generation,
+            next_profile_refresh_at_unix_ms,
+            now,
+            now_unix_ms,
+        );
+    }
+
+    fn disconnect(&mut self) {
+        self.request_in_flight = false;
+        self.refresh_pending = false;
+        self.refresh_deadline = None;
+        self.profile_deadline = None;
+    }
+
+    fn request_refresh(&mut self, generation: u64, now: Duration) {
+        if generation != self.generation {
+            return;
+        }
+        self.refresh_pending = true;
+        if !self.request_in_flight && self.refresh_deadline.is_none() {
+            self.refresh_deadline = Some(
+                now.saturating_add(SNAPSHOT_REFRESH_COALESCE)
+                    .max(self.next_allowed_at),
+            );
+        }
+    }
+
+    fn take_due(&mut self, now: Duration) -> Option<u64> {
+        if self
+            .profile_deadline
+            .is_some_and(|deadline| deadline <= now)
+        {
+            self.profile_deadline = None;
+            self.refresh_pending = true;
+            if !self.request_in_flight && self.refresh_deadline.is_none() {
+                self.refresh_deadline = Some(now.max(self.next_allowed_at));
+            }
+        }
+        if self.request_in_flight
+            || !self.refresh_pending
+            || self.refresh_deadline.is_none_or(|deadline| deadline > now)
+        {
+            return None;
+        }
+        self.request_in_flight = true;
+        self.refresh_pending = false;
+        self.refresh_deadline = None;
+        self.next_allowed_at = now.saturating_add(SNAPSHOT_REFRESH_MIN_INTERVAL);
+        Some(self.generation)
+    }
+
+    fn submit_failed(&mut self, generation: u64, now: Duration) {
+        if generation != self.generation {
+            return;
+        }
+        self.request_in_flight = false;
+        self.request_refresh(generation, now);
+    }
+
+    fn complete(
+        &mut self,
+        generation: u64,
+        accepted: bool,
+        next_profile_refresh_at_unix_ms: Option<u64>,
+        now: Duration,
+        now_unix_ms: u64,
+    ) {
+        if generation != self.generation {
+            return;
+        }
+        self.request_in_flight = false;
+        self.schedule_profile_deadline(next_profile_refresh_at_unix_ms, now, now_unix_ms);
+        if !accepted {
+            self.refresh_pending = true;
+        }
+        if self.refresh_pending {
+            self.refresh_deadline = Some(
+                now.saturating_add(SNAPSHOT_REFRESH_COALESCE)
+                    .max(self.next_allowed_at),
+            );
+        }
+    }
+
+    fn schedule_profile_deadline(
+        &mut self,
+        next_refresh_at_unix_ms: Option<u64>,
+        now: Duration,
+        now_unix_ms: u64,
+    ) {
+        self.profile_deadline = next_refresh_at_unix_ms.map(|deadline| {
+            let delay_ms = deadline.saturating_sub(now_unix_ms);
+            let delay =
+                Duration::from_millis(delay_ms).saturating_add(PROFILE_REFRESH_SETTLE_DELAY);
+            now.saturating_add(delay)
+        });
+    }
+
+    fn deadline(&self) -> Option<Duration> {
+        [self.refresh_deadline, self.profile_deadline]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+}
+
+fn next_profile_refresh_at(snapshot: &FullViewSnapshot) -> Option<u64> {
+    snapshot
+        .profiles
+        .iter()
+        .map(|profile| profile.next_refresh_at_unix_ms)
+        .min()
+}
+
+fn status_requires_snapshot_refresh(previous: &StatusSnapshot, next: &StatusSnapshot) -> bool {
+    previous.active_profile != next.active_profile
+        || previous.runtime_generation != next.runtime_generation
+        || previous.core.instance_generation != next.core.instance_generation
+        || previous.primary_proxy_group != next.primary_proxy_group
+        || previous.selected_node != next.selected_node
+        || previous.latency != next.latency
+}
 
 pub struct StatusInterfaceRuntime<'a> {
     state: AppState,
@@ -1210,9 +1699,11 @@ pub struct StatusInterfaceRuntime<'a> {
     dispatcher: &'a mut dyn CommandDispatcher,
     reconnect: &'a mut dyn ReconnectTiming,
     input: &'a mut dyn TerminalEventSource,
+    waiter: &'a dyn RuntimeWaiter,
     clock: &'a dyn RuntimeClock,
     signal: &'a dyn ShutdownSignal,
     renderer: &'a mut dyn StatusRenderer,
+    freshness: SnapshotFreshness,
     stopped: bool,
 }
 
@@ -1221,6 +1712,8 @@ pub struct StatusInterfacePorts<'a> {
     pub dispatcher: &'a mut dyn CommandDispatcher,
     pub reconnect: &'a mut dyn ReconnectTiming,
     pub input: &'a mut dyn TerminalEventSource,
+    pub waiter: &'a dyn RuntimeWaiter,
+    pub waker: RuntimeWaker,
     pub clock: &'a dyn RuntimeClock,
     pub signal: &'a dyn ShutdownSignal,
     pub renderer: &'a mut dyn StatusRenderer,
@@ -1237,10 +1730,18 @@ impl<'a> StatusInterfaceRuntime<'a> {
             dispatcher,
             reconnect,
             input,
+            waiter,
+            waker,
             clock,
             signal,
             renderer,
         } = ports;
+        let freshness = SnapshotFreshness::connected(
+            connection_generation,
+            next_profile_refresh_at(&snapshot),
+            clock.now(),
+            clock.now_unix_ms(),
+        );
         let mut state = AppState::new();
         let _ = update(
             &mut state,
@@ -1249,6 +1750,10 @@ impl<'a> StatusInterfaceRuntime<'a> {
                 snapshot,
             },
         );
+        events.install_waker(waker.clone());
+        dispatcher.install_waker(waker.clone());
+        input.install_waker(waker.clone());
+        signal.install_waker(waker);
         Self {
             state,
             inbox: FairEventInbox::product(),
@@ -1256,9 +1761,11 @@ impl<'a> StatusInterfaceRuntime<'a> {
             dispatcher,
             reconnect,
             input,
+            waiter,
             clock,
             signal,
             renderer,
+            freshness,
             stopped: false,
         }
     }
@@ -1271,18 +1778,20 @@ impl<'a> StatusInterfaceRuntime<'a> {
     pub fn run(&mut self) -> Result<(), StatusInterfaceError> {
         self.draw_if_dirty()?;
         while !self.state.should_quit {
+            let checkpoint = self.waiter.checkpoint();
             let already_ready = self.collect_events()?;
-            let timeout = if already_ready {
-                Duration::ZERO
-            } else {
-                LOOP_POLL_INTERVAL
-            };
-            if let Some(event) = self.input.poll_event(timeout)? {
-                self.inbox.push(EventSource::Terminal, event);
-            }
             self.process_round();
             if !self.state.should_quit {
                 self.draw_if_dirty()?;
+            }
+            if !already_ready && !self.state.should_quit {
+                let now = self.clock.now();
+                let timeout = [self.reconnect.deadline(), self.freshness.deadline()]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                    .map(|deadline| deadline.saturating_sub(now));
+                self.waiter.wait(checkpoint, timeout);
             }
         }
         self.stop();
@@ -1291,6 +1800,13 @@ impl<'a> StatusInterfaceRuntime<'a> {
 
     fn collect_events(&mut self) -> Result<bool, StatusInterfaceError> {
         let mut ready = false;
+        for _ in 0..TERMINAL_EVENTS_PER_ROUND {
+            let Some(event) = self.input.try_event()? else {
+                break;
+            };
+            self.inbox.push(EventSource::Terminal, event);
+            ready = true;
+        }
         if self.signal.shutdown_requested() {
             self.inbox.push(EventSource::Deadline, UiEvent::Shutdown);
             ready = true;
@@ -1339,11 +1855,49 @@ impl<'a> StatusInterfaceRuntime<'a> {
             );
             ready = true;
         }
+        if let Some(connection_generation) = self.freshness.take_due(self.clock.now()) {
+            self.dispatch(Command::RefreshSnapshot {
+                connection_generation,
+            });
+            ready = true;
+        }
         Ok(ready)
     }
 
     fn process_round(&mut self) {
         for event in self.inbox.drain_round() {
+            let refresh_from_status = match &event {
+                UiEvent::StatusSnapshot {
+                    connection_generation,
+                    status,
+                } if *connection_generation == self.state.connection.generation
+                    && self.state.connection.status == ConnectionStatus::Connected =>
+                {
+                    self.state
+                        .status
+                        .as_ref()
+                        .is_some_and(|previous| status_requires_snapshot_refresh(previous, status))
+                }
+                _ => false,
+            };
+            let completed_snapshot = match &event {
+                UiEvent::SnapshotRefreshed {
+                    connection_generation,
+                    snapshot,
+                } => Some((
+                    *connection_generation,
+                    next_profile_refresh_at(snapshot),
+                    self.state.pending.is_none(),
+                )),
+                _ => None,
+            };
+            let connected_snapshot = match &event {
+                UiEvent::Connected {
+                    connection_generation,
+                    snapshot,
+                } => Some((*connection_generation, next_profile_refresh_at(snapshot))),
+                _ => None,
+            };
             let connected_generation = match &event {
                 UiEvent::Connected {
                     connection_generation,
@@ -1358,6 +1912,30 @@ impl<'a> StatusInterfaceRuntime<'a> {
                 _ => None,
             };
             let commands = update(&mut self.state, event);
+            if refresh_from_status {
+                self.freshness
+                    .request_refresh(self.state.connection.generation, self.clock.now());
+            }
+            if let Some((generation, next_profile_refresh, accepted)) = completed_snapshot {
+                self.freshness.complete(
+                    generation,
+                    accepted,
+                    next_profile_refresh,
+                    self.clock.now(),
+                    self.clock.now_unix_ms(),
+                );
+            }
+            if let Some((generation, next_profile_refresh)) = connected_snapshot
+                && generation == self.state.connection.generation
+                && self.state.connection.status == ConnectionStatus::Connected
+            {
+                self.freshness.reset_connected(
+                    generation,
+                    next_profile_refresh,
+                    self.clock.now(),
+                    self.clock.now_unix_ms(),
+                );
+            }
             if connected_generation == Some(self.state.connection.generation)
                 && self.state.connection.status == ConnectionStatus::Connected
             {
@@ -1367,6 +1945,7 @@ impl<'a> StatusInterfaceRuntime<'a> {
                 && self.state.connection.status == ConnectionStatus::Disconnected
             {
                 self.events.disconnect(self.state.connection.generation);
+                self.freshness.disconnect();
             }
             for command in commands {
                 self.dispatch(command);
@@ -1453,6 +2032,18 @@ impl<'a> StatusInterfaceRuntime<'a> {
                     );
                 }
             }
+            command @ Command::RefreshSnapshot {
+                connection_generation,
+            } => {
+                if connection_generation != self.state.connection.generation
+                    || self.state.connection.status != ConnectionStatus::Connected
+                {
+                    self.freshness.disconnect();
+                } else if self.dispatcher.submit(command).is_err() {
+                    self.freshness
+                        .submit_failed(connection_generation, self.clock.now());
+                }
+            }
         }
     }
 
@@ -1474,6 +2065,7 @@ impl<'a> StatusInterfaceRuntime<'a> {
         self.stopped = true;
         self.dispatcher.cancel_all();
         self.events.disconnect(self.state.connection.generation);
+        self.input.shutdown();
     }
 }
 
@@ -1551,7 +2143,8 @@ fn run_crossterm_after_bootstrap(
     let clock = MonotonicClock::default();
     let mut reconnect =
         BoundedReconnectTimer::new(RECONNECT_INITIAL_BACKOFF, RECONNECT_MAX_BACKOFF)?;
-    let mut input = CrosstermEventSource;
+    let mut input = CrosstermEventSource::new()?;
+    let waker = RuntimeWaker::default();
     let backend = CrosstermBackend::new(io::stdout());
     let mut renderer = RatatuiStatusRenderer::new(backend)?;
     let mut control = CrosstermControl::new(io::stdout());
@@ -1566,6 +2159,8 @@ fn run_crossterm_after_bootstrap(
                     dispatcher: &mut dispatcher,
                     reconnect: &mut reconnect,
                     input: &mut input,
+                    waiter: &waker,
+                    waker: waker.clone(),
                     clock: &clock,
                     signal: &signal,
                     renderer: &mut renderer,

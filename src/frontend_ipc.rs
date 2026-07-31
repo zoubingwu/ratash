@@ -23,8 +23,8 @@ use crate::ipc_runtime::{
 use crate::telemetry::{LogLevel, LogSource};
 use crate::tui::ViewLogRecord;
 use crate::tui_runtime::{
-    CancellationToken, LogTail, StatusInterfaceError, StatusInterfaceErrorKind, StatusLogEvent,
-    StatusLogEventSource,
+    CancellationToken, LogTail, RuntimeWaker, StatusInterfaceError, StatusInterfaceErrorKind,
+    StatusLogEvent, StatusLogEventSource,
 };
 
 const SAFE_ERROR_MAX_CHARACTERS: usize = 512;
@@ -37,6 +37,7 @@ pub struct IpcStatusLogEventSource {
     client: Arc<IpcClient>,
     state: Mutex<EventSourceState>,
     resume: Arc<Mutex<ResumeState>>,
+    wake: Arc<Mutex<Option<RuntimeWaker>>>,
 }
 
 #[derive(Default)]
@@ -64,9 +65,9 @@ struct ConnectionControl {
     logs: Mutex<Option<IpcStreamCancellation>>,
 }
 
-#[derive(Default)]
 struct ConnectionBuffer {
     state: Mutex<ConnectionBufferState>,
+    wake: Arc<Mutex<Option<RuntimeWaker>>>,
 }
 
 #[derive(Default)]
@@ -87,6 +88,7 @@ impl IpcStatusLogEventSource {
             client,
             state: Mutex::new(EventSourceState::default()),
             resume: Arc::new(Mutex::new(ResumeState::default())),
+            wake: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -104,7 +106,7 @@ impl IpcStatusLogEventSource {
             status: status_cancellation,
             logs: Mutex::new(Some(log_cancellation)),
         });
-        let buffer = Arc::new(ConnectionBuffer::default());
+        let buffer = Arc::new(ConnectionBuffer::new(Arc::clone(&self.wake)));
 
         let status_reader = spawn_status_reader(
             generation,
@@ -170,6 +172,13 @@ impl IpcStatusLogEventSource {
 }
 
 impl StatusLogEventSource for IpcStatusLogEventSource {
+    fn install_waker(&self, waker: RuntimeWaker) {
+        *self
+            .wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(waker);
+    }
+
     fn connect(
         &self,
         connection_generation: u64,
@@ -367,13 +376,25 @@ impl ConnectionControl {
 }
 
 impl ConnectionBuffer {
+    fn new(wake: Arc<Mutex<Option<RuntimeWaker>>>) -> Self {
+        Self {
+            state: Mutex::new(ConnectionBufferState::default()),
+            wake,
+        }
+    }
+
     fn publish_status(&self, status: StatusSnapshot) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let should_wake = !state.disconnected && state.status.is_none();
         if !state.disconnected {
             state.status = Some(status);
+        }
+        drop(state);
+        if should_wake {
+            wake_runtime(&self.wake);
         }
     }
 
@@ -389,12 +410,17 @@ impl ConnectionBuffer {
         {
             return;
         }
+        let should_wake = state.logs.is_empty() && !state.gap;
         if state.logs.len() == LOG_CAPACITY {
             state.logs.pop_front();
             state.local_dropped_total = state.local_dropped_total.saturating_add(1);
             state.gap = true;
         }
         state.logs.push_back(record);
+        drop(state);
+        if should_wake {
+            wake_runtime(&self.wake);
+        }
     }
 
     fn publish_tail(&self, tail: &LogTailV1) -> Result<(), StatusInterfaceError> {
@@ -406,6 +432,7 @@ impl ConnectionBuffer {
         if state.disconnected {
             return Ok(());
         }
+        let should_wake = state.logs.is_empty() && !state.gap;
         state.remote_dropped_total = state.remote_dropped_total.max(tail.dropped_total);
         state.gap |= tail.gap;
         for record in records {
@@ -421,6 +448,10 @@ impl ConnectionBuffer {
                 state.gap = true;
             }
             state.logs.push_back(record);
+        }
+        drop(state);
+        if should_wake {
+            wake_runtime(&self.wake);
         }
         Ok(())
     }
@@ -440,10 +471,16 @@ impl ConnectionBuffer {
     }
 
     fn mark_disconnected(&self) {
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .disconnected = true;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let should_wake = !state.disconnected;
+        state.disconnected = true;
+        drop(state);
+        if should_wake {
+            wake_runtime(&self.wake);
+        }
     }
 
     fn take_event(&self, generation: u64) -> Option<StatusLogEvent> {
@@ -477,6 +514,16 @@ impl ConnectionBuffer {
                 .remote_dropped_total
                 .saturating_add(state.local_dropped_total),
         })
+    }
+}
+
+fn wake_runtime(wake: &Mutex<Option<RuntimeWaker>>) {
+    if let Some(waker) = wake
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+    {
+        waker.wake();
     }
 }
 

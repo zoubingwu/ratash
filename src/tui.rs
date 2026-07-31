@@ -453,6 +453,61 @@ impl AppState {
         self.render_dirty = true;
     }
 
+    fn refresh_snapshot(&mut self, generation: u64, snapshot: FullViewSnapshot) {
+        if generation != self.connection.generation
+            || self.connection.status != ConnectionStatus::Connected
+            || self.pending.is_some()
+        {
+            return;
+        }
+        let proxies = snapshot
+            .proxies
+            .into_iter()
+            .take(MAX_ACTIVE_NODES)
+            .collect::<Vec<_>>();
+        let profiles = snapshot
+            .profiles
+            .into_iter()
+            .take(PROFILE_VIEW_CAPACITY)
+            .collect::<Vec<_>>();
+        if self.status.as_ref() == Some(&snapshot.status)
+            && self.proxies.rows == proxies
+            && self.profiles.rows == profiles
+            && !self.connection.snapshot_stale
+        {
+            return;
+        }
+        let selected_proxy = filtered_proxies(&self.proxies)
+            .get(self.proxies.selected)
+            .and_then(|row| row.node_id.clone());
+        let selected_profile = filtered_profiles(&self.profiles)
+            .get(self.profiles.selected)
+            .map(|row| row.id);
+        self.proxies.rows = proxies;
+        self.profiles.rows = profiles;
+        if let Some(selected) = selected_proxy
+            && let Some(index) = filtered_proxies(&self.proxies)
+                .iter()
+                .position(|row| row.node_id.as_ref() == Some(&selected))
+        {
+            self.proxies.selected = index;
+        }
+        if let Some(selected) = selected_profile
+            && let Some(index) = filtered_profiles(&self.profiles)
+                .iter()
+                .position(|row| row.id == selected)
+        {
+            self.profiles.selected = index;
+        }
+        self.status = Some(snapshot.status);
+        self.connection.snapshot_stale = false;
+        self.proxies.selected_group = filtered_proxies(&self.proxies)
+            .get(self.proxies.selected)
+            .map(|row| row.group.clone());
+        self.clamp_selections();
+        self.render_dirty = true;
+    }
+
     fn push_traffic_sample(&mut self) {
         let Some(status) = &self.status else {
             return;
@@ -497,6 +552,10 @@ pub enum UiEvent {
     StatusSnapshot {
         connection_generation: u64,
         status: StatusSnapshot,
+    },
+    SnapshotRefreshed {
+        connection_generation: u64,
+        snapshot: FullViewSnapshot,
     },
     LogBatch {
         connection_generation: u64,
@@ -572,6 +631,9 @@ pub enum Command {
         connection_generation: u64,
         after_sequence: Option<u64>,
     },
+    RefreshSnapshot {
+        connection_generation: u64,
+    },
     Cancel {
         request_id: RequestId,
     },
@@ -614,11 +676,19 @@ pub fn update(state: &mut AppState, event: UiEvent) -> Vec<Command> {
         } => {
             if connection_generation == state.connection.generation
                 && state.connection.status == ConnectionStatus::Connected
+                && state.status.as_ref() != Some(&status)
             {
                 state.status = Some(status);
                 state.push_traffic_sample();
                 state.render_dirty = true;
             }
+            Vec::new()
+        }
+        UiEvent::SnapshotRefreshed {
+            connection_generation,
+            snapshot,
+        } => {
+            state.refresh_snapshot(connection_generation, snapshot);
             Vec::new()
         }
         UiEvent::LogBatch {
