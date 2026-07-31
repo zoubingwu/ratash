@@ -1,6 +1,6 @@
 use crate::constants::{
     CORE_LOG_LINE_MAX_BYTES, CORE_RESTART_LIMIT, EFFECTIVE_CONFIGURATION_MAX_BYTES, LOG_CAPACITY,
-    MIHOMO_BINARY_MAX_BYTES,
+    MIHOMO_BINARY_MAX_BYTES, PROFILE_RESPONSE_MAX_BYTES,
 };
 use crate::core::{
     ApplyCandidateResult, ApplyDisposition, CoreControlEndpoint, CoreRuntime, CoreRuntimeError,
@@ -15,12 +15,21 @@ use std::fmt;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 pub const CORE_RUNTIME_PROTOCOL_VERSION: u16 = 1;
 const RUNTIME_MANIFEST_SCHEMA_VERSION: u16 = 1;
 const RUNTIME_MANIFEST_MAX_BYTES: usize = 64 * 1_024;
+const RUNTIME_PROVIDER_FILE_MAX: usize = 1_024;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeManifestFileV1 {
+    pub path: String,
+    pub sha256: String,
+    pub size: u64,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +41,7 @@ pub struct RuntimeManifestV1 {
     pub configuration_sha256: String,
     pub executable: String,
     pub configuration: String,
+    pub provider_files: Vec<RuntimeManifestFileV1>,
 }
 
 impl RuntimeManifestV1 {
@@ -50,7 +60,15 @@ impl RuntimeManifestV1 {
             configuration_sha256: configuration_sha256.into(),
             executable: "mihomo".to_owned(),
             configuration: "config.yaml".to_owned(),
+            provider_files: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_provider_files(mut self, mut provider_files: Vec<RuntimeManifestFileV1>) -> Self {
+        provider_files.sort_by(|left, right| left.path.cmp(&right.path));
+        self.provider_files = provider_files;
+        self
     }
 }
 
@@ -623,6 +641,7 @@ impl PrivilegedCoreRuntimeService {
         if crate::digest::sha256_hex(&configuration) != manifest.configuration_sha256 {
             return Err(invalid_bundle("runtime configuration identity mismatch"));
         }
+        verify_provider_files(&generation_root, &manifest.provider_files)?;
 
         Ok(VerifiedRuntimeBundle {
             bundle: RuntimeBundle {
@@ -990,6 +1009,45 @@ impl CoreRuntime for PrivilegedCoreRuntimeService {
         authenticated_owner(&state, owner)?;
         self.cleanup_owner(&mut state)
     }
+}
+
+fn verify_provider_files(
+    generation_root: &Path,
+    files: &[RuntimeManifestFileV1],
+) -> Result<(), CoreRuntimeError> {
+    if files.len() > RUNTIME_PROVIDER_FILE_MAX {
+        return Err(invalid_bundle("runtime provider file count exceeded"));
+    }
+    let mut previous_path: Option<&str> = None;
+    for file in files {
+        if previous_path.is_some_and(|previous| previous >= file.path.as_str())
+            || !valid_manifest_relative_path(&file.path)
+            || !valid_digest(&file.sha256)
+            || file.size > PROFILE_RESPONSE_MAX_BYTES as u64
+        {
+            return Err(invalid_bundle("runtime provider manifest entry is invalid"));
+        }
+        let bytes = read_bounded_regular(
+            generation_root,
+            &generation_root.join(&file.path),
+            PROFILE_RESPONSE_MAX_BYTES,
+        )?;
+        if bytes.len() as u64 != file.size || crate::digest::sha256_hex(&bytes) != file.sha256 {
+            return Err(invalid_bundle("runtime provider identity mismatch"));
+        }
+        previous_path = Some(&file.path);
+    }
+    Ok(())
+}
+
+fn valid_manifest_relative_path(value: &str) -> bool {
+    let path = Path::new(value);
+    !value.is_empty()
+        && !path.is_absolute()
+        && !matches!(value, "manifest.json" | "config.yaml" | "mihomo")
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
 }
 
 fn authenticated_owner<'a>(

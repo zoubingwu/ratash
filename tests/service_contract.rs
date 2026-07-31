@@ -7,9 +7,9 @@ use hopash::service::{
     CORE_RUNTIME_PROTOCOL_VERSION, CallerCredentialValidator, CoreExitIdentity,
     CoreProcessController, CoreProcessLog, OwnedProcessIdentity, PrivilegedCoreRuntimeService,
     PrivilegedServiceConfig, PrivilegedServiceDependencies, PrivilegedServiceLifecycle,
-    ProcessIdentityProbe, RuntimeManifestV1, SecretGenerator, ServicePlatformError,
-    ServicePlatformErrorKind, SpawnedCoreProcess, TunCapabilityPreflight, UnexpectedExitOutcome,
-    VerifiedRuntimeBundle,
+    ProcessIdentityProbe, RuntimeManifestFileV1, RuntimeManifestV1, SecretGenerator,
+    ServicePlatformError, ServicePlatformErrorKind, SpawnedCoreProcess, TunCapabilityPreflight,
+    UnexpectedExitOutcome, VerifiedRuntimeBundle,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
@@ -566,6 +566,46 @@ fn runtime_bundle_checks_root_manifest_policy_binary_and_configuration_identity(
         &harness.binary_sha256,
     );
     assert_invalid_bundle(&harness.service, &session.proof, &outside);
+    assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn runtime_bundle_rejects_changed_local_provider_content() {
+    let harness = Harness::new();
+    let session = harness.open();
+    let mut bundle = harness.bundle(1);
+    let provider_path = bundle.generation_root.join("providers/local.yaml");
+    fs::create_dir_all(
+        provider_path
+            .parent()
+            .expect("the provider fixture should have a parent"),
+    )
+    .expect("the provider fixture directory should be created");
+    let original_provider = b"payload: []\n";
+    fs::write(&provider_path, original_provider).expect("the provider fixture should be written");
+    let configuration = fs::read(bundle.generation_root.join("config.yaml"))
+        .expect("the configuration fixture should be readable");
+    let manifest = RuntimeManifestV1::new(
+        bundle.generation,
+        &bundle.compiler_policy_sha256,
+        &bundle.mihomo_binary_sha256,
+        sha256(&configuration),
+    )
+    .with_provider_files(vec![RuntimeManifestFileV1 {
+        path: "providers/local.yaml".to_owned(),
+        sha256: sha256(original_provider),
+        size: original_provider.len() as u64,
+    }]);
+    let manifest_bytes = serde_json::to_vec(&manifest).expect("the manifest should serialize");
+    fs::write(
+        bundle.generation_root.join("manifest.json"),
+        &manifest_bytes,
+    )
+    .expect("the manifest fixture should be updated");
+    bundle.manifest_sha256 = sha256(&manifest_bytes);
+    fs::write(provider_path, b"changed: true\n").expect("the provider fixture should be changed");
+
+    assert_invalid_bundle(&harness.service, &session.proof, &bundle);
     assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 0);
 }
 
