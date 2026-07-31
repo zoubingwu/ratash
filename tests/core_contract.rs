@@ -270,6 +270,15 @@ fn codecs_match_v1_19_28_snapshot_and_stream_shapes() {
 
 #[test]
 fn fixed_codecs_reject_unknown_fields_and_oversized_numbers() {
+    assert_eq!(
+        MihomoJsonCodec::traffic(br#"{"up":1,"down":2,"upTotal":3,"downTotal":4}"#)
+            .expect("v1.19.28 traffic totals are accepted"),
+        TrafficFrame {
+            upload_bytes_per_second: 1,
+            download_bytes_per_second: 2,
+        }
+    );
+
     for error in [
         MihomoJsonCodec::version(
             br#"{"meta":true,"premium":false,"version":"v1.19.28","secret-field":1}"#,

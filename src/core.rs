@@ -1310,6 +1310,10 @@ struct RawDelay {
 struct RawTraffic {
     up: u64,
     down: u64,
+    #[serde(default, rename = "upTotal")]
+    _up_total: u64,
+    #[serde(default, rename = "downTotal")]
+    _down_total: u64,
 }
 
 #[derive(Deserialize)]
