@@ -94,7 +94,7 @@ top-level:
         - *string-sequence
   inbound-mptcp: { kind: managed-drop }
   inbound-tfo: { kind: managed-drop }
-  interface-name: { kind: string }
+  interface-name: { kind: managed-drop }
   iptables: { kind: managed-drop }
   ipv6: { kind: boolean }
   keep-alive-idle: { kind: integer }

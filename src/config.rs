@@ -11,7 +11,7 @@ use url::Url;
 
 const BUNDLED_CATALOG: &str = include_str!("../fixtures/mihomo/v1.19.28/config-schema.yaml");
 pub const BUNDLED_CORE_VERSION: &str = "v1.19.28";
-const COMPILER_POLICY_REVISION: &str = "hopash-config-policy-v1";
+const COMPILER_POLICY_REVISION: &str = "hopash-config-policy-v2";
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct AuthoritativeConfig {
@@ -403,16 +403,18 @@ impl ConfigCompiler {
         );
         document.insert("secret".into(), authoritative.secret.clone().into());
 
-        let tun = document
-            .entry("tun".into())
+        document.insert("tun".into(), authoritative_tun_baseline());
+        let dns = document
+            .entry("dns".into())
             .or_insert_with(|| Value::Mapping(Mapping::new()));
-        let Value::Mapping(tun) = tun else {
+        let Value::Mapping(dns) = dns else {
             return Err(ConfigError::InvalidShape {
-                path: "tun".to_owned(),
+                path: "dns".to_owned(),
                 expected: "a mapping",
             });
         };
-        tun.insert("enable".into(), true.into());
+        dns.insert("enable".into(), true.into());
+        dns.insert("fallback".into(), Value::Sequence(Vec::new()));
 
         let mut providers = Vec::new();
         classify_provider_section(
@@ -1137,7 +1139,7 @@ fn is_integer(value: &Value) -> bool {
 }
 
 fn policy_sha256() -> String {
-    let managed = b"rules=local\ntun.enable=true\nmode=rule\nallow-lan=false";
+    let managed = b"rules=local\nmode=rule\nallow-lan=false\ntun.enable=true\ntun.stack=gvisor\ntun.auto-route=true\ntun.strict-route=false\ntun.auto-detect-interface=true\ntun.dns-hijack=any:53\ndns.enable=true\ndns.fallback=[]";
     let mut policy = Vec::with_capacity(
         COMPILER_POLICY_REVISION.len() + BUNDLED_CATALOG.len() + managed.len() + 2,
     );
@@ -1147,6 +1149,17 @@ fn policy_sha256() -> String {
     policy.push(0);
     policy.extend_from_slice(managed);
     sha256_hex(&policy)
+}
+
+fn authoritative_tun_baseline() -> Value {
+    Value::Mapping(Mapping::from_iter([
+        ("enable".into(), true.into()),
+        ("stack".into(), "gvisor".into()),
+        ("auto-route".into(), true.into()),
+        ("strict-route".into(), false.into()),
+        ("auto-detect-interface".into(), true.into()),
+        ("dns-hijack".into(), Value::Sequence(vec!["any:53".into()])),
+    ]))
 }
 
 fn path_string(path: &Path) -> String {

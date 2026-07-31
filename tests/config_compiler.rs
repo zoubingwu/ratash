@@ -42,9 +42,16 @@ dns:
   enable: true
   listen: 0.0.0.0:53
   nameserver: [1.1.1.1]
+  fallback: [8.8.8.8]
 tun:
   enable: false
   stack: system
+  auto-route: false
+  strict-route: true
+  auto-detect-interface: false
+  dns-hijack: ['127.0.0.1:5353']
+  device: untrusted-device
+interface-name: untrusted-interface
 sniffer:
   enable: true
   force-dns-mapping: true
@@ -92,7 +99,29 @@ rules:
     assert_eq!(document["mode"].as_str(), Some("rule"));
     assert_eq!(document["allow-lan"].as_bool(), Some(false));
     assert_eq!(document["tun"]["enable"].as_bool(), Some(true));
+    assert_eq!(document["tun"]["stack"].as_str(), Some("gvisor"));
+    assert_eq!(document["tun"]["auto-route"].as_bool(), Some(true));
+    assert_eq!(document["tun"]["strict-route"].as_bool(), Some(false));
+    assert_eq!(
+        document["tun"]["auto-detect-interface"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        document["tun"]["dns-hijack"]
+            .as_sequence()
+            .expect("DNS hijack should be a sequence"),
+        &[Value::String("any:53".to_owned())]
+    );
+    assert_eq!(document["tun"].get("device"), None);
     assert_eq!(document["dns"].get("listen"), None);
+    assert_eq!(document["dns"]["enable"].as_bool(), Some(true));
+    assert!(
+        document["dns"]["fallback"]
+            .as_sequence()
+            .expect("DNS fallback should be a sequence")
+            .is_empty()
+    );
+    assert_eq!(document.get("interface-name"), None);
     assert_eq!(
         document["external-controller-unix"].as_str(),
         Some("/private/tmp/hopash-core.sock")
