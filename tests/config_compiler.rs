@@ -641,6 +641,7 @@ fn equivalent_documents_produce_identical_yaml_and_policy_sha256() {
     let staging_root = temporary_root("deterministic-config");
     let compiler = ConfigCompiler::bundled().expect("the bundled catalog should load");
     let authoritative = AuthoritativeConfig::new("/tmp/core.sock", "secret");
+    assert_eq!(compiler.compiler_policy_sha256().len(), 64);
     let first =
         snapshot("mode: global\ndns:\n  nameserver: [1.1.1.1]\n  enable: true\nallow-lan: true\n");
     let second =

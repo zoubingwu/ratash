@@ -376,6 +376,11 @@ impl ConfigCompiler {
         })
     }
 
+    #[must_use]
+    pub fn compiler_policy_sha256(&self) -> &str {
+        &self.compiler_policy_sha256
+    }
+
     pub fn compile(
         &self,
         snapshot: &ProfileSnapshot,
