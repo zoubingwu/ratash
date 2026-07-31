@@ -1,0 +1,44 @@
+{
+  "providers": {
+    "alpha": {
+      "name": "alpha",
+      "proxies": [
+        {
+          "alive": true,
+          "history": [],
+          "name": "provider-only",
+          "type": "VLESS",
+          "udp": true,
+          "xudp": true
+        },
+        {
+          "alive": true,
+          "history": [],
+          "name": "shared",
+          "type": "VLESS",
+          "udp": true,
+          "xudp": true
+        }
+      ],
+      "type": "Proxy",
+      "updatedAt": "2026-08-01T00:00:00Z",
+      "vehicleType": "HTTP"
+    },
+    "beta": {
+      "name": "beta",
+      "proxies": [
+        {
+          "alive": false,
+          "history": [],
+          "name": "shared",
+          "type": "Trojan",
+          "udp": true,
+          "xudp": false
+        }
+      ],
+      "type": "Proxy",
+      "updatedAt": "2026-08-01T00:00:00Z",
+      "vehicleType": "File"
+    }
+  }
+}

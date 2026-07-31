@@ -5,6 +5,7 @@ pub mod cli;
 pub mod config;
 pub mod constants;
 pub mod contract;
+pub mod core;
 mod digest;
 pub mod domain;
 pub mod error;

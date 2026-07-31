@@ -1,0 +1,68 @@
+{
+  "proxies": {
+    "GLOBAL": {
+      "alive": true,
+      "all": ["Manual", "Automatic", "DIRECT"],
+      "history": [],
+      "name": "GLOBAL",
+      "now": "Manual",
+      "type": "Selector",
+      "udp": true,
+      "xudp": false
+    },
+    "Manual": {
+      "alive": true,
+      "all": ["core-a", "provider-only", "shared", "missing", "Nested"],
+      "history": [],
+      "name": "Manual",
+      "now": "provider-only",
+      "type": "Selector",
+      "udp": true,
+      "xudp": false
+    },
+    "Automatic": {
+      "alive": true,
+      "all": ["core-a", "provider-only"],
+      "history": [],
+      "name": "Automatic",
+      "now": "core-a",
+      "type": "URLTest",
+      "udp": true,
+      "xudp": false
+    },
+    "Nested": {
+      "alive": true,
+      "all": ["core-a"],
+      "history": [],
+      "name": "Nested",
+      "now": "core-a",
+      "type": "Selector",
+      "udp": true,
+      "xudp": false
+    },
+    "DIRECT": {
+      "alive": true,
+      "history": [],
+      "name": "DIRECT",
+      "type": "Direct",
+      "udp": true,
+      "xudp": false
+    },
+    "core-a": {
+      "alive": true,
+      "history": [{"time": "2026-08-01T00:00:00Z", "delay": 40}],
+      "name": "core-a",
+      "type": "Shadowsocks",
+      "udp": true,
+      "xudp": false
+    },
+    "offline-core": {
+      "alive": false,
+      "history": [],
+      "name": "offline-core",
+      "type": "Trojan",
+      "udp": true,
+      "xudp": false
+    }
+  }
+}

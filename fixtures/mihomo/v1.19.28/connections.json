@@ -1,0 +1,15 @@
+{
+  "connections": [
+    {
+      "chains": ["provider-only", "Manual"],
+      "id": "fixture-connection"
+    },
+    {
+      "chains": ["DIRECT"],
+      "id": "fixture-direct"
+    }
+  ],
+  "downloadTotal": 8192,
+  "memory": 1048576,
+  "uploadTotal": 4096
+}

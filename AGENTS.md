@@ -50,6 +50,8 @@
 - `src/persistence.rs` owns private content-addressed objects, recoverable transaction journals, and the committed manifest pointer.
 - `src/config.rs` compiles Profile Snapshots through the bundled Mihomo field catalog, applies authoritative fields, and exposes the final Core validation seam.
 - `fixtures/mihomo/v1.19.28/config-schema.yaml` is the closed field catalog bound to the bundled Core version.
+- `src/core.rs` defines the authenticated CoreRuntime boundary, Mihomo adapter contract, versioned Proxy View, selection resolution, and fixed API codecs.
+- `fixtures/mihomo/v1.19.28/*.json` are the pinned Core API contract fixtures for projection, readiness, probes, and telemetry.
 - `src/rule.rs` owns Rule String parsing, ordered Local Rule Set mutations, revisions, and deterministic `rules.yaml` serialization.
 - `src/constants.rs` centralizes versioned product intervals, capacities, terminal limits, and input-size boundaries.
 - `src/digest.rs` is the internal SHA-256 helper shared by stable identities, immutable storage, and compiler policies.
