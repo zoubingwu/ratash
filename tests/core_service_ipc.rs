@@ -50,6 +50,7 @@ struct FakeRuntimeState {
     close_count: usize,
     managed_core: Option<ManagedCoreHandle>,
     staged_bundles: BTreeMap<u64, RuntimeBundle>,
+    apply_delay: Option<Duration>,
     status_delay: Option<Duration>,
     status_diagnostic: Option<String>,
     oversized_logs: bool,
@@ -133,6 +134,9 @@ impl CoreRuntime for FakeRuntime {
                 .expect("the staged provider should be readable"),
             b"payload: []\n"
         );
+        if let Some(delay) = self.state().apply_delay {
+            std::thread::sleep(delay);
+        }
         let managed_core = ManagedCoreHandle {
             pid: 4_242,
             process_start_identity: "fixture-core-start".to_owned(),
@@ -620,6 +624,32 @@ fn absolute_response_deadline_bounds_a_stalled_runtime_operation() {
 
     assert_eq!(error.kind, CoreRuntimeErrorKind::Unavailable);
     assert!(started.elapsed() < Duration::from_millis(200));
+}
+
+#[test]
+fn runtime_mutations_use_the_extended_response_budget() {
+    let harness = Harness::new();
+    let session = harness
+        .client
+        .open_owner_session(&harness.owner_request())
+        .expect("the owner session should open");
+    harness.runtime.state().apply_delay = Some(Duration::from_millis(80));
+    let client = CoreServiceClient::with_service_uid_and_operation_timeouts(
+        &harness.socket_path,
+        nix::unistd::Uid::effective().as_raw(),
+        Duration::from_secs(1),
+        Duration::from_millis(40),
+        Duration::from_millis(200),
+    );
+
+    let result = client
+        .apply_candidate(&session.proof, &harness.source_bundle(13))
+        .expect("the Runtime Apply should use the mutation response budget");
+
+    assert_eq!(
+        result.managed_core.runtime_generation,
+        RuntimeGeneration(13)
+    );
 }
 
 #[test]

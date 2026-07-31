@@ -27,7 +27,8 @@ use socket2::{Domain, SockAddr, Socket, Type};
 
 use crate::constants::{
     CORE_LOG_LINE_MAX_BYTES, EFFECTIVE_CONFIGURATION_MAX_BYTES, IPC_FRAME_MAX_BYTES,
-    IPC_REQUEST_TIMEOUT, MIHOMO_BINARY_MAX_BYTES, PROFILE_RESPONSE_MAX_BYTES,
+    IPC_REQUEST_TIMEOUT, IPC_RUNTIME_MUTATION_TIMEOUT, MIHOMO_BINARY_MAX_BYTES,
+    PROFILE_RESPONSE_MAX_BYTES,
 };
 use crate::core::{
     ApplyCandidateResult, ApplyDisposition, CoreControlEndpoint, CoreRuntime, CoreRuntimeError,
@@ -62,19 +63,24 @@ pub struct CoreServiceClient {
     socket_path: PathBuf,
     expected_service_uid: u32,
     connect_timeout: Duration,
-    io_timeout: Duration,
+    timeout_policy: CoreServiceTimeoutPolicy,
     next_request_id: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+enum CoreServiceTimeoutPolicy {
+    Product,
+    Fixed(Duration),
+    OperationSpecific {
+        request: Duration,
+        mutation: Duration,
+    },
 }
 
 impl CoreServiceClient {
     #[must_use]
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
-        Self::with_service_uid_and_timeouts(
-            socket_path,
-            0,
-            IPC_REQUEST_TIMEOUT,
-            IPC_REQUEST_TIMEOUT,
-        )
+        Self::with_service_uid(socket_path, 0)
     }
 
     #[must_use]
@@ -88,12 +94,17 @@ impl CoreServiceClient {
 
     #[must_use]
     pub fn for_service_uid(socket_path: impl Into<PathBuf>, expected_service_uid: u32) -> Self {
-        Self::with_service_uid_and_timeouts(
-            socket_path,
+        Self::with_service_uid(socket_path, expected_service_uid)
+    }
+
+    fn with_service_uid(socket_path: impl Into<PathBuf>, expected_service_uid: u32) -> Self {
+        Self {
+            socket_path: socket_path.into(),
             expected_service_uid,
-            IPC_REQUEST_TIMEOUT,
-            IPC_REQUEST_TIMEOUT,
-        )
+            connect_timeout: IPC_REQUEST_TIMEOUT,
+            timeout_policy: CoreServiceTimeoutPolicy::Product,
+            next_request_id: AtomicU64::new(1),
+        }
     }
 
     #[must_use]
@@ -107,7 +118,27 @@ impl CoreServiceClient {
             socket_path: socket_path.into(),
             expected_service_uid,
             connect_timeout,
-            io_timeout,
+            timeout_policy: CoreServiceTimeoutPolicy::Fixed(io_timeout),
+            next_request_id: AtomicU64::new(1),
+        }
+    }
+
+    #[must_use]
+    pub fn with_service_uid_and_operation_timeouts(
+        socket_path: impl Into<PathBuf>,
+        expected_service_uid: u32,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        mutation_timeout: Duration,
+    ) -> Self {
+        Self {
+            socket_path: socket_path.into(),
+            expected_service_uid,
+            connect_timeout,
+            timeout_policy: CoreServiceTimeoutPolicy::OperationSpecific {
+                request: request_timeout,
+                mutation: mutation_timeout,
+            },
             next_request_id: AtomicU64::new(1),
         }
     }
@@ -122,7 +153,7 @@ impl CoreServiceClient {
     }
 
     fn connect(&self) -> io::Result<UnixStream> {
-        if self.connect_timeout.is_zero() || self.io_timeout.is_zero() {
+        if self.connect_timeout.is_zero() || !self.timeout_policy.is_valid() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Core service IPC deadlines must be positive",
@@ -143,6 +174,7 @@ impl CoreServiceClient {
     }
 
     fn request(&self, operation: WireOperation) -> Result<WireSuccess, CoreRuntimeError> {
+        let response_timeout = self.timeout_policy.response_timeout(&operation);
         let request_id = self.request_id();
         let request = WireRequest {
             protocol_version: CORE_SERVICE_IPC_PROTOCOL_VERSION,
@@ -151,7 +183,7 @@ impl CoreServiceClient {
         };
         let stream = self.connect().map_err(transport_unavailable)?;
         let mut stream =
-            DeadlineUnixStream::new(stream, self.io_timeout).map_err(transport_unavailable)?;
+            DeadlineUnixStream::new(stream, response_timeout).map_err(transport_unavailable)?;
         stream.begin_write().map_err(transport_unavailable)?;
         write_frame(&mut stream, &request).map_err(map_write_error)?;
         stream.begin_read().map_err(transport_unavailable)?;
@@ -177,8 +209,41 @@ impl fmt::Debug for CoreServiceClient {
             .field("socket_path", &"[REDACTED]")
             .field("expected_service_uid", &self.expected_service_uid)
             .field("connect_timeout", &self.connect_timeout)
-            .field("io_timeout", &self.io_timeout)
+            .field("request_timeout", &self.timeout_policy.request_timeout())
+            .field("mutation_timeout", &self.timeout_policy.mutation_timeout())
             .finish_non_exhaustive()
+    }
+}
+
+impl CoreServiceTimeoutPolicy {
+    fn request_timeout(self) -> Duration {
+        match self {
+            Self::Product => IPC_REQUEST_TIMEOUT,
+            Self::Fixed(timeout) => timeout,
+            Self::OperationSpecific { request, .. } => request,
+        }
+    }
+
+    fn mutation_timeout(self) -> Duration {
+        match self {
+            Self::Product => IPC_RUNTIME_MUTATION_TIMEOUT,
+            Self::Fixed(timeout) => timeout,
+            Self::OperationSpecific { mutation, .. } => mutation,
+        }
+    }
+
+    fn response_timeout(self, operation: &WireOperation) -> Duration {
+        match operation {
+            WireOperation::Status(_) | WireOperation::Logs(_) => self.request_timeout(),
+            WireOperation::OpenOwnerSession(_)
+            | WireOperation::ApplyCandidate(_)
+            | WireOperation::Stop(_)
+            | WireOperation::CloseOwnerSession(_) => self.mutation_timeout(),
+        }
+    }
+
+    fn is_valid(self) -> bool {
+        !self.request_timeout().is_zero() && !self.mutation_timeout().is_zero()
     }
 }
 
