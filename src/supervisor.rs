@@ -766,14 +766,13 @@ impl Supervisor {
                 generation,
                 false,
             );
+            let failure_stage = result
+                .as_ref()
+                .err()
+                .map_or(RefreshStage::Apply, refresh_stage_for_transaction_failure);
             if let Err(error) = settle_transaction(&mut state, result) {
                 drop(state);
-                self.record_refresh_failure(
-                    profile_id,
-                    context,
-                    RefreshStage::Apply,
-                    &error.message,
-                )?;
+                self.record_refresh_failure(profile_id, context, failure_stage, &error.message)?;
                 return Err(error);
             }
             state.profiles = profiles;
@@ -812,7 +811,16 @@ impl Supervisor {
                     return Err(error);
                 }
             };
-            self.validate_configuration(&configuration, profile_id)?;
+            if let Err(error) = self.validate_configuration(&configuration, profile_id) {
+                drop(state);
+                self.record_refresh_failure(
+                    profile_id,
+                    context,
+                    RefreshStage::Validate,
+                    &error.message,
+                )?;
+                return Err(error);
+            }
             let mut profiles = state.profiles.clone();
             let revision = profiles
                 .commit_refresh(profile_id, context, snapshot, now, next_refresh)
@@ -2304,7 +2312,7 @@ fn map_rule_error(error: RuleSetError) -> ApplicationError {
             false,
         ),
         RuleSetError::RuleAmbiguous { matching_indexes } => ApplicationError::new(
-            ErrorCode::NodeAmbiguous,
+            ErrorCode::RuleAmbiguous,
             "The Rule String is ambiguous",
             false,
         )
@@ -2338,7 +2346,7 @@ fn map_selection_error(error: SelectionError) -> ApplicationError {
             name,
             candidate_ids,
         } => ApplicationError::new(
-            ErrorCode::RuleAmbiguous,
+            ErrorCode::NodeAmbiguous,
             "The Node selector is ambiguous",
             false,
         )
@@ -2357,6 +2365,17 @@ fn map_selection_error(error: SelectionError) -> ApplicationError {
         | SelectionError::NodeUnavailable(_)
         | SelectionError::ProviderUnavailable(_)
         | SelectionError::TargetIsGroup(_) => core_error("The selected Node is unavailable"),
+    }
+}
+
+fn refresh_stage_for_transaction_failure(failure: &SupervisorTransactionFailure) -> RefreshStage {
+    if matches!(
+        failure.kind,
+        SupervisorTransactionFailureKind::Coordinator(ConfigTransactionErrorKind::Validation)
+    ) {
+        RefreshStage::Validate
+    } else {
+        RefreshStage::Apply
     }
 }
 

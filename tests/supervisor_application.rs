@@ -351,6 +351,7 @@ struct PersistingTransactions {
     apply_count: AtomicU64,
     metadata_count: AtomicU64,
     fail_next_apply: AtomicBool,
+    fail_next_validation: AtomicBool,
     fail_next_metadata: AtomicBool,
     busy_next_rule: AtomicBool,
     next_success_recovery: Mutex<Option<TransactionRecoveryOutcome>>,
@@ -447,6 +448,13 @@ impl SupervisorTransactionPort for PersistingTransactions {
                 .unwrap_or(TransactionRecoveryOutcome::NotRequired);
             return Err(failure);
         }
+        if self.fail_next_validation.swap(false, Ordering::Relaxed) {
+            return Err(SupervisorTransactionFailure::new(
+                hopash::supervisor::SupervisorTransactionFailureKind::Coordinator(
+                    hopash::transaction::ConfigTransactionErrorKind::Validation,
+                ),
+            ));
+        }
         if self.block_next_apply.swap(false, Ordering::AcqRel) {
             self.apply_gate.enter_and_wait();
         }
@@ -516,6 +524,7 @@ impl Harness {
             apply_count: AtomicU64::new(0),
             metadata_count: AtomicU64::new(0),
             fail_next_apply: AtomicBool::new(false),
+            fail_next_validation: AtomicBool::new(false),
             fail_next_metadata: AtomicBool::new(false),
             busy_next_rule: AtomicBool::new(false),
             next_success_recovery: Mutex::new(None),
@@ -1464,6 +1473,44 @@ fn latency_show_prefers_opaque_id_and_reports_name_ambiguity() {
 }
 
 #[test]
+fn proxy_and_rule_ambiguity_use_their_stable_error_codes() {
+    let proxy_harness = Harness::new("proxy-ambiguity-code");
+    proxy_harness.core.state.lock().expect("the Core lock").view = duplicate_node_name_proxy_view();
+    proxy_harness.queue_profile("Primary", "node-a");
+    let proxy_supervisor = proxy_harness.open();
+    add_profile(
+        &proxy_supervisor,
+        "https://example.test/proxy-ambiguity.yaml",
+    );
+
+    let proxy_error = proxy_supervisor
+        .execute(ApplicationOperation::ProxySelect {
+            group: "Main".to_owned(),
+            node: "shared".to_owned(),
+        })
+        .expect_err("an ambiguous Node selector should fail");
+    assert_eq!(proxy_error.code, hopash::error::ErrorCode::NodeAmbiguous);
+
+    let rule_harness = Harness::new("rule-ambiguity-code");
+    let duplicated_rules = String::from_utf8(fixture_profile("node-a"))
+        .expect("the Profile fixture should be UTF-8")
+        .replace("  - MATCH,Main\n", "  - MATCH,Main\n  - MATCH,Main\n");
+    rule_harness.source.push(Ok(FetchedProfile {
+        body: duplicated_rules.into_bytes(),
+        metadata_name: Some("Primary".to_owned()),
+    }));
+    let rule_supervisor = rule_harness.open();
+    add_profile(&rule_supervisor, "https://example.test/rule-ambiguity.yaml");
+
+    let rule_error = rule_supervisor
+        .execute(ApplicationOperation::RuleRemove {
+            rule: "MATCH,Main".to_owned(),
+        })
+        .expect_err("an ambiguous Rule String should fail");
+    assert_eq!(rule_error.code, hopash::error::ErrorCode::RuleAmbiguous);
+}
+
+#[test]
 fn proxy_group_and_node_misses_have_selector_specific_codes() {
     let harness = Harness::new("selector-specific-misses");
     harness.queue_profile("Primary", "node-a");
@@ -1688,6 +1735,25 @@ fn inactive_and_active_refreshes_follow_distinct_commit_paths_and_record_apply_f
         hopash::application::ProfileRefreshState::Fresh
     );
 
+    harness.clock.now.store(25_000, Ordering::Relaxed);
+    harness.queue_profile("Secondary", "node-c");
+    harness.validator.fail_next.store(true, Ordering::Relaxed);
+    supervisor
+        .refresh_profile(secondary.id)
+        .expect_err("the injected inactive validation should fail");
+    let secondary_after_failure = profile_list(&supervisor)
+        .into_iter()
+        .find(|profile| profile.id == secondary.id)
+        .expect("the secondary Profile should remain");
+    assert_eq!(secondary_after_failure.last_success_at_unix_ms, 20_000);
+    assert_eq!(
+        secondary_after_failure
+            .last_error
+            .expect("the validation stage should be retained")
+            .stage,
+        hopash::application::ProfileRefreshStage::Validate
+    );
+
     harness.clock.now.store(30_000, Ordering::Relaxed);
     harness.queue_profile("Primary", "node-a");
     assert_eq!(
@@ -1704,6 +1770,28 @@ fn inactive_and_active_refreshes_follow_distinct_commit_paths_and_record_apply_f
         panic!("status should return Status")
     };
     assert_eq!(status.runtime_generation, Some(RuntimeGeneration(2)));
+
+    harness.clock.now.store(35_000, Ordering::Relaxed);
+    harness.queue_profile("Primary", "node-a");
+    harness
+        .transactions
+        .fail_next_validation
+        .store(true, Ordering::Relaxed);
+    supervisor
+        .refresh_profile(primary.id)
+        .expect_err("the injected active validation should fail");
+    let primary_after_validation = profile_list(&supervisor)
+        .into_iter()
+        .find(|profile| profile.id == primary.id)
+        .expect("the primary Profile should remain");
+    assert_eq!(primary_after_validation.last_success_at_unix_ms, 30_000);
+    assert_eq!(
+        primary_after_validation
+            .last_error
+            .expect("the validation stage should be retained")
+            .stage,
+        hopash::application::ProfileRefreshStage::Validate
+    );
 
     harness.clock.now.store(40_000, Ordering::Relaxed);
     harness.queue_profile("Primary", "node-a");
