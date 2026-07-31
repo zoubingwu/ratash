@@ -20,6 +20,7 @@ pub mod process_controller;
 pub mod profile;
 pub mod profile_source;
 pub mod rule;
+pub mod runtime_adapters;
 pub mod runtime_bundle;
 pub mod scheduler;
 pub mod service;

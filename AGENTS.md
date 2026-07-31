@@ -64,6 +64,7 @@
 - `src/service.rs` owns the injected privileged CoreRuntime state machine, authenticated owner sessions, verified runtime bundles, process identity enforcement, bounded log forwarding, and bounded restart policy.
 - `src/process_controller.rs` implements verified Mihomo process spawn, bounded readiness and reload control, identity-matched stop, and bounded stdout/stderr capture for the privileged runtime service.
 - `src/runtime_bundle.rs` atomically stages private Runtime Generations and binds the Effective Configuration, bundled Mihomo executable, and local provider files to one verified manifest.
+- `src/runtime_adapters.rs` confirms pinned Mihomo readiness, classifies uncertain CoreRuntime outcomes, and resolves previously staged Runtime Generations for recovery.
 - `fixtures/mihomo/v1.19.28/*.json` are the pinned Core API contract fixtures for projection, readiness, probes, and telemetry.
 - `fixtures/release/product-contract-v1.json` freezes protocol versions, user-visible timing, capacities, size limits, and process exit codes for the first release contract.
 - `src/rule.rs` owns Rule String parsing, ordered Local Rule Set mutations, revisions, and deterministic `rules.yaml` serialization.
