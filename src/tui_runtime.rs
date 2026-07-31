@@ -21,8 +21,8 @@ use crate::domain::StatusSnapshot;
 use crate::ipc::RequestId;
 use crate::tui::{
     AppState, Command, ConnectionStatus, CrosstermControl, EventSource, FairEventInbox,
-    FullViewSnapshot, InteractionMap, ProfileRow, ProxyRow, TerminalControl, TerminalSession,
-    UiEvent, ViewLogRecord, from_crossterm_event, render, update,
+    FullViewSnapshot, InteractionMap, MutationSuccess, ProfileRow, ProxyRow, TerminalControl,
+    TerminalSession, UiEvent, ViewLogRecord, from_crossterm_event, render, update,
 };
 
 const LOOP_POLL_INTERVAL: Duration = Duration::from_millis(16);
@@ -713,31 +713,31 @@ fn execute_work(
             request_id,
             connection_generation,
             profile_id,
-        } => command_result(
+        } => mutation_result(
             *request_id,
             *connection_generation,
-            commands.execute(
-                ApplicationOperation::ProfileUse {
-                    profile: profile_id.to_string(),
-                },
-                &work.cancellation,
-            ),
+            ApplicationOperation::ProfileUse {
+                profile: profile_id.to_string(),
+            },
+            &work.cancellation,
+            snapshots,
+            commands,
         ),
         Command::SelectNode {
             request_id,
             connection_generation,
             group,
             node_id,
-        } => command_result(
+        } => mutation_result(
             *request_id,
             *connection_generation,
-            commands.execute(
-                ApplicationOperation::ProxySelect {
-                    group: group.clone(),
-                    node: node_id.as_str().to_owned(),
-                },
-                &work.cancellation,
-            ),
+            ApplicationOperation::ProxySelect {
+                group: group.clone(),
+                node: node_id.as_str().to_owned(),
+            },
+            &work.cancellation,
+            snapshots,
+            commands,
         ),
         Command::FetchLogTail {
             connection_generation,
@@ -784,18 +784,37 @@ fn execute_work(
 fn command_result(
     request_id: RequestId,
     connection_generation: u64,
-    result: Result<String, StatusInterfaceError>,
+    result: Result<MutationSuccess, StatusInterfaceError>,
 ) -> DispatchedEvent {
     DispatchedEvent {
         source: EventSource::CommandResult,
         event: UiEvent::CommandResult {
             request_id,
             connection_generation,
-            result: result
-                .map(|message| short_terminal_text(&message))
-                .map_err(|error| short_terminal_text(&error.to_string())),
+            result: result.map_err(|error| short_terminal_text(&error.to_string())),
         },
     }
+}
+
+fn mutation_result(
+    request_id: RequestId,
+    connection_generation: u64,
+    operation: ApplicationOperation,
+    cancellation: &CancellationToken,
+    snapshots: &Arc<dyn FullSnapshotSource>,
+    commands: &Arc<dyn UiCommandExecutor>,
+) -> DispatchedEvent {
+    let result = commands
+        .execute(operation, cancellation)
+        .and_then(|message| {
+            snapshots
+                .fetch_full_snapshot(connection_generation, cancellation)
+                .map(|snapshot| MutationSuccess {
+                    message: short_terminal_text(&message),
+                    snapshot,
+                })
+        });
+    command_result(request_id, connection_generation, result)
 }
 
 fn command_request_id(command: &Command) -> Option<RequestId> {

@@ -325,6 +325,12 @@ pub struct FullViewSnapshot {
 }
 
 #[derive(Clone, Debug)]
+pub struct MutationSuccess {
+    pub message: String,
+    pub snapshot: FullViewSnapshot,
+}
+
+#[derive(Clone, Debug)]
 pub struct AppState {
     pub page: Page,
     pub focus: Focus,
@@ -501,7 +507,7 @@ pub enum UiEvent {
     CommandResult {
         request_id: RequestId,
         connection_generation: u64,
-        result: Result<String, String>,
+        result: Result<MutationSuccess, String>,
     },
     ReconnectDeadline {
         connection_generation: u64,
@@ -649,19 +655,22 @@ pub fn update(state: &mut AppState, event: UiEvent) -> Vec<Command> {
                     && connection_generation == state.connection.generation
             });
             if current {
-                if state
-                    .pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.kind == PendingOperationKind::ActivateProfile)
-                {
-                    state.profiles.activation_pending = None;
+                match result {
+                    Ok(success) => {
+                        state.replace_snapshot(connection_generation, success.snapshot);
+                        state.toast = Some(success.message);
+                    }
+                    Err(message) => {
+                        if state.pending.as_ref().is_some_and(|pending| {
+                            pending.kind == PendingOperationKind::ActivateProfile
+                        }) {
+                            state.profiles.activation_pending = None;
+                        }
+                        state.pending = None;
+                        state.toast = Some(message);
+                        state.render_dirty = true;
+                    }
                 }
-                state.pending = None;
-                state.toast = Some(match result {
-                    Ok(message) => message,
-                    Err(message) => message,
-                });
-                state.render_dirty = true;
             }
             Vec::new()
         }

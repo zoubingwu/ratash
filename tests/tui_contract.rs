@@ -24,9 +24,9 @@ use hopash::telemetry::{LogLevel, LogSource};
 use hopash::tui::{
     AppState, Command, ConnectionStatus, EventBudgets, EventSource, FairEventInbox, Focus,
     FullViewSnapshot, InteractionMap, KeyInput, LogLevelFilter, Modal, MouseInput, MouseInputKind,
-    Page, ProfileRow, ProxyRow, TerminalAction, TerminalControl, TerminalInput, TerminalSession,
-    UiEvent, UiIntent, ViewLogRecord, from_crossterm_event, input_to_intent, render, render_buffer,
-    update,
+    MutationSuccess, Page, ProfileRow, ProxyRow, TerminalAction, TerminalControl, TerminalInput,
+    TerminalSession, UiEvent, UiIntent, ViewLogRecord, from_crossterm_event, input_to_intent,
+    render, render_buffer, update,
 };
 
 #[test]
@@ -373,34 +373,129 @@ fn tab_shift_tab_and_page_shortcuts_update_navigation_state() {
 fn stale_command_results_are_discarded_by_request_and_connection_generation() {
     let mut state = connected_state();
     state.page = Page::Profiles;
-    let profile_id = state.profiles.rows[0].id;
+    let profile_id = state.profiles.rows[1].id;
     let commands = update(
         &mut state,
         UiEvent::Intent(UiIntent::ActivateProfile(profile_id)),
     );
     let (request_id, generation) = activation_identity(&commands);
+    let mut refreshed_status = status_snapshot();
+    refreshed_status.active_profile = Some(ActiveProfileSummary {
+        id: profile_id,
+        name: "Backup".to_owned(),
+    });
+    refreshed_status.selected_node = Some(SelectedNodeSummary {
+        id: NodeRecordId::for_core("Berlin"),
+        name: "Berlin".to_owned(),
+    });
+    refreshed_status.traffic.upload_bytes_per_second = 900;
+    let refreshed_snapshot = FullViewSnapshot {
+        status: refreshed_status,
+        proxies: vec![proxy("Tokyo", false), proxy("Berlin", true)],
+        profiles: vec![
+            ProfileRow {
+                id: state.profiles.rows[0].id,
+                name: "Work".to_owned(),
+                active: false,
+                ..state.profiles.rows[0].clone()
+            },
+            ProfileRow {
+                id: profile_id,
+                name: "Backup".to_owned(),
+                active: true,
+                ..state.profiles.rows[1].clone()
+            },
+        ],
+        logs: vec![log(2, LogLevel::Info, "Profile activated")],
+        dropped_logs: 3,
+    };
 
     update(
         &mut state,
         UiEvent::CommandResult {
             request_id: RequestId(request_id.0 + 1),
             connection_generation: generation,
-            result: Ok("stale".to_owned()),
+            result: Ok(MutationSuccess {
+                message: "stale".to_owned(),
+                snapshot: refreshed_snapshot.clone(),
+            }),
         },
     );
     assert!(state.pending.is_some());
     assert_ne!(state.toast.as_deref(), Some("stale"));
+    assert_eq!(
+        state
+            .status
+            .as_ref()
+            .expect("connected state should retain its snapshot")
+            .traffic
+            .upload_bytes_per_second,
+        100
+    );
+
+    update(
+        &mut state,
+        UiEvent::CommandResult {
+            request_id,
+            connection_generation: generation + 1,
+            result: Ok(MutationSuccess {
+                message: "wrong generation".to_owned(),
+                snapshot: refreshed_snapshot.clone(),
+            }),
+        },
+    );
+    assert!(state.pending.is_some());
+    assert_ne!(state.toast.as_deref(), Some("wrong generation"));
 
     update(
         &mut state,
         UiEvent::CommandResult {
             request_id,
             connection_generation: generation,
-            result: Ok("Profile activated".to_owned()),
+            result: Ok(MutationSuccess {
+                message: "Profile activated".to_owned(),
+                snapshot: refreshed_snapshot,
+            }),
         },
     );
     assert!(state.pending.is_none());
     assert_eq!(state.toast.as_deref(), Some("Profile activated"));
+    assert_eq!(
+        state
+            .status
+            .as_ref()
+            .and_then(|status| status.active_profile.as_ref())
+            .map(|profile| profile.name.as_str()),
+        Some("Backup")
+    );
+    assert_eq!(
+        state
+            .status
+            .as_ref()
+            .expect("refreshed status should be present")
+            .traffic
+            .upload_bytes_per_second,
+        900
+    );
+    assert_eq!(
+        state
+            .profiles
+            .rows
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .map(|profile| profile.active),
+        Some(true)
+    );
+    assert_eq!(
+        state
+            .proxies
+            .rows
+            .iter()
+            .find(|proxy| proxy.name == "Berlin")
+            .map(|proxy| proxy.selected),
+        Some(true)
+    );
+    assert_eq!(state.logs.dropped_total, 3);
 }
 
 #[test]
@@ -625,7 +720,7 @@ fn fair_event_inbox_gives_each_ready_source_its_budget_every_round() {
         UiEvent::CommandResult {
             request_id: RequestId(1),
             connection_generation: 1,
-            result: Ok("done".to_owned()),
+            result: Err("failed".to_owned()),
         },
     );
     inbox.push(

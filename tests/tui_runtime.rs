@@ -11,9 +11,9 @@ use hopash::application::{
 };
 use hopash::constants::LOG_CAPACITY;
 use hopash::domain::{
-    ActiveProfileSummary, ApplyState, CoreLifecycle, CoreStatus, ProfileId, SampleState,
-    StatusSnapshot, StreamHealthSet, StreamState, SupervisorLifecycle, SupervisorStatus,
-    TrafficSample, TunStatus,
+    ActiveProfileSummary, ApplyState, CoreLifecycle, CoreStatus, NodeRecordId, ProfileId,
+    SampleState, StatusSnapshot, StreamHealthSet, StreamState, SupervisorLifecycle,
+    SupervisorStatus, TrafficSample, TunStatus,
 };
 use hopash::ipc::RequestId;
 use hopash::tui::{
@@ -331,6 +331,67 @@ fn background_dispatcher_runs_commands_off_the_render_thread_and_cancels_results
 }
 
 #[test]
+fn successful_mutation_dispatches_a_refreshed_full_snapshot() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let sources = StatusInterfaceSources {
+        snapshots: Arc::new(FakeSnapshots {
+            snapshot: snapshot(73),
+            order: Arc::clone(&order),
+            fail: false,
+        }),
+        events: Arc::new(FakeEvents::default()),
+        commands: Arc::new(OrderedCommands {
+            order: Arc::clone(&order),
+        }),
+    };
+    let mut dispatcher =
+        BackgroundCommandDispatcher::new(sources).expect("fixture command workers should start");
+
+    dispatcher
+        .submit(Command::SelectNode {
+            request_id: RequestId(92),
+            connection_generation: 6,
+            group: "Automatic".to_owned(),
+            node_id: NodeRecordId::for_core("Berlin"),
+        })
+        .expect("fixture command should enter the bounded queue");
+
+    let dispatched = (0..100)
+        .find_map(|_| {
+            let event = dispatcher
+                .try_next()
+                .expect("result queue should remain open");
+            if event.is_none() {
+                thread::sleep(Duration::from_millis(5));
+            }
+            event
+        })
+        .expect("successful mutation should dispatch a bounded result");
+
+    match dispatched.event {
+        UiEvent::CommandResult {
+            request_id,
+            connection_generation,
+            result: Ok(success),
+        } => {
+            assert_eq!(request_id, RequestId(92));
+            assert_eq!(connection_generation, 6);
+            assert_eq!(success.message, "done");
+            assert_eq!(success.snapshot.status.traffic.upload_bytes_per_second, 73);
+        }
+        other => panic!("unexpected mutation event: {other:?}"),
+    }
+    assert_eq!(
+        order
+            .lock()
+            .expect("order lock should be available")
+            .as_slice(),
+        ["command", "snapshot"]
+    );
+    dispatcher.shutdown();
+}
+
+#[test]
 fn shutdown_signal_exits_and_restores_every_terminal_mode() {
     let events = Arc::new(FakeEvents::default());
     let mut dispatcher = RecordingDispatcher::default();
@@ -571,6 +632,24 @@ impl UiCommandExecutor for ImmediateCommands {
         _operation: ApplicationOperation,
         _cancellation: &CancellationToken,
     ) -> Result<String, StatusInterfaceError> {
+        Ok("done".to_owned())
+    }
+}
+
+struct OrderedCommands {
+    order: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl UiCommandExecutor for OrderedCommands {
+    fn execute(
+        &self,
+        _operation: ApplicationOperation,
+        _cancellation: &CancellationToken,
+    ) -> Result<String, StatusInterfaceError> {
+        self.order
+            .lock()
+            .expect("order lock should be available")
+            .push("command");
         Ok("done".to_owned())
     }
 }
