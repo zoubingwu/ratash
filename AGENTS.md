@@ -53,6 +53,8 @@
 - `src/core.rs` defines the authenticated CoreRuntime boundary, Mihomo adapter contract, versioned Proxy View, selection resolution, and fixed API codecs.
 - `fixtures/mihomo/v1.19.28/*.json` are the pinned Core API contract fixtures for projection, readiness, probes, and telemetry.
 - `src/rule.rs` owns Rule String parsing, ordered Local Rule Set mutations, revisions, and deterministic `rules.yaml` serialization.
+- `src/scheduler.rs` owns deterministic bounded Profile Refresh and Active Profile Delay Probe scheduling state.
+- `src/telemetry.rs` owns generation-scoped latest values, fixed traffic history, and the bounded Core Log ring.
 - `src/constants.rs` centralizes versioned product intervals, capacities, terminal limits, and input-size boundaries.
 - `src/digest.rs` is the internal SHA-256 helper shared by stable identities, immutable storage, and compiler policies.
 - `src/cli/command.rs` defines the public Clap command tree and maps parsed commands to typed invocations.
