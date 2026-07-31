@@ -6,16 +6,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 
 use crate::application::{
-    ApplicationClient, ApplicationError, ApplicationOperation, ApplicationOutput, Clock,
-    LatencyFreshness as ApplicationLatencyFreshness, LatencyListOutcome,
+    ApplicationClient, ApplicationError, ApplicationErrorDetails, ApplicationOperation,
+    ApplicationOutput, Clock, LatencyFreshness as ApplicationLatencyFreshness, LatencyListOutcome,
     LatencyProbeStatus as ApplicationLatencyProbeStatus, LatencyShowOutcome, LatencySummary,
     PolicyTargetValidation, ProfileListOutcome, ProfileMutationAction, ProfileMutationOutcome,
     ProfileRefreshFailure, ProfileRefreshStage, ProfileRefreshState, ProfileSummary,
     ProxyAvailability, ProxyGroupSummary, ProxyListOutcome, ProxyMemberKind, ProxyNodeRow,
     ProxyNodeSource, ProxySelectionOutcome, RecoveryOutcome as ApplicationRecoveryOutcome,
     RecoveryStatus, RuleListOutcome, RuleMutationAction, RuleMutationOutcome,
-    RulePlacement as ApplicationRulePlacement, RuleSummary, RuntimeApplyOutcome,
-    RuntimeApplyStatus, SelectorCandidate, SelectorIdentity, SelectorKind,
+    RulePlacement as ApplicationRulePlacement, RuleSummary, RuntimeApplyFailureDetails,
+    RuntimeApplyFailureStage, RuntimeApplyOutcome, RuntimeApplyStatus, SelectorCandidate,
+    SelectorIdentity, SelectorKind,
 };
 use crate::config::{
     AuthoritativeConfig, ConfigCompiler, ConfigError, CoreConfigValidator, EffectiveConfiguration,
@@ -426,13 +427,17 @@ impl SupervisorTransactionPort for CoordinatedSupervisorTransactions {
                 .as_ref()
                 .is_some_and(|manifest| manifest.current == prepared.candidate);
             if !committed {
-                let _ = persistence.clear_prepared(&prepared);
+                if persistence.clear_prepared(&prepared).is_ok() {
+                    let _ = persistence.prune_unreachable();
+                }
                 return Err(SupervisorTransactionFailure::new(
                     SupervisorTransactionFailureKind::State,
                 ));
             }
         }
-        let _ = persistence.clear_prepared(&prepared);
+        if persistence.clear_prepared(&prepared).is_ok() {
+            let _ = persistence.prune_unreachable();
+        }
         self.revisions.set(request.revisions);
         Ok(())
     }
@@ -2123,7 +2128,7 @@ fn resolve_latency_node<'a>(
         [] => Err(selector_not_found(SelectorKind::Node, "Node")),
         [node] => Ok(*node),
         _ => Err(ApplicationError::new(
-            ErrorCode::RuleAmbiguous,
+            ErrorCode::NodeAmbiguous,
             "The Node selector is ambiguous",
             false,
         )
@@ -2299,7 +2304,7 @@ fn map_rule_error(error: RuleSetError) -> ApplicationError {
             false,
         ),
         RuleSetError::RuleAmbiguous { matching_indexes } => ApplicationError::new(
-            ErrorCode::RuleAmbiguous,
+            ErrorCode::NodeAmbiguous,
             "The Rule String is ambiguous",
             false,
         )
@@ -2344,9 +2349,10 @@ fn map_selection_error(error: SelectionError) -> ApplicationError {
                 .map(|id| SelectorCandidate::new(id.as_str(), &name))
                 .collect(),
         ),
-        SelectionError::GroupMissing(_) | SelectionError::NodeMissing(_) => {
-            selector_not_found(SelectorKind::Node, "Proxy selection")
+        SelectionError::GroupMissing(_) => {
+            selector_not_found(SelectorKind::ProxyGroup, "Proxy Group")
         }
+        SelectionError::NodeMissing(_) => selector_not_found(SelectorKind::Node, "Node"),
         SelectionError::GroupNotSelectable(_)
         | SelectionError::NodeUnavailable(_)
         | SelectionError::ProviderUnavailable(_)
@@ -2368,11 +2374,49 @@ fn map_config_error(error: ConfigError) -> ApplicationError {
 fn map_transaction_error(error: SupervisorTransactionFailure) -> ApplicationError {
     match error.kind {
         SupervisorTransactionFailureKind::Busy => rule_busy_error(),
-        _ => ApplicationError::new(
+        kind => ApplicationError::new(
             ErrorCode::ExternalOperationFailed,
             "Runtime Apply failed and the committed configuration was retained",
             false,
-        ),
+        )
+        .with_details(ApplicationErrorDetails::RuntimeApplyFailure(Box::new(
+            RuntimeApplyFailureDetails {
+                candidate_generation: error.candidate_generation,
+                committed_generation: error.committed_generation,
+                stage: transaction_failure_stage(kind),
+                recovery: application_recovery(error.recovery),
+            },
+        ))),
+    }
+}
+
+fn transaction_failure_stage(kind: SupervisorTransactionFailureKind) -> RuntimeApplyFailureStage {
+    match kind {
+        SupervisorTransactionFailureKind::Busy => RuntimeApplyFailureStage::Lock,
+        SupervisorTransactionFailureKind::State => RuntimeApplyFailureStage::State,
+        SupervisorTransactionFailureKind::Bundle => RuntimeApplyFailureStage::Bundle,
+        SupervisorTransactionFailureKind::Coordinator(kind) => match kind {
+            ConfigTransactionErrorKind::Busy | ConfigTransactionErrorKind::LockPoisoned => {
+                RuntimeApplyFailureStage::Lock
+            }
+            ConfigTransactionErrorKind::RecoveryRequired => {
+                RuntimeApplyFailureStage::RecoveryRequired
+            }
+            ConfigTransactionErrorKind::StaleCandidate => RuntimeApplyFailureStage::StaleCandidate,
+            ConfigTransactionErrorKind::InvalidCandidate => {
+                RuntimeApplyFailureStage::InvalidCandidate
+            }
+            ConfigTransactionErrorKind::Validation => RuntimeApplyFailureStage::Validation,
+            ConfigTransactionErrorKind::Prepare => RuntimeApplyFailureStage::Prepare,
+            ConfigTransactionErrorKind::Apply => RuntimeApplyFailureStage::Apply,
+            ConfigTransactionErrorKind::IndeterminateApply => {
+                RuntimeApplyFailureStage::IndeterminateApply
+            }
+            ConfigTransactionErrorKind::Health => RuntimeApplyFailureStage::Health,
+            ConfigTransactionErrorKind::Commit => RuntimeApplyFailureStage::Commit,
+            ConfigTransactionErrorKind::Cleanup => RuntimeApplyFailureStage::Cleanup,
+            ConfigTransactionErrorKind::Recovery => RuntimeApplyFailureStage::Recovery,
+        },
     }
 }
 
@@ -2404,45 +2448,43 @@ fn recovery_requires_degraded(recovery: TransactionRecoveryOutcome) -> bool {
 }
 
 fn runtime_apply_success(success: ConfigTransactionSuccess) -> RuntimeApplyOutcome {
-    let (status, recovery) = match success.recovery {
-        TransactionRecoveryOutcome::NotRequired => (
-            RuntimeApplyStatus::Applied,
-            ApplicationRecoveryOutcome {
-                status: RecoveryStatus::NotRequired,
-                restored_generation: None,
-                message: None,
-            },
-        ),
-        TransactionRecoveryOutcome::Converged { generation } => (
-            RuntimeApplyStatus::Recovered,
-            ApplicationRecoveryOutcome {
-                status: RecoveryStatus::Succeeded,
-                restored_generation: generation,
-                message: Some("The committed Runtime Generation was confirmed".to_owned()),
-            },
-        ),
-        TransactionRecoveryOutcome::Pending { target } => (
-            RuntimeApplyStatus::Applied,
-            ApplicationRecoveryOutcome {
-                status: RecoveryStatus::Failed,
-                restored_generation: target,
-                message: Some("Committed state cleanup is pending".to_owned()),
-            },
-        ),
-        TransactionRecoveryOutcome::Failed { target } => (
-            RuntimeApplyStatus::Applied,
-            ApplicationRecoveryOutcome {
-                status: RecoveryStatus::Failed,
-                restored_generation: target,
-                message: Some("Committed state recovery failed".to_owned()),
-            },
-        ),
+    let status = match success.recovery {
+        TransactionRecoveryOutcome::NotRequired => RuntimeApplyStatus::Applied,
+        TransactionRecoveryOutcome::Converged { .. } => RuntimeApplyStatus::Recovered,
+        TransactionRecoveryOutcome::Pending { .. } | TransactionRecoveryOutcome::Failed { .. } => {
+            RuntimeApplyStatus::Applied
+        }
     };
     RuntimeApplyOutcome {
         status,
         candidate_generation: Some(success.candidate_generation),
         committed_generation: Some(success.committed_generation),
-        recovery,
+        recovery: application_recovery(success.recovery),
+    }
+}
+
+fn application_recovery(recovery: TransactionRecoveryOutcome) -> ApplicationRecoveryOutcome {
+    match recovery {
+        TransactionRecoveryOutcome::NotRequired => ApplicationRecoveryOutcome {
+            status: RecoveryStatus::NotRequired,
+            restored_generation: None,
+            message: None,
+        },
+        TransactionRecoveryOutcome::Converged { generation } => ApplicationRecoveryOutcome {
+            status: RecoveryStatus::Succeeded,
+            restored_generation: generation,
+            message: Some("The committed Runtime Generation was confirmed".to_owned()),
+        },
+        TransactionRecoveryOutcome::Pending { target } => ApplicationRecoveryOutcome {
+            status: RecoveryStatus::Failed,
+            restored_generation: target,
+            message: Some("Committed state cleanup is pending".to_owned()),
+        },
+        TransactionRecoveryOutcome::Failed { target } => ApplicationRecoveryOutcome {
+            status: RecoveryStatus::Failed,
+            restored_generation: target,
+            message: Some("Committed state recovery failed".to_owned()),
+        },
     }
 }
 
@@ -2532,9 +2574,14 @@ fn bounded_message(message: String) -> String {
     message.chars().take(1_024).collect()
 }
 
-fn selector_not_found(_kind: SelectorKind, label: &str) -> ApplicationError {
+fn selector_not_found(kind: SelectorKind, label: &str) -> ApplicationError {
     ApplicationError::new(
-        ErrorCode::ProfileNotFound,
+        match kind {
+            SelectorKind::Profile => ErrorCode::ProfileNotFound,
+            SelectorKind::ProxyGroup => ErrorCode::ProxyGroupNotFound,
+            SelectorKind::Node => ErrorCode::NodeNotFound,
+            SelectorKind::Rule => ErrorCode::RuleNotFound,
+        },
         format!("The {label} was not found"),
         false,
     )

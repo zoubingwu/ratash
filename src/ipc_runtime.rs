@@ -25,8 +25,8 @@ use crate::application::{
     ProxyAvailability, ProxyGroupSummary, ProxyListOutcome, ProxyMemberKind, ProxyNodeRow,
     ProxyNodeSource, ProxySelectionOutcome, RecoveryOutcome, RecoveryStatus, RuleListOutcome,
     RuleMutationAction, RuleMutationOutcome, RulePlacement as ApplicationRulePlacement,
-    RuleSummary, RuntimeApplyOutcome, RuntimeApplyStatus, SelectorCandidate, SelectorIdentity,
-    SelectorKind,
+    RuleSummary, RuntimeApplyFailureDetails, RuntimeApplyFailureStage, RuntimeApplyOutcome,
+    RuntimeApplyStatus, SelectorCandidate, SelectorIdentity, SelectorKind,
 };
 use crate::constants::{
     CORE_LOG_LINE_MAX_BYTES, IPC_FRAME_MAX_BYTES, IPC_REQUEST_TIMEOUT, LOG_CAPACITY,
@@ -1084,6 +1084,9 @@ fn application_error(error: &IpcError) -> ApplicationError {
         return protocol_error("The IPC response error code is unknown");
     };
     let mut result = ApplicationError::new(code, error.message.clone(), error.retryable);
+    if let Some(details) = decode_runtime_apply_failure(error.details.as_ref()) {
+        result = result.with_details(details);
+    }
     if let Some(application_candidate_ids) = error
         .details
         .as_ref()
@@ -1117,6 +1120,53 @@ fn decode_candidate_ids(value: &serde_json::Value) -> Option<Vec<String>> {
         .iter()
         .map(|value| value.as_str().map(str::to_owned))
         .collect()
+}
+
+fn decode_runtime_apply_failure(
+    details: Option<&serde_json::Value>,
+) -> Option<ApplicationErrorDetails> {
+    let details = details?.as_object()?;
+    let stage = RuntimeApplyFailureStage::parse(details.get("stage")?.as_str()?)?;
+    let candidate_generation = decode_optional_generation(details.get("candidate_generation"))?;
+    let committed_generation = decode_optional_generation(details.get("committed_generation"))?;
+    let recovery = details.get("recovery")?.as_object()?;
+    let status = match recovery.get("status")?.as_str()? {
+        "not_required" => RecoveryStatus::NotRequired,
+        "succeeded" => RecoveryStatus::Succeeded,
+        "failed" => RecoveryStatus::Failed,
+        _ => return None,
+    };
+    let restored_generation = decode_optional_generation(recovery.get("restored_generation"))?;
+    let message = match recovery.get("message") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(message) => Some(message.as_str()?.to_owned()),
+    };
+    Some(ApplicationErrorDetails::RuntimeApplyFailure(Box::new(
+        RuntimeApplyFailureDetails {
+            candidate_generation,
+            committed_generation,
+            stage,
+            recovery: RecoveryOutcome {
+                status,
+                restored_generation,
+                message,
+            },
+        },
+    )))
+}
+
+fn decode_optional_generation(
+    value: Option<&serde_json::Value>,
+) -> Option<Option<RuntimeGeneration>> {
+    match value {
+        None | Some(serde_json::Value::Null) => Some(None),
+        Some(value) => value
+            .as_str()?
+            .parse::<u64>()
+            .ok()
+            .map(RuntimeGeneration)
+            .map(Some),
+    }
 }
 
 fn decode_selector_candidates(
@@ -1153,6 +1203,9 @@ fn parse_error_code(code: &str) -> Option<ErrorCode> {
         "profile_ambiguous" => ErrorCode::ProfileAmbiguous,
         "profile_active" => ErrorCode::ProfileActive,
         "profile_not_found" => ErrorCode::ProfileNotFound,
+        "proxy_group_not_found" => ErrorCode::ProxyGroupNotFound,
+        "node_not_found" => ErrorCode::NodeNotFound,
+        "node_ambiguous" => ErrorCode::NodeAmbiguous,
         "invalid_subscription_url" => ErrorCode::InvalidSubscriptionUrl,
         "rules_uninitialized" => ErrorCode::RulesUninitialized,
         "rule_busy" => ErrorCode::RuleBusy,
@@ -1833,58 +1886,7 @@ fn write_response(stream: &mut DeadlineUnixStream, response: &IpcResponse) {
 }
 
 fn wire_error(error: ApplicationError) -> IpcError {
-    let mut details = serde_json::Map::new();
-    if let Some(ApplicationErrorDetails::CandidateIds { candidate_ids }) = error.details {
-        details.insert(
-            "candidate_ids".to_owned(),
-            serde_json::json!(&candidate_ids),
-        );
-        details.insert(
-            "application_candidate_ids".to_owned(),
-            serde_json::json!(candidate_ids),
-        );
-    }
-    if let Some(selector_candidates) = error.selector_candidates {
-        details
-            .entry("candidate_ids".to_owned())
-            .or_insert_with(|| {
-                serde_json::json!(
-                    selector_candidates
-                        .candidates
-                        .iter()
-                        .map(|candidate| &candidate.id)
-                        .collect::<Vec<_>>()
-                )
-            });
-        details.insert(
-            "selector".to_owned(),
-            serde_json::json!(match selector_candidates.selector {
-                SelectorKind::Profile => "profile",
-                SelectorKind::ProxyGroup => "proxy_group",
-                SelectorKind::Node => "node",
-                SelectorKind::Rule => "rule",
-            }),
-        );
-        details.insert(
-            "candidates".to_owned(),
-            serde_json::json!(
-                selector_candidates
-                    .candidates
-                    .iter()
-                    .map(|candidate| serde_json::json!({
-                        "id": candidate.id,
-                        "name": candidate.name,
-                    }))
-                    .collect::<Vec<_>>()
-            ),
-        );
-    }
-    let ipc_error = IpcError::new(error.code, error.message, error.retryable);
-    if details.is_empty() {
-        ipc_error
-    } else {
-        ipc_error.with_details(serde_json::Value::Object(details))
-    }
+    error.into()
 }
 
 fn conversion_error(error: OperationConversionError) -> IpcError {

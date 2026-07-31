@@ -10,9 +10,47 @@ use serde::Serialize;
 use std::fmt::Write as _;
 use std::io::{self, Write};
 
+pub trait ForegroundRunner {
+    fn run_status_interface(&self, stderr: &mut dyn Write) -> ProcessExitCode;
+
+    fn follow_logs(
+        &self,
+        output: OutputMode,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> ProcessExitCode;
+}
+
+struct UnavailableForeground;
+
+impl ForegroundRunner for UnavailableForeground {
+    fn run_status_interface(&self, stderr: &mut dyn Write) -> ProcessExitCode {
+        write_application_error(supervisor_unavailable(), OutputMode::Human, stderr)
+    }
+
+    fn follow_logs(
+        &self,
+        output: OutputMode,
+        _stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> ProcessExitCode {
+        write_application_error(supervisor_unavailable(), output, stderr)
+    }
+}
+
 pub fn run_invocation(
     invocation: Invocation,
     client: &dyn ApplicationClient,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> ProcessExitCode {
+    run_invocation_with_frontend(invocation, client, &UnavailableForeground, stdout, stderr)
+}
+
+pub fn run_invocation_with_frontend(
+    invocation: Invocation,
+    client: &dyn ApplicationClient,
+    foreground: &dyn ForegroundRunner,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> ProcessExitCode {
@@ -37,12 +75,8 @@ pub fn run_invocation(
                 ProcessExitCode::Success
             }
         }
-        Invocation::LaunchStatusInterface => {
-            write_application_error(supervisor_unavailable(), OutputMode::Human, stderr)
-        }
-        Invocation::FollowLogs { output } => {
-            write_application_error(supervisor_unavailable(), output, stderr)
-        }
+        Invocation::LaunchStatusInterface => foreground.run_status_interface(stderr),
+        Invocation::FollowLogs { output } => foreground.follow_logs(output, stdout, stderr),
     }
 }
 
@@ -532,18 +566,48 @@ fn write_human_application_error(
                 return ProcessExitCode::InternalFailure;
             }
         }
-    } else if let Some(ApplicationErrorDetails::CandidateIds { candidate_ids }) = error.details {
-        if writeln!(stderr, "Candidate profile IDs:").is_err() {
-            return ProcessExitCode::InternalFailure;
-        }
-        for candidate_id in candidate_ids {
-            if writeln!(stderr, "- {}", terminal_safe(&candidate_id)).is_err() {
-                return ProcessExitCode::InternalFailure;
+    } else if let Some(details) = error.details {
+        match details {
+            ApplicationErrorDetails::CandidateIds { candidate_ids } => {
+                if writeln!(stderr, "Candidate profile IDs:").is_err() {
+                    return ProcessExitCode::InternalFailure;
+                }
+                for candidate_id in candidate_ids {
+                    if writeln!(stderr, "- {}", terminal_safe(&candidate_id)).is_err() {
+                        return ProcessExitCode::InternalFailure;
+                    }
+                }
+            }
+            ApplicationErrorDetails::RuntimeApplyFailure(details) => {
+                if writeln!(stderr, "Runtime Apply Stage: {}", details.stage.as_str()).is_err()
+                    || writeln!(
+                        stderr,
+                        "Candidate Generation: {}",
+                        optional_generation(details.candidate_generation)
+                    )
+                    .is_err()
+                    || writeln!(
+                        stderr,
+                        "Committed Generation: {}",
+                        optional_generation(details.committed_generation)
+                    )
+                    .is_err()
+                    || write_recovery(&details.recovery, stderr).is_err()
+                {
+                    return ProcessExitCode::InternalFailure;
+                }
             }
         }
     }
 
     exit
+}
+
+fn optional_generation(generation: Option<crate::domain::RuntimeGeneration>) -> String {
+    match generation {
+        Some(generation) => generation.0.to_string(),
+        None => "none".to_owned(),
+    }
 }
 
 fn terminal_safe(value: &str) -> String {

@@ -9,6 +9,9 @@ pub enum ErrorCode {
     ProfileAmbiguous,
     ProfileActive,
     ProfileNotFound,
+    ProxyGroupNotFound,
+    NodeNotFound,
+    NodeAmbiguous,
     InvalidSubscriptionUrl,
     RulesUninitialized,
     RuleBusy,
@@ -34,6 +37,9 @@ impl ErrorCode {
             Self::ProfileAmbiguous
             | Self::ProfileActive
             | Self::ProfileNotFound
+            | Self::ProxyGroupNotFound
+            | Self::NodeNotFound
+            | Self::NodeAmbiguous
             | Self::RulesUninitialized
             | Self::RuleBusy
             | Self::RuleNotFound

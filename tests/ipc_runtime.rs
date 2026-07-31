@@ -9,15 +9,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hopash::application::{
-    ApplicationClient, ApplicationError, ApplicationOperation, ApplicationOutput,
-    ApplicationService, LatencyFreshness, LatencyListOutcome, LatencyProbeStatus,
-    LatencyShowOutcome, LatencySummary, LifecycleAction, LifecycleOutcome, LogGap, LogMetadata,
-    PolicyTargetValidation, ProfileListOutcome, ProfileMutationAction, ProfileMutationOutcome,
-    ProfileRefreshState, ProfileSummary, ProxyAvailability, ProxyGroupSummary, ProxyListOutcome,
-    ProxyMemberKind, ProxyNodeRow, ProxyNodeSource, ProxySelectionOutcome, RecoveryOutcome,
-    RecoveryStatus, RuleListOutcome, RuleMutationAction, RuleMutationOutcome, RulePlacement,
-    RuleSummary, RuntimeApplyOutcome, RuntimeApplyStatus, SelectorCandidate, SelectorIdentity,
-    SelectorKind,
+    ApplicationClient, ApplicationError, ApplicationErrorDetails, ApplicationOperation,
+    ApplicationOutput, ApplicationService, LatencyFreshness, LatencyListOutcome,
+    LatencyProbeStatus, LatencyShowOutcome, LatencySummary, LifecycleAction, LifecycleOutcome,
+    LogGap, LogMetadata, PolicyTargetValidation, ProfileListOutcome, ProfileMutationAction,
+    ProfileMutationOutcome, ProfileRefreshState, ProfileSummary, ProxyAvailability,
+    ProxyGroupSummary, ProxyListOutcome, ProxyMemberKind, ProxyNodeRow, ProxyNodeSource,
+    ProxySelectionOutcome, RecoveryOutcome, RecoveryStatus, RuleListOutcome, RuleMutationAction,
+    RuleMutationOutcome, RulePlacement, RuleSummary, RuntimeApplyFailureStage, RuntimeApplyOutcome,
+    RuntimeApplyStatus, SelectorCandidate, SelectorIdentity, SelectorKind,
 };
 use hopash::constants::IPC_FRAME_MAX_BYTES;
 use hopash::domain::{
@@ -300,6 +300,42 @@ fn structured_application_errors_preserve_selector_candidates() {
     let error = IpcClient::new(socket.path())
         .execute(ApplicationOperation::ProfileList)
         .expect_err("application error should cross the transport");
+    assert_eq!(error, source_error);
+
+    server.shutdown().expect("server should stop cleanly");
+}
+
+#[test]
+fn runtime_apply_failure_details_round_trip_over_ipc() {
+    let socket = TempSocket::new("runtime-apply-error");
+    let source_error = ApplicationError::new(
+        ErrorCode::ExternalOperationFailed,
+        "Runtime Apply failed and the committed configuration was retained",
+        false,
+    )
+    .with_details(ApplicationErrorDetails::RuntimeApplyFailure(Box::new(
+        hopash::application::RuntimeApplyFailureDetails {
+            candidate_generation: Some(RuntimeGeneration(9)),
+            committed_generation: Some(RuntimeGeneration(8)),
+            stage: RuntimeApplyFailureStage::Health,
+            recovery: RecoveryOutcome {
+                status: RecoveryStatus::Failed,
+                restored_generation: Some(RuntimeGeneration(8)),
+                message: Some("Committed state recovery failed".to_owned()),
+            },
+        },
+    )));
+    let mut server = IpcServer::start(
+        socket.path(),
+        Arc::new(QueuedClient::new(vec![Err(source_error.clone())])),
+        Arc::new(AllowPeer),
+        test_server_config(),
+    )
+    .expect("server should start");
+
+    let error = IpcClient::new(socket.path())
+        .execute(ApplicationOperation::RuleList)
+        .expect_err("Runtime Apply details should cross the transport");
     assert_eq!(error, source_error);
 
     server.shutdown().expect("server should stop cleanly");

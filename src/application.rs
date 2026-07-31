@@ -417,6 +417,67 @@ pub struct RuntimeApplyOutcome {
     pub recovery: RecoveryOutcome,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeApplyFailureStage {
+    State,
+    Bundle,
+    Lock,
+    RecoveryRequired,
+    StaleCandidate,
+    InvalidCandidate,
+    Validation,
+    Prepare,
+    Apply,
+    IndeterminateApply,
+    Health,
+    Commit,
+    Cleanup,
+    Recovery,
+}
+
+impl RuntimeApplyFailureStage {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::State => "state",
+            Self::Bundle => "bundle",
+            Self::Lock => "lock",
+            Self::RecoveryRequired => "recovery_required",
+            Self::StaleCandidate => "stale_candidate",
+            Self::InvalidCandidate => "invalid_candidate",
+            Self::Validation => "validation",
+            Self::Prepare => "prepare",
+            Self::Apply => "apply",
+            Self::IndeterminateApply => "indeterminate_apply",
+            Self::Health => "health",
+            Self::Commit => "commit",
+            Self::Cleanup => "cleanup",
+            Self::Recovery => "recovery",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "state" => Self::State,
+            "bundle" => Self::Bundle,
+            "lock" => Self::Lock,
+            "recovery_required" => Self::RecoveryRequired,
+            "stale_candidate" => Self::StaleCandidate,
+            "invalid_candidate" => Self::InvalidCandidate,
+            "validation" => Self::Validation,
+            "prepare" => Self::Prepare,
+            "apply" => Self::Apply,
+            "indeterminate_apply" => Self::IndeterminateApply,
+            "health" => Self::Health,
+            "commit" => Self::Commit,
+            "cleanup" => Self::Cleanup,
+            "recovery" => Self::Recovery,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogGap {
     pub requested_after_sequence: u64,
@@ -511,6 +572,15 @@ impl fmt::Debug for ApplicationError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApplicationErrorDetails {
     CandidateIds { candidate_ids: Vec<String> },
+    RuntimeApplyFailure(Box<RuntimeApplyFailureDetails>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeApplyFailureDetails {
+    pub candidate_generation: Option<RuntimeGeneration>,
+    pub committed_generation: Option<RuntimeGeneration>,
+    pub stage: RuntimeApplyFailureStage,
+    pub recovery: RecoveryOutcome,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

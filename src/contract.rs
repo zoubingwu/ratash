@@ -70,8 +70,38 @@ impl ApiError {
 impl From<ApplicationError> for ApiError {
     fn from(error: ApplicationError) -> Self {
         let mut details = serde_json::Map::new();
-        if let Some(ApplicationErrorDetails::CandidateIds { candidate_ids }) = error.details {
-            details.insert("candidate_ids".to_owned(), serde_json::json!(candidate_ids));
+        if let Some(application_details) = error.details {
+            match application_details {
+                ApplicationErrorDetails::CandidateIds { candidate_ids } => {
+                    details.insert("candidate_ids".to_owned(), serde_json::json!(candidate_ids));
+                }
+                ApplicationErrorDetails::RuntimeApplyFailure(runtime_failure) => {
+                    let application::RuntimeApplyFailureDetails {
+                        candidate_generation,
+                        committed_generation,
+                        stage,
+                        recovery,
+                    } = *runtime_failure;
+                    details.insert(
+                        "candidate_generation".to_owned(),
+                        serde_json::json!(
+                            candidate_generation.map(|generation| generation.0.to_string())
+                        ),
+                    );
+                    details.insert(
+                        "committed_generation".to_owned(),
+                        serde_json::json!(
+                            committed_generation.map(|generation| generation.0.to_string())
+                        ),
+                    );
+                    details.insert("stage".to_owned(), serde_json::json!(stage.as_str()));
+                    details.insert(
+                        "recovery".to_owned(),
+                        serde_json::to_value(RecoveryViewV1::from(recovery))
+                            .expect("RecoveryViewV1 is serializable"),
+                    );
+                }
+            }
         }
         if let Some(selector_details) = error.selector_candidates {
             let candidates = selector_details

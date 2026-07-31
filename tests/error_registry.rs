@@ -14,6 +14,13 @@ fn public_error_codes_map_to_stable_process_exit_classes() {
         ),
         (ErrorCode::ProfileAmbiguous, ProcessExitCode::DomainConflict),
         (ErrorCode::ProfileActive, ProcessExitCode::DomainConflict),
+        (ErrorCode::ProfileNotFound, ProcessExitCode::DomainConflict),
+        (
+            ErrorCode::ProxyGroupNotFound,
+            ProcessExitCode::DomainConflict,
+        ),
+        (ErrorCode::NodeNotFound, ProcessExitCode::DomainConflict),
+        (ErrorCode::NodeAmbiguous, ProcessExitCode::DomainConflict),
         (
             ErrorCode::RulesUninitialized,
             ProcessExitCode::DomainConflict,

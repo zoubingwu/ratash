@@ -432,6 +432,13 @@ impl SupervisorTransactionPort for PersistingTransactions {
                     hopash::transaction::ConfigTransactionErrorKind::Apply,
                 ),
             );
+            failure.candidate_generation = Some(request.generation);
+            failure.committed_generation = request
+                .generation
+                .0
+                .checked_sub(1)
+                .filter(|generation| *generation > 0)
+                .map(RuntimeGeneration);
             failure.recovery = self
                 .next_failure_recovery
                 .lock()
@@ -921,6 +928,23 @@ fn failed_first_profile_apply_preserves_the_zero_profile_state() {
     assert_eq!(
         error.code,
         hopash::error::ErrorCode::ExternalOperationFailed
+    );
+    assert_eq!(
+        error.details,
+        Some(
+            hopash::application::ApplicationErrorDetails::RuntimeApplyFailure(Box::new(
+                hopash::application::RuntimeApplyFailureDetails {
+                    candidate_generation: Some(RuntimeGeneration(1)),
+                    committed_generation: None,
+                    stage: hopash::application::RuntimeApplyFailureStage::Apply,
+                    recovery: hopash::application::RecoveryOutcome {
+                        status: hopash::application::RecoveryStatus::NotRequired,
+                        restored_generation: None,
+                        message: None,
+                    },
+                },
+            ))
+        )
     );
 
     let ApplicationOutput::Profiles(profiles) = supervisor
@@ -1431,11 +1455,37 @@ fn latency_show_prefers_opaque_id_and_reports_name_ambiguity() {
             node: "shared".to_owned(),
         })
         .expect_err("the duplicate Node name should be ambiguous");
+    assert_eq!(error.code, hopash::error::ErrorCode::NodeAmbiguous);
     let candidates = error
         .selector_candidates
         .expect("Node ambiguity should include candidates");
     assert_eq!(candidates.selector, hopash::application::SelectorKind::Node);
     assert_eq!(candidates.candidates.len(), 2);
+}
+
+#[test]
+fn proxy_group_and_node_misses_have_selector_specific_codes() {
+    let harness = Harness::new("selector-specific-misses");
+    harness.queue_profile("Primary", "node-a");
+    let supervisor = harness.open();
+    add_profile(&supervisor, "https://example.test/primary.yaml");
+
+    let group_error = supervisor
+        .execute(ApplicationOperation::ProxyList {
+            group: "Missing Group".to_owned(),
+        })
+        .expect_err("the missing Proxy Group should fail");
+    assert_eq!(
+        group_error.code,
+        hopash::error::ErrorCode::ProxyGroupNotFound
+    );
+
+    let node_error = supervisor
+        .execute(ApplicationOperation::LatencyShow {
+            node: "missing-node".to_owned(),
+        })
+        .expect_err("the missing Node should fail");
+    assert_eq!(node_error.code, hopash::error::ErrorCode::NodeNotFound);
 }
 
 #[test]

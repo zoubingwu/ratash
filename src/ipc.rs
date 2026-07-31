@@ -450,16 +450,12 @@ impl IpcError {
 
 impl From<ApplicationError> for IpcError {
     fn from(error: ApplicationError) -> Self {
-        let details = error.details.map(|details| match details {
-            crate::application::ApplicationErrorDetails::CandidateIds { candidate_ids } => {
-                serde_json::json!({ "candidate_ids": candidate_ids })
-            }
-        });
+        let error = crate::contract::ApiError::from(error);
         Self {
             code: error_code_name(error.code).to_owned(),
             message: error.message,
             retryable: error.retryable,
-            details,
+            details: error.details,
         }
     }
 }
@@ -484,6 +480,9 @@ fn error_code_name(code: ErrorCode) -> &'static str {
         ErrorCode::ProfileAmbiguous => "profile_ambiguous",
         ErrorCode::ProfileActive => "profile_active",
         ErrorCode::ProfileNotFound => "profile_not_found",
+        ErrorCode::ProxyGroupNotFound => "proxy_group_not_found",
+        ErrorCode::NodeNotFound => "node_not_found",
+        ErrorCode::NodeAmbiguous => "node_ambiguous",
         ErrorCode::InvalidSubscriptionUrl => "invalid_subscription_url",
         ErrorCode::RulesUninitialized => "rules_uninitialized",
         ErrorCode::RuleBusy => "rule_busy",

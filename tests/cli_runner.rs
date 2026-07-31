@@ -3,11 +3,14 @@ use hopash::application::{
     ApplicationOutput, ApplicationService, ProfileListOutcome, ProfileRefreshState, ProfileSummary,
     SelectorCandidate, SelectorKind,
 };
-use hopash::cli::{Invocation, OutputMode, run_invocation};
+use hopash::cli::{
+    ForegroundRunner, Invocation, OutputMode, run_invocation, run_invocation_with_frontend,
+};
 use hopash::contract::ProcessExitCode;
 use hopash::domain::{ProfileId, SubscriptionUrl};
 use hopash::error::ErrorCode;
 use std::cell::RefCell;
+use std::io::Write;
 
 struct RecordingClient {
     calls: RefCell<Vec<ApplicationOperation>>,
@@ -22,6 +25,70 @@ impl ApplicationClient for RecordingClient {
         self.calls.borrow_mut().push(operation);
         self.result.clone()
     }
+}
+
+#[derive(Default)]
+struct RecordingForeground {
+    status_calls: RefCell<usize>,
+    log_formats: RefCell<Vec<OutputMode>>,
+}
+
+impl ForegroundRunner for RecordingForeground {
+    fn run_status_interface(&self, stderr: &mut dyn Write) -> ProcessExitCode {
+        *self.status_calls.borrow_mut() += 1;
+        writeln!(stderr, "status interface").expect("fixture output should succeed");
+        ProcessExitCode::Success
+    }
+
+    fn follow_logs(
+        &self,
+        output: OutputMode,
+        stdout: &mut dyn Write,
+        _stderr: &mut dyn Write,
+    ) -> ProcessExitCode {
+        self.log_formats.borrow_mut().push(output);
+        writeln!(stdout, "log stream").expect("fixture output should succeed");
+        ProcessExitCode::Interrupted
+    }
+}
+
+#[test]
+fn foreground_status_and_logs_are_dispatched_to_the_injected_runner() {
+    let client = RecordingClient {
+        calls: RefCell::new(Vec::new()),
+        result: Ok(ApplicationOutput::Status(
+            ApplicationService::new().status(),
+        )),
+    };
+    let foreground = RecordingForeground::default();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let status_exit = run_invocation_with_frontend(
+        Invocation::LaunchStatusInterface,
+        &client,
+        &foreground,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(status_exit, ProcessExitCode::Success);
+    assert_eq!(*foreground.status_calls.borrow(), 1);
+    assert_eq!(stderr, b"status interface\n");
+
+    stderr.clear();
+    let logs_exit = run_invocation_with_frontend(
+        Invocation::FollowLogs {
+            output: OutputMode::Json,
+        },
+        &client,
+        &foreground,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(logs_exit, ProcessExitCode::Interrupted);
+    assert_eq!(foreground.log_formats.into_inner(), vec![OutputMode::Json]);
+    assert_eq!(stdout, b"log stream\n");
+    assert!(client.calls.into_inner().is_empty());
 }
 
 #[test]
@@ -113,6 +180,78 @@ fn application_error_details_reach_the_json_contract() {
         value["error"]["details"],
         serde_json::json!({ "candidate_ids": ["profile-a", "profile-b"] })
     );
+}
+
+#[test]
+fn runtime_apply_failures_expose_stage_generations_and_recovery() {
+    let error = ApplicationError::new(
+        ErrorCode::ExternalOperationFailed,
+        "Runtime Apply failed and the committed configuration was retained",
+        false,
+    )
+    .with_details(ApplicationErrorDetails::RuntimeApplyFailure(Box::new(
+        hopash::application::RuntimeApplyFailureDetails {
+            candidate_generation: Some(hopash::domain::RuntimeGeneration(12)),
+            committed_generation: Some(hopash::domain::RuntimeGeneration(11)),
+            stage: hopash::application::RuntimeApplyFailureStage::IndeterminateApply,
+            recovery: hopash::application::RecoveryOutcome {
+                status: hopash::application::RecoveryStatus::Succeeded,
+                restored_generation: Some(hopash::domain::RuntimeGeneration(11)),
+                message: Some("The committed Runtime Generation was confirmed".to_owned()),
+            },
+        },
+    )));
+
+    let json_client = RecordingClient {
+        calls: RefCell::new(Vec::new()),
+        result: Err(error.clone()),
+    };
+    let mut json_stdout = Vec::new();
+    let mut json_stderr = Vec::new();
+    let json_exit = run_invocation(
+        Invocation::Application {
+            operation: ApplicationOperation::RuleList,
+            output: OutputMode::Json,
+        },
+        &json_client,
+        &mut json_stdout,
+        &mut json_stderr,
+    );
+
+    assert_eq!(json_exit, ProcessExitCode::ExternalOperationFailure);
+    assert!(json_stdout.is_empty());
+    let value: serde_json::Value =
+        serde_json::from_slice(&json_stderr).expect("stderr should contain one JSON document");
+    let details = &value["error"]["details"];
+    assert_eq!(details["stage"], "indeterminate_apply");
+    assert_eq!(details["candidate_generation"], "12");
+    assert_eq!(details["committed_generation"], "11");
+    assert_eq!(details["recovery"]["status"], "succeeded");
+    assert_eq!(details["recovery"]["restored_generation"], "11");
+
+    let human_client = RecordingClient {
+        calls: RefCell::new(Vec::new()),
+        result: Err(error),
+    };
+    let mut human_stdout = Vec::new();
+    let mut human_stderr = Vec::new();
+    let human_exit = run_invocation(
+        Invocation::Application {
+            operation: ApplicationOperation::RuleList,
+            output: OutputMode::Human,
+        },
+        &human_client,
+        &mut human_stdout,
+        &mut human_stderr,
+    );
+
+    assert_eq!(human_exit, ProcessExitCode::ExternalOperationFailure);
+    assert!(human_stdout.is_empty());
+    let diagnostic = String::from_utf8(human_stderr).expect("diagnostic should be UTF-8");
+    assert!(diagnostic.contains("Runtime Apply Stage: indeterminate_apply"));
+    assert!(diagnostic.contains("Candidate Generation: 12"));
+    assert!(diagnostic.contains("Committed Generation: 11"));
+    assert!(diagnostic.contains("Recovery: succeeded"));
 }
 
 #[test]
