@@ -23,7 +23,9 @@ fn get_status_operation_returns_the_same_application_snapshot() {
         .execute(ApplicationOperation::GetStatus)
         .expect("status should be available from a new application");
 
-    let ApplicationOutput::Status(status) = output;
+    let ApplicationOutput::Status(status) = output else {
+        panic!("status operation should return a status output");
+    };
     assert_eq!(status.supervisor.lifecycle, SupervisorLifecycle::Ready);
     assert_eq!(status.core.lifecycle, CoreLifecycle::Unconfigured);
 }

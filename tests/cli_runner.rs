@@ -1,9 +1,11 @@
 use hopash::application::{
     ApplicationClient, ApplicationError, ApplicationErrorDetails, ApplicationOperation,
-    ApplicationOutput, ApplicationService,
+    ApplicationOutput, ApplicationService, ProfileListOutcome, ProfileRefreshState, ProfileSummary,
+    SelectorCandidate, SelectorKind,
 };
 use hopash::cli::{Invocation, OutputMode, run_invocation};
 use hopash::contract::ProcessExitCode;
+use hopash::domain::{ProfileId, SubscriptionUrl};
 use hopash::error::ErrorCode;
 use std::cell::RefCell;
 
@@ -144,4 +146,120 @@ fn profile_candidates_reach_human_diagnostics() {
     assert!(diagnostic.contains("Candidate profile IDs:"));
     assert!(diagnostic.contains("profile-a"));
     assert!(diagnostic.contains("profile-b"));
+}
+
+#[test]
+fn typed_selector_candidates_reach_json_and_human_diagnostics() {
+    let error = ApplicationError::new(
+        ErrorCode::ProfileAmbiguous,
+        "Profile name is ambiguous",
+        false,
+    )
+    .with_selector_candidates(
+        SelectorKind::Profile,
+        vec![
+            SelectorCandidate::new("profile-a", "Shared"),
+            SelectorCandidate::new("profile-b", "Shared"),
+        ],
+    );
+
+    let json_client = RecordingClient {
+        calls: RefCell::new(Vec::new()),
+        result: Err(error.clone()),
+    };
+    let mut json_stdout = Vec::new();
+    let mut json_stderr = Vec::new();
+    let json_exit = run_invocation(
+        Invocation::Application {
+            operation: ApplicationOperation::ProfileUse {
+                profile: "Shared".to_owned(),
+            },
+            output: OutputMode::Json,
+        },
+        &json_client,
+        &mut json_stdout,
+        &mut json_stderr,
+    );
+
+    assert_eq!(json_exit, ProcessExitCode::DomainConflict);
+    assert!(json_stdout.is_empty());
+    let value: serde_json::Value =
+        serde_json::from_slice(&json_stderr).expect("stderr should contain one JSON document");
+    assert_eq!(value["error"]["details"]["selector"], "profile");
+    assert_eq!(
+        value["error"]["details"]["candidate_ids"],
+        serde_json::json!(["profile-a", "profile-b"])
+    );
+    assert_eq!(
+        value["error"]["details"]["candidates"][0],
+        serde_json::json!({"id": "profile-a", "name": "Shared"})
+    );
+
+    let human_client = RecordingClient {
+        calls: RefCell::new(Vec::new()),
+        result: Err(error),
+    };
+    let mut human_stdout = Vec::new();
+    let mut human_stderr = Vec::new();
+    let human_exit = run_invocation(
+        Invocation::Application {
+            operation: ApplicationOperation::ProfileUse {
+                profile: "Shared".to_owned(),
+            },
+            output: OutputMode::Human,
+        },
+        &human_client,
+        &mut human_stdout,
+        &mut human_stderr,
+    );
+
+    assert_eq!(human_exit, ProcessExitCode::DomainConflict);
+    assert!(human_stdout.is_empty());
+    let diagnostic = String::from_utf8(human_stderr).expect("diagnostic should be UTF-8");
+    assert!(diagnostic.contains("Profile candidates:"));
+    assert!(diagnostic.contains("Shared (profile-a)"));
+}
+
+#[test]
+fn human_profile_output_redacts_urls_and_escapes_terminal_controls() {
+    let client = RecordingClient {
+        calls: RefCell::new(Vec::new()),
+        result: Ok(ApplicationOutput::Profiles(ProfileListOutcome {
+            profiles: vec![ProfileSummary {
+                id: ProfileId::parse("550e8400-e29b-41d4-a716-446655440000")
+                    .expect("fixture Profile ID should parse"),
+                name: "Primary\u{1b}[31m\nInjected".to_owned(),
+                subscription_url: SubscriptionUrl::parse(
+                    "https://user:password@example.com/subscription-secret.yaml?token=value",
+                )
+                .expect("fixture Subscription URL should parse"),
+                active: true,
+                refresh_state: ProfileRefreshState::Fresh,
+                last_success_at_unix_ms: 1_700_000_000_000,
+                next_refresh_at_unix_ms: 1_700_021_600_000,
+                last_error: None,
+            }],
+        })),
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let exit = run_invocation(
+        Invocation::Application {
+            operation: ApplicationOperation::ProfileList,
+            output: OutputMode::Human,
+        },
+        &client,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(exit, ProcessExitCode::Success);
+    assert!(stderr.is_empty());
+    let output = String::from_utf8(stdout).expect("output should be UTF-8");
+    assert!(!output.contains('\u{1b}'));
+    assert!(output.contains("Primary\\u{1b}[31m\\nInjected"));
+    assert!(!output.contains("subscription-secret"));
+    assert!(!output.contains("password"));
+    assert!(output.contains("[redacted]"));
 }

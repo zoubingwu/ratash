@@ -1,9 +1,10 @@
 use crate::domain::{
-    ApplyState, CoreLifecycle, CoreStatus, SampleState, StatusSnapshot, StreamHealthSet,
-    StreamState, SubscriptionUrl, SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason,
-    TunStatus,
+    ApplyState, CoreLifecycle, CoreStatus, LocalRuleSetRevision, NodeRecordId, ProbeGeneration,
+    ProfileId, RuntimeGeneration, SampleState, StatusSnapshot, StreamHealthSet, StreamState,
+    SubscriptionUrl, SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason, TunStatus,
 };
 use crate::error::ErrorCode;
+use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -176,17 +177,284 @@ pub enum RulePlacement {
     After(String),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ApplicationOutput {
-    Status(StatusSnapshot),
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LifecycleAction {
+    Start,
+    Stop,
+    Restart,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LifecycleOutcome {
+    pub action: LifecycleAction,
+    pub changed: bool,
+    pub status: StatusSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProfileRefreshState {
+    Fresh,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProfileRefreshStage {
+    Download,
+    Parse,
+    Validate,
+    Apply,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProfileRefreshFailure {
+    pub stage: ProfileRefreshStage,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProfileSummary {
+    pub id: ProfileId,
+    pub name: String,
+    pub subscription_url: SubscriptionUrl,
+    pub active: bool,
+    pub refresh_state: ProfileRefreshState,
+    pub last_success_at_unix_ms: u64,
+    pub next_refresh_at_unix_ms: u64,
+    pub last_error: Option<ProfileRefreshFailure>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProfileListOutcome {
+    pub profiles: Vec<ProfileSummary>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProfileMutationAction {
+    Added,
+    Activated,
+    Removed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProfileMutationOutcome {
+    pub action: ProfileMutationAction,
+    pub profile: ProfileSummary,
+    pub runtime_apply: Option<RuntimeApplyOutcome>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProxyAvailability {
+    Available,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProxyMemberKind {
+    Node,
+    Group,
+    Missing,
+    Ambiguous,
+    ProviderUnavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProxyNodeSource {
+    Core,
+    Provider { provider_name: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProxyNodeRow {
+    pub id: Option<NodeRecordId>,
+    pub name: String,
+    pub member_kind: ProxyMemberKind,
+    pub source: Option<ProxyNodeSource>,
+    pub candidate_ids: Vec<NodeRecordId>,
+    pub proxy_type: Option<String>,
+    pub availability: ProxyAvailability,
+    pub selected: bool,
+    pub delay_ms: Option<u64>,
+    pub sampled_at_unix_ms: Option<u64>,
+    pub freshness: LatencyFreshness,
+    pub probe_status: LatencyProbeStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProxyGroupSummary {
+    pub name: String,
+    pub proxy_type: String,
+    pub selectable: bool,
+    pub selected_node: Option<SelectorIdentity>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProxyListOutcome {
+    pub group: ProxyGroupSummary,
+    pub nodes: Vec<ProxyNodeRow>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectorIdentity {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProxySelectionOutcome {
+    pub group: String,
+    pub previous_node: Option<SelectorIdentity>,
+    pub selected_node: SelectorIdentity,
+    pub persisted: bool,
+    pub recovery: RecoveryOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LatencyFreshness {
+    NotSampled,
+    Fresh,
+    Stale,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LatencyProbeStatus {
+    NotSampled,
+    Queued,
+    InFlight,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LatencySummary {
+    pub node_id: NodeRecordId,
+    pub node_name: String,
+    pub delay_ms: Option<u64>,
+    pub sampled_at_unix_ms: Option<u64>,
+    pub freshness: LatencyFreshness,
+    pub probe_status: LatencyProbeStatus,
+    pub probe_generation: ProbeGeneration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LatencyListOutcome {
+    pub samples: Vec<LatencySummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LatencyShowOutcome {
+    pub sample: LatencySummary,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PolicyTargetValidation {
+    Valid,
+    Missing,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuleSummary {
+    pub index: usize,
+    pub rule_string: String,
+    pub rule_type: String,
+    pub payload: Option<String>,
+    pub policy_target: String,
+    pub params: Vec<String>,
+    pub policy_target_validation: PolicyTargetValidation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuleListOutcome {
+    pub initialized: bool,
+    pub revision: Option<LocalRuleSetRevision>,
+    pub rules: Vec<RuleSummary>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuleMutationAction {
+    Added,
+    Replaced,
+    Removed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuleMutationOutcome {
+    pub action: RuleMutationAction,
+    pub changed_rule: String,
+    pub previous_rule: Option<String>,
+    pub resulting_position: Option<usize>,
+    pub runtime_apply: RuntimeApplyOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeApplyStatus {
+    NotRequired,
+    Applied,
+    Recovered,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryStatus {
+    NotRequired,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryOutcome {
+    pub status: RecoveryStatus,
+    pub restored_generation: Option<RuntimeGeneration>,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeApplyOutcome {
+    pub status: RuntimeApplyStatus,
+    pub candidate_generation: Option<RuntimeGeneration>,
+    pub committed_generation: Option<RuntimeGeneration>,
+    pub recovery: RecoveryOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogGap {
+    pub requested_after_sequence: u64,
+    pub first_available_sequence: u64,
+    pub dropped_count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogMetadata {
+    pub first_sequence: Option<u64>,
+    pub last_sequence: Option<u64>,
+    pub next_sequence: Option<u64>,
+    pub dropped_total: u64,
+    pub gap: Option<LogGap>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ApplicationOutput {
+    Status(StatusSnapshot),
+    Lifecycle(LifecycleOutcome),
+    Profiles(ProfileListOutcome),
+    ProfileMutation(ProfileMutationOutcome),
+    Proxies(ProxyListOutcome),
+    ProxySelection(ProxySelectionOutcome),
+    Latencies(LatencyListOutcome),
+    Latency(LatencyShowOutcome),
+    Rules(RuleListOutcome),
+    RuleMutation(RuleMutationOutcome),
+    LogMetadata(LogMetadata),
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub struct ApplicationError {
     pub code: ErrorCode,
     pub message: String,
     pub retryable: bool,
     pub details: Option<ApplicationErrorDetails>,
+    pub selector_candidates: Option<SelectorCandidateDetails>,
 }
 
 impl ApplicationError {
@@ -197,6 +465,7 @@ impl ApplicationError {
             message: message.into(),
             retryable,
             details: None,
+            selector_candidates: None,
         }
     }
 
@@ -205,9 +474,71 @@ impl ApplicationError {
         self.details = Some(details);
         self
     }
+
+    #[must_use]
+    pub fn with_selector_candidates(
+        mut self,
+        selector: SelectorKind,
+        candidates: Vec<SelectorCandidate>,
+    ) -> Self {
+        self.selector_candidates = Some(SelectorCandidateDetails {
+            selector,
+            candidates,
+        });
+        self
+    }
+}
+
+impl fmt::Debug for ApplicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApplicationError")
+            .field("code", &self.code)
+            .field("message_bytes", &self.message.len())
+            .field("retryable", &self.retryable)
+            .field("has_details", &self.details.is_some())
+            .field(
+                "selector_candidate_count",
+                &self
+                    .selector_candidates
+                    .as_ref()
+                    .map_or(0, |details| details.candidates.len()),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApplicationErrorDetails {
     CandidateIds { candidate_ids: Vec<String> },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectorKind {
+    Profile,
+    ProxyGroup,
+    Node,
+    Rule,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectorCandidate {
+    pub id: String,
+    pub name: String,
+}
+
+impl SelectorCandidate {
+    #[must_use]
+    pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectorCandidateDetails {
+    pub selector: SelectorKind,
+    pub candidates: Vec<SelectorCandidate>,
 }
