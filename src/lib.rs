@@ -19,4 +19,5 @@ pub mod scheduler;
 pub mod state;
 pub mod telemetry;
 pub mod transaction;
+pub mod tui;
 pub mod validator;
