@@ -64,10 +64,12 @@ fn overview_renders_probe_queue_overload_metrics() {
         estimated_full_pass_duration_ms: 30_000,
         stale_node_count: 4,
     };
+    status.selection_restore_pending = true;
 
     let (text, _) = render_with_backend(&state, 120, 32);
 
     assert!(text.contains("Probe Queue: overloaded"));
+    assert!(text.contains("Selection Restore: pending"));
     assert!(text.contains("queued 7, in-flight 2, stale 40.0%"));
     assert!(text.contains("oldest 12345 ms, full pass 30000 ms"));
 }
@@ -1255,6 +1257,7 @@ fn status_snapshot() -> StatusSnapshot {
         connection_count: 3,
         runtime_generation: Some(RuntimeGeneration(1)),
         apply_state: ApplyState::Idle,
+        selection_restore_pending: false,
         probe_queue: ProbeQueueStatus::default(),
         stream_health: StreamHealthSet {
             traffic: StreamState::Healthy,

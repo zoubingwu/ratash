@@ -62,6 +62,7 @@ fn zero_profile_status_serializes_the_complete_v1_contract() {
                 },
                 "connection_count": 0,
                 "apply_state": "idle",
+                "selection_restore_pending": false,
                 "probe_queue": {
                     "active_node_count": 0,
                     "queue_depth": 0,

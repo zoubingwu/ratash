@@ -1997,8 +1997,13 @@ fn render_overview(state: &AppState, area: Rect, buffer: &mut Buffer) {
             .probe_queue
             .oldest_due_age_ms
             .map_or_else(|| "-".to_owned(), |age| format!("{age} ms"));
+        let selection_restore = if status.selection_restore_pending {
+            "pending"
+        } else {
+            "settled"
+        };
         format!(
-            "Connection: {connection}\nSupervisor: {:?}\nCore: {:?}\nTUN: {}\nActive Profile: {}\nPrimary Group: {}\nCurrent Node: {}\nLatency: {delay}\nSampled At: {sampled_at}\nFreshness: {freshness}\nProbe: {probe_status} (generation {probe_generation})\nProbe Queue: {probe_queue_state}, queued {}, in-flight {}, stale {:.1}%\nProbe Window: oldest {oldest_due}, full pass {} ms\nConnections: {}\nUptime: {}s",
+            "Connection: {connection}\nSupervisor: {:?}\nCore: {:?}\nTUN: {}\nActive Profile: {}\nPrimary Group: {}\nCurrent Node: {}\nSelection Restore: {selection_restore}\nLatency: {delay}\nSampled At: {sampled_at}\nFreshness: {freshness}\nProbe: {probe_status} (generation {probe_generation})\nProbe Queue: {probe_queue_state}, queued {}, in-flight {}, stale {:.1}%\nProbe Window: oldest {oldest_due}, full pass {} ms\nConnections: {}\nUptime: {}s",
             status.supervisor.lifecycle,
             status.core.lifecycle,
             if status.tun.effective {

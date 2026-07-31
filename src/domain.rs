@@ -351,6 +351,7 @@ pub struct StatusSnapshot {
     pub connection_count: u64,
     pub runtime_generation: Option<RuntimeGeneration>,
     pub apply_state: ApplyState,
+    pub selection_restore_pending: bool,
     pub probe_queue: ProbeQueueStatus,
     pub stream_health: StreamHealthSet,
 }

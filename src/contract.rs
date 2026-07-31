@@ -872,6 +872,7 @@ pub struct StatusViewV1 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_generation: Option<String>,
     pub apply_state: ApplyStateViewV1,
+    pub selection_restore_pending: bool,
     pub probe_queue: ProbeQueueViewV1,
     pub stream_health: StreamHealthViewV1,
 }
@@ -892,6 +893,7 @@ impl From<StatusSnapshot> for StatusViewV1 {
                 .runtime_generation
                 .map(|generation| generation.0.to_string()),
             apply_state: snapshot.apply_state.into(),
+            selection_restore_pending: snapshot.selection_restore_pending,
             probe_queue: snapshot.probe_queue.into(),
             stream_health: snapshot.stream_health.into(),
         }

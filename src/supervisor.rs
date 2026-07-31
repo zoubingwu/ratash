@@ -1180,6 +1180,7 @@ impl Supervisor {
             connection_count,
             runtime_generation: state.runtime_generation,
             apply_state: self.current_apply_state(),
+            selection_restore_pending: state.selection_restore_pending,
             probe_queue,
             stream_health: state.stream_health.clone(),
         };
@@ -2780,6 +2781,7 @@ fn initial_status_snapshot(
         connection_count: 0,
         runtime_generation,
         apply_state: ApplyState::Idle,
+        selection_restore_pending: false,
         probe_queue: ProbeQueueStatus::default(),
         stream_health: disconnected_stream_health(),
     }

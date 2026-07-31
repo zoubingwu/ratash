@@ -357,6 +357,7 @@ fn stopped_status(
             connection_count: 0,
             runtime_generation: None,
             apply_state: ApplyState::Idle,
+            selection_restore_pending: false,
             probe_queue: crate::domain::ProbeQueueStatus::default(),
             stream_health: StreamHealthSet {
                 traffic: StreamState::Disconnected,

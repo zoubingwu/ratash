@@ -97,6 +97,7 @@ impl ApplicationService {
             connection_count: 0,
             runtime_generation: None,
             apply_state: ApplyState::Idle,
+            selection_restore_pending: false,
             probe_queue: ProbeQueueStatus::default(),
             stream_health: StreamHealthSet {
                 traffic: StreamState::Disconnected,

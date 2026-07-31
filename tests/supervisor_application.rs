@@ -1569,8 +1569,21 @@ fn unresolved_selection_restoration_has_a_fixed_retry_limit() {
     harness.core.applied(RuntimeGeneration(1));
     harness.core.state.lock().expect("the Core lock").view = fixture_proxy_view();
 
+    assert!(
+        !supervisor
+            .retry_selection_restore()
+            .expect("the first restore attempt should remain pending")
+    );
+    let ApplicationOutput::Status(pending_status) = supervisor
+        .execute(ApplicationOperation::GetStatus)
+        .expect("pending restoration status should remain available")
+    else {
+        panic!("status should return a Status output")
+    };
+    assert!(pending_status.selection_restore_pending);
+
     let mut complete = false;
-    for _ in 0..hopash::constants::SELECTION_RESTORE_ATTEMPT_LIMIT {
+    for _ in 1..hopash::constants::SELECTION_RESTORE_ATTEMPT_LIMIT {
         complete = supervisor
             .retry_selection_restore()
             .expect("a bounded restore attempt should complete");
@@ -1587,6 +1600,7 @@ fn unresolved_selection_restoration_has_a_fixed_retry_limit() {
         status.supervisor.lifecycle,
         hopash::domain::SupervisorLifecycle::Degraded
     );
+    assert!(!status.selection_restore_pending);
 }
 
 #[test]

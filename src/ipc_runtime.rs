@@ -3019,6 +3019,8 @@ struct WireStatusSnapshot {
     runtime_generation: Option<u64>,
     apply_state: WireApplyState,
     #[serde(default)]
+    selection_restore_pending: bool,
+    #[serde(default)]
     probe_queue: WireProbeQueueStatus,
     stream_health: WireStreamHealthSet,
 }
@@ -3037,6 +3039,7 @@ impl From<StatusSnapshot> for WireStatusSnapshot {
             connection_count: status.connection_count,
             runtime_generation: status.runtime_generation.map(|generation| generation.0),
             apply_state: status.apply_state.into(),
+            selection_restore_pending: status.selection_restore_pending,
             probe_queue: status.probe_queue.into(),
             stream_health: status.stream_health.into(),
         }
@@ -3059,6 +3062,7 @@ impl TryFrom<WireStatusSnapshot> for StatusSnapshot {
             connection_count: status.connection_count,
             runtime_generation: status.runtime_generation.map(RuntimeGeneration),
             apply_state: status.apply_state.into(),
+            selection_restore_pending: status.selection_restore_pending,
             probe_queue: status.probe_queue.try_into()?,
             stream_health: status.stream_health.into(),
         })
