@@ -2225,6 +2225,10 @@ fn unexpected_response() -> CoreRuntimeError {
     protocol_error("Core service IPC response operation mismatch")
 }
 
+fn safe_io_error(error: io::Error, message: &'static str) -> io::Error {
+    io::Error::new(error.kind(), message)
+}
+
 #[cfg(test)]
 mod accept_loop_tests {
     use super::*;
@@ -2340,8 +2344,4 @@ mod accept_loop_tests {
         drop(replacement);
         fs::remove_dir_all(root).expect("the wake fixture root should be removed");
     }
-}
-
-fn safe_io_error(error: io::Error, message: &'static str) -> io::Error {
-    io::Error::new(error.kind(), message)
 }
