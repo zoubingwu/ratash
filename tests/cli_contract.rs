@@ -1,0 +1,273 @@
+use clap::{CommandFactory, Parser};
+use hopash::application::{ApplicationOperation, RulePlacement};
+use hopash::cli::{Cli, Invocation, OutputMode};
+use hopash::domain::SubscriptionUrl;
+
+#[test]
+fn bare_command_routes_to_general_help() {
+    let cli = Cli::try_parse_from(["hopash"]).expect("bare command should parse");
+
+    assert_eq!(cli.into_invocation(), Invocation::PrintGeneralHelp);
+}
+
+#[test]
+fn lifecycle_commands_preserve_the_output_mode() {
+    let cases = [
+        (
+            vec!["hopash", "start"],
+            ApplicationOperation::Start,
+            OutputMode::Human,
+        ),
+        (
+            vec!["hopash", "stop", "--json"],
+            ApplicationOperation::Stop,
+            OutputMode::Json,
+        ),
+        (
+            vec!["hopash", "restart"],
+            ApplicationOperation::Restart,
+            OutputMode::Human,
+        ),
+    ];
+
+    for (arguments, operation, output) in cases {
+        let cli = Cli::try_parse_from(arguments).expect("lifecycle command should parse");
+
+        assert_eq!(
+            cli.into_invocation(),
+            Invocation::Application { operation, output }
+        );
+    }
+}
+
+#[test]
+fn status_selects_the_terminal_interface_or_json_query() {
+    let interactive = Cli::try_parse_from(["hopash", "status"])
+        .expect("interactive status should parse")
+        .into_invocation();
+    let json = Cli::try_parse_from(["hopash", "status", "--json"])
+        .expect("JSON status should parse")
+        .into_invocation();
+
+    assert_eq!(interactive, Invocation::LaunchStatusInterface);
+    assert_eq!(
+        json,
+        Invocation::Application {
+            operation: ApplicationOperation::GetStatus,
+            output: OutputMode::Json,
+        }
+    );
+}
+
+#[test]
+fn profile_commands_preserve_urls_selectors_and_output_modes() {
+    let cases = [
+        (
+            vec![
+                "hopash",
+                "profile",
+                "add",
+                "https://example.com/sub?token=secret",
+                "--json",
+            ],
+            ApplicationOperation::ProfileAdd {
+                subscription_url: SubscriptionUrl::parse("https://example.com/sub?token=secret")
+                    .expect("fixture URL should be valid"),
+            },
+            OutputMode::Json,
+        ),
+        (
+            vec!["hopash", "profile", "list"],
+            ApplicationOperation::ProfileList,
+            OutputMode::Human,
+        ),
+        (
+            vec!["hopash", "profile", "use", "Office Profile"],
+            ApplicationOperation::ProfileUse {
+                profile: "Office Profile".to_owned(),
+            },
+            OutputMode::Human,
+        ),
+        (
+            vec!["hopash", "profile", "remove", "profile-01", "--json"],
+            ApplicationOperation::ProfileRemove {
+                profile: "profile-01".to_owned(),
+            },
+            OutputMode::Json,
+        ),
+    ];
+
+    for (arguments, operation, output) in cases {
+        let cli = Cli::try_parse_from(arguments).expect("profile command should parse");
+        assert_eq!(
+            cli.into_invocation(),
+            Invocation::Application { operation, output }
+        );
+    }
+
+    assert!(Cli::try_parse_from(["hopash", "profile", "add", "file:///tmp/profile.yaml"]).is_err());
+}
+
+#[test]
+fn proxy_and_latency_commands_preserve_case_sensitive_selectors() {
+    let cases = [
+        (
+            vec!["hopash", "proxy", "list", "Auto Select", "--json"],
+            ApplicationOperation::ProxyList {
+                group: "Auto Select".to_owned(),
+            },
+            OutputMode::Json,
+        ),
+        (
+            vec!["hopash", "proxy", "select", "Auto Select", "HK Node 01"],
+            ApplicationOperation::ProxySelect {
+                group: "Auto Select".to_owned(),
+                node: "HK Node 01".to_owned(),
+            },
+            OutputMode::Human,
+        ),
+        (
+            vec!["hopash", "latency", "list", "--json"],
+            ApplicationOperation::LatencyList,
+            OutputMode::Json,
+        ),
+        (
+            vec!["hopash", "latency", "show", "Provider/HK Node 01"],
+            ApplicationOperation::LatencyShow {
+                node: "Provider/HK Node 01".to_owned(),
+            },
+            OutputMode::Human,
+        ),
+    ];
+
+    for (arguments, operation, output) in cases {
+        let cli = Cli::try_parse_from(arguments).expect("query command should parse");
+        assert_eq!(
+            cli.into_invocation(),
+            Invocation::Application { operation, output }
+        );
+    }
+}
+
+#[test]
+fn rule_commands_preserve_complete_strings_and_require_one_placement() {
+    let logical_rule = "AND,((DOMAIN,api.example.com),(NETWORK,TCP)),DIRECT";
+    let anchor = "MATCH,PROXY";
+    let cases = [
+        (
+            vec!["hopash", "rule", "list", "--json"],
+            ApplicationOperation::RuleList,
+            OutputMode::Json,
+        ),
+        (
+            vec!["hopash", "rule", "add", logical_rule, "--before", anchor],
+            ApplicationOperation::RuleAdd {
+                rule: logical_rule.to_owned(),
+                placement: RulePlacement::Before(anchor.to_owned()),
+            },
+            OutputMode::Human,
+        ),
+        (
+            vec![
+                "hopash",
+                "rule",
+                "replace",
+                "DOMAIN-SUFFIX,Example.com,PROXY",
+                "DOMAIN-SUFFIX,Example.com,DIRECT",
+                "--json",
+            ],
+            ApplicationOperation::RuleReplace {
+                old_rule: "DOMAIN-SUFFIX,Example.com,PROXY".to_owned(),
+                new_rule: "DOMAIN-SUFFIX,Example.com,DIRECT".to_owned(),
+            },
+            OutputMode::Json,
+        ),
+        (
+            vec![
+                "hopash",
+                "rule",
+                "remove",
+                "DOMAIN-SUFFIX,Example.com,DIRECT",
+            ],
+            ApplicationOperation::RuleRemove {
+                rule: "DOMAIN-SUFFIX,Example.com,DIRECT".to_owned(),
+            },
+            OutputMode::Human,
+        ),
+    ];
+
+    for (arguments, operation, output) in cases {
+        let cli = Cli::try_parse_from(arguments).expect("rule command should parse");
+        assert_eq!(
+            cli.into_invocation(),
+            Invocation::Application { operation, output }
+        );
+    }
+
+    assert!(Cli::try_parse_from(["hopash", "rule", "add", "MATCH,DIRECT"]).is_err());
+    assert!(
+        Cli::try_parse_from([
+            "hopash",
+            "rule",
+            "add",
+            "MATCH,DIRECT",
+            "--prepend",
+            "--append",
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn logs_and_help_route_to_dedicated_local_invocations() {
+    let human_logs = Cli::try_parse_from(["hopash", "logs", "--follow"])
+        .expect("human log follow should parse")
+        .into_invocation();
+    let json_logs = Cli::try_parse_from(["hopash", "logs", "--follow", "--json"])
+        .expect("JSON log follow should parse")
+        .into_invocation();
+    let help = Cli::try_parse_from(["hopash", "help"])
+        .expect("general help should parse")
+        .into_invocation();
+    let agent_help = Cli::try_parse_from(["hopash", "help", "agent"])
+        .expect("agent help should parse")
+        .into_invocation();
+
+    assert_eq!(
+        human_logs,
+        Invocation::FollowLogs {
+            output: OutputMode::Human
+        }
+    );
+    assert_eq!(
+        json_logs,
+        Invocation::FollowLogs {
+            output: OutputMode::Json
+        }
+    );
+    assert_eq!(help, Invocation::PrintGeneralHelp);
+    assert_eq!(agent_help, Invocation::PrintAgentHelp);
+
+    assert!(Cli::try_parse_from(["hopash", "logs"]).is_err());
+}
+
+#[test]
+fn root_help_lists_the_public_surface_only() {
+    let mut command = Cli::command();
+    let mut output = Vec::new();
+    command
+        .write_long_help(&mut output)
+        .expect("help should render");
+    let help = String::from_utf8(output).expect("help should be UTF-8");
+
+    for public_command in [
+        "start", "stop", "restart", "profile", "proxy", "latency", "status", "logs", "rule", "help",
+    ] {
+        assert!(
+            help.contains(public_command),
+            "missing {public_command}:\n{help}"
+        );
+    }
+    assert!(!help.contains("supervisor-internal"));
+    assert!(!help.contains("service-internal"));
+}

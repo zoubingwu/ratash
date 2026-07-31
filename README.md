@@ -6,7 +6,7 @@ The executable is named `hopash`.
 
 ## Project Status
 
-Hopash RS is in the design phase. The first implementation release will target macOS.
+Hopash RS is under active development for its first macOS release. The current build exposes the planned command surface and machine-readable error contract while the Supervisor, Core integration, and Status Interface are being implemented.
 
 ## Installation
 

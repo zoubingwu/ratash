@@ -41,6 +41,17 @@
 - Keep Runtime Generation, Core Instance Generation, and Probe Generation as distinct concepts. Carry the appropriate generation or revision through asynchronous work and discard stale results.
 - Keep CLI, TUI, persistence, scheduling, HTTP, IPC transport, and Mihomo integration behind explicit application boundaries.
 
+## Current Source Layout
+
+- `src/application.rs` defines transport-independent operations, outputs, errors, and the application service seam.
+- `src/domain.rs` defines shared lifecycle, identity, status, and validated value types.
+- `src/contract.rs` owns the versioned JSON V1 envelope and explicit status DTO projection.
+- `src/cli/command.rs` defines the public Clap command tree and maps parsed commands to typed invocations.
+- `src/cli/process.rs` owns process argument errors, JSON usage envelopes, and sensitive argument redaction.
+- `src/cli/help.rs` generates Agent Help from the Clap command tree plus the fixed recovery workflow.
+- `src/cli/runner.rs` executes typed invocations against an injected application client and owns stdout/stderr formatting.
+- `src/main.rs` remains the thin executable composition root.
+
 ## Product Constraints
 
 - Profiles originate from remote HTTP(S) Subscription URLs. A Profile Snapshot is read-only and retains the latest validated content.
@@ -52,6 +63,14 @@
 - Delay Probes cover the deduplicated Node set of the Active Profile only.
 - Expose Core proxies through a versioned projection with source-aware Node identities and explicit missing, ambiguous, and provider-unavailable states.
 - Keep queues, channels, buffers, histories, stream subscribers, task concurrency, and retry policies bounded.
+
+## Development Host Safety
+
+- Treat the development host's network state as read-only.
+- Keep TUN devices, system proxy settings, DNS settings, routes, firewall rules, privileged-service installation, and live Mihomo traffic capture unchanged during development and verification.
+- Exercise CoreRuntime, privileged-service, and Mihomo lifecycle behavior through fakes, fixture subprocesses, temporary directories, and contract tests.
+- Use loopback-only HTTP servers and Unix sockets for integration fixtures.
+- Reserve real TUN and privileged-service end-to-end validation for a disposable isolated environment outside this development host.
 
 ## Domain Vocabulary
 
