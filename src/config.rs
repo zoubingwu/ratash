@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use url::Url;
 
 const BUNDLED_CATALOG: &str = include_str!("../fixtures/mihomo/v1.19.28/config-schema.yaml");
-const BUNDLED_CORE_VERSION: &str = "v1.19.28";
+pub const BUNDLED_CORE_VERSION: &str = "v1.19.28";
 const COMPILER_POLICY_REVISION: &str = "hopash-config-policy-v1";
 
 #[derive(Clone, Eq, PartialEq)]

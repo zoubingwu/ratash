@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "product": "Hopash RS",
+  "executable": "hopash",
+  "minimum_rust_version": "1.85",
+  "supported_targets": [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin"
+  ],
+  "mihomo_version": "v1.19.28",
+  "protocol_versions": {
+    "cli_json": 1,
+    "ipc": 1,
+    "proxy_view": 1
+  },
+  "intervals_ms": {
+    "profile_refresh": 21600000,
+    "profile_connect_timeout": 5000,
+    "profile_request_timeout": 10000,
+    "profile_total_timeout": 30000,
+    "core_readiness_timeout": 10000,
+    "core_health_timeout": 5000,
+    "mihomo_validation_timeout": 10000,
+    "probe_interval": 300000,
+    "probe_timeout": 5000,
+    "latency_freshness": 600000,
+    "status_sample_interval": 1000,
+    "stream_stale_timeout": 10000,
+    "reconnect_initial_backoff": 250,
+    "reconnect_max_backoff": 10000,
+    "ipc_request_timeout": 10000
+  },
+  "capacities": {
+    "profile_refresh_concurrency": 2,
+    "profile_redirect_limit": 5,
+    "profile_count": 1000,
+    "core_restart_limit": 3,
+    "probe_workers": 16,
+    "active_nodes": 10000,
+    "logs": 10000,
+    "log_subscriber": 256,
+    "status_subscriber": 64,
+    "traffic_series": 300,
+    "local_rules": 20000
+  },
+  "byte_limits": {
+    "profile_metadata_name": 80,
+    "subscription_url": 8192,
+    "supervisor_state": 16777216,
+    "effective_configuration": 67108864,
+    "mihomo_binary": 134217728,
+    "mihomo_validation_output": 262144,
+    "profile_response": 16777216,
+    "rule_string": 16384,
+    "local_rule_set": 33554432,
+    "ipc_frame": 4194304,
+    "core_log_line": 65536,
+    "json_output": 67108864
+  },
+  "other_limits": {
+    "yaml_depth": 64,
+    "minimum_terminal_width": 80,
+    "minimum_terminal_height": 24
+  },
+  "probe_url": "https://www.gstatic.com/generate_204",
+  "exit_codes": {
+    "success": 0,
+    "usage": 2,
+    "supervisor_unavailable": 3,
+    "domain_conflict": 4,
+    "external_operation_failure": 5,
+    "internal_failure": 70,
+    "interrupted": 130
+  }
+}
