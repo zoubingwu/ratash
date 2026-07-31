@@ -52,6 +52,7 @@
 - `src/profile_source.rs` owns bounded HTTP(S) Profile downloads, redirect policy, metadata extraction, and safe download errors.
 - `src/persistence.rs` owns private content-addressed objects, recoverable transaction journals, and the committed manifest pointer.
 - `src/state.rs` stages and hydrates the complete authoritative Supervisor state through immutable objects and the committed transaction pointer.
+- `src/transaction.rs` serializes every Runtime Generation producer, revalidates revisions, confirms Core identity and health, and converges failures to the committed pointer.
 - `src/config.rs` compiles Profile Snapshots through the bundled Mihomo field catalog, applies authoritative fields, and exposes the final Core validation seam.
 - `src/validator.rs` verifies the pinned Mihomo binary and runs bounded `-t` validation inside the private staging root without starting the Core.
 - `fixtures/mihomo/v1.19.28/config-schema.yaml` is the closed field catalog bound to the bundled Core version.
