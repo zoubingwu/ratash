@@ -28,7 +28,9 @@
     "stream_stale_timeout": 10000,
     "reconnect_initial_backoff": 250,
     "reconnect_max_backoff": 10000,
-    "ipc_request_timeout": 10000
+    "ipc_request_timeout": 10000,
+    "ipc_runtime_mutation_timeout": 40000,
+    "ipc_profile_add_timeout": 65000
   },
   "capacities": {
     "profile_refresh_concurrency": 2,

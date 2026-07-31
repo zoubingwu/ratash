@@ -47,6 +47,8 @@ fn release_fixture_freezes_versions_and_user_observable_intervals() {
         ("reconnect_initial_backoff", RECONNECT_INITIAL_BACKOFF),
         ("reconnect_max_backoff", RECONNECT_MAX_BACKOFF),
         ("ipc_request_timeout", IPC_REQUEST_TIMEOUT),
+        ("ipc_runtime_mutation_timeout", IPC_RUNTIME_MUTATION_TIMEOUT),
+        ("ipc_profile_add_timeout", IPC_PROFILE_ADD_TIMEOUT),
     ] {
         assert_eq!(intervals[name], duration_ms(actual), "{name} drifted");
     }
