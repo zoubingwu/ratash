@@ -10,6 +10,7 @@ mod digest;
 pub mod domain;
 pub mod error;
 pub mod ipc;
+pub mod ipc_runtime;
 pub mod lifecycle;
 pub mod mihomo;
 pub mod persistence;
