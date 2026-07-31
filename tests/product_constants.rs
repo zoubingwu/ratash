@@ -13,6 +13,9 @@ fn observable_product_limits_are_frozen_for_the_release_contract() {
     assert_eq!(SUBSCRIPTION_URL_MAX_BYTES, 8_192);
     assert_eq!(SUPERVISOR_STATE_MAX_BYTES, 16 * 1_024 * 1_024);
     assert_eq!(EFFECTIVE_CONFIGURATION_MAX_BYTES, 64 * 1_024 * 1_024);
+    assert_eq!(MIHOMO_VALIDATION_TIMEOUT.as_secs(), 10);
+    assert_eq!(MIHOMO_BINARY_MAX_BYTES, 128 * 1_024 * 1_024);
+    assert_eq!(MIHOMO_VALIDATION_OUTPUT_MAX_BYTES, 256 * 1_024);
     assert_eq!(PROBE_WORKER_COUNT, 16);
     assert_eq!(PROBE_INTERVAL.as_secs(), 300);
     assert_eq!(PROBE_TIMEOUT.as_secs(), 5);
@@ -34,6 +37,8 @@ fn every_input_and_transport_boundary_has_a_positive_limit() {
         SUBSCRIPTION_URL_MAX_BYTES,
         SUPERVISOR_STATE_MAX_BYTES,
         EFFECTIVE_CONFIGURATION_MAX_BYTES,
+        MIHOMO_BINARY_MAX_BYTES,
+        MIHOMO_VALIDATION_OUTPUT_MAX_BYTES,
         YAML_MAX_DEPTH,
         RULE_STRING_MAX_BYTES,
         LOCAL_RULE_SET_MAX_BYTES,

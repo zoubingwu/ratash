@@ -15,6 +15,9 @@ pub const EFFECTIVE_CONFIGURATION_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub const CORE_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CORE_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 pub const CORE_RESTART_LIMIT: usize = 3;
+pub const MIHOMO_VALIDATION_TIMEOUT: Duration = Duration::from_secs(10);
+pub const MIHOMO_BINARY_MAX_BYTES: usize = 128 * 1024 * 1024;
+pub const MIHOMO_VALIDATION_OUTPUT_MAX_BYTES: usize = 256 * 1024;
 
 pub const PROBE_WORKER_COUNT: usize = 16;
 pub const PROBE_INTERVAL: Duration = Duration::from_secs(5 * 60);
