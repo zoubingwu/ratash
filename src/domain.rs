@@ -316,6 +316,28 @@ pub struct StreamHealthSet {
     pub logs: StreamState,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProbeQueueStatus {
+    pub active_node_count: u64,
+    pub queue_depth: u64,
+    pub in_flight_count: u64,
+    pub overloaded: bool,
+    pub oldest_due_age_ms: Option<u64>,
+    pub estimated_full_pass_duration_ms: u64,
+    pub stale_node_count: u64,
+}
+
+impl ProbeQueueStatus {
+    #[must_use]
+    pub fn stale_ratio(self) -> f64 {
+        if self.active_node_count == 0 {
+            0.0
+        } else {
+            self.stale_node_count as f64 / self.active_node_count as f64
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatusSnapshot {
     pub supervisor: SupervisorStatus,
@@ -329,6 +351,7 @@ pub struct StatusSnapshot {
     pub connection_count: u64,
     pub runtime_generation: Option<RuntimeGeneration>,
     pub apply_state: ApplyState,
+    pub probe_queue: ProbeQueueStatus,
     pub stream_health: StreamHealthSet,
 }
 use std::fmt;

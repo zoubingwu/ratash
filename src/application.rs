@@ -1,7 +1,8 @@
 use crate::domain::{
     ApplyState, CoreLifecycle, CoreStatus, LocalRuleSetRevision, NodeRecordId, ProbeGeneration,
-    ProfileId, RuntimeGeneration, SampleState, StatusSnapshot, StreamHealthSet, StreamState,
-    SubscriptionUrl, SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason, TunStatus,
+    ProbeQueueStatus, ProfileId, RuntimeGeneration, SampleState, StatusSnapshot, StreamHealthSet,
+    StreamState, SubscriptionUrl, SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason,
+    TunStatus,
 };
 use crate::error::ErrorCode;
 use std::fmt;
@@ -96,6 +97,7 @@ impl ApplicationService {
             connection_count: 0,
             runtime_generation: None,
             apply_state: ApplyState::Idle,
+            probe_queue: ProbeQueueStatus::default(),
             stream_health: StreamHealthSet {
                 traffic: StreamState::Disconnected,
                 connections: StreamState::Disconnected,

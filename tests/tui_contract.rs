@@ -16,9 +16,9 @@ use hopash::constants::{
     TRAFFIC_SERIES_CAPACITY,
 };
 use hopash::domain::{
-    ActiveProfileSummary, ApplyState, CoreLifecycle, CoreStatus, NodeRecordId, ProfileId,
-    RuntimeGeneration, SampleState, SelectedNodeSummary, StatusSnapshot, StreamHealthSet,
-    StreamState, SupervisorLifecycle, SupervisorStatus, TrafficSample, TunStatus,
+    ActiveProfileSummary, ApplyState, CoreLifecycle, CoreStatus, NodeRecordId, ProbeQueueStatus,
+    ProfileId, RuntimeGeneration, SampleState, SelectedNodeSummary, StatusSnapshot,
+    StreamHealthSet, StreamState, SupervisorLifecycle, SupervisorStatus, TrafficSample, TunStatus,
 };
 use hopash::ipc::RequestId;
 use hopash::telemetry::{LogLevel, LogSource};
@@ -46,6 +46,30 @@ fn all_four_pages_render_their_primary_content() {
             assert!(text.contains(title));
         }
     }
+}
+
+#[test]
+fn overview_renders_probe_queue_overload_metrics() {
+    let mut state = connected_state();
+    let status = state
+        .status
+        .as_mut()
+        .expect("the connected fixture should have status");
+    status.probe_queue = ProbeQueueStatus {
+        active_node_count: 10,
+        queue_depth: 7,
+        in_flight_count: 2,
+        overloaded: true,
+        oldest_due_age_ms: Some(12_345),
+        estimated_full_pass_duration_ms: 30_000,
+        stale_node_count: 4,
+    };
+
+    let (text, _) = render_with_backend(&state, 120, 32);
+
+    assert!(text.contains("Probe Queue: overloaded"));
+    assert!(text.contains("queued 7, in-flight 2, stale 40.0%"));
+    assert!(text.contains("oldest 12345 ms, full pass 30000 ms"));
 }
 
 #[test]
@@ -1231,6 +1255,7 @@ fn status_snapshot() -> StatusSnapshot {
         connection_count: 3,
         runtime_generation: Some(RuntimeGeneration(1)),
         apply_state: ApplyState::Idle,
+        probe_queue: ProbeQueueStatus::default(),
         stream_health: StreamHealthSet {
             traffic: StreamState::Healthy,
             connections: StreamState::Healthy,

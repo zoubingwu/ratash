@@ -281,6 +281,7 @@ pub struct ProbeMetrics {
     pub overloaded: bool,
     pub oldest_due_age_ms: Option<u64>,
     pub estimated_full_pass_duration_ms: u64,
+    pub stale_node_count: usize,
     pub stale_ratio: f64,
 }
 
@@ -504,6 +505,7 @@ impl ProbeScheduler {
             overloaded,
             oldest_due_age_ms,
             estimated_full_pass_duration_ms,
+            stale_node_count: stale_count,
             stale_ratio,
         }
     }

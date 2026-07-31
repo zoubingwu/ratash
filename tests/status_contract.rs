@@ -62,6 +62,14 @@ fn zero_profile_status_serializes_the_complete_v1_contract() {
                 },
                 "connection_count": 0,
                 "apply_state": "idle",
+                "probe_queue": {
+                    "active_node_count": 0,
+                    "queue_depth": 0,
+                    "in_flight_count": 0,
+                    "overloaded": false,
+                    "estimated_full_pass_duration_ms": 0,
+                    "stale_ratio": 0.0
+                },
                 "stream_health": {
                     "traffic": "disconnected",
                     "connections": "disconnected",

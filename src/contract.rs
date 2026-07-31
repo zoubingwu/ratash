@@ -1,12 +1,12 @@
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 
 pub use crate::error::{ErrorCode, ProcessExitCode};
 
 use crate::application::{self, ApplicationError, ApplicationErrorDetails, ApplicationOutput};
 use crate::domain::{
-    ActiveProfileSummary, ApplyState, CoreLifecycle, CoreStatus, LatencySample, SampleState,
-    SelectedNodeSummary, StatusSnapshot, StreamHealthSet, StreamState, SupervisorLifecycle,
-    SupervisorStatus, TrafficSample, TunReason, TunStatus,
+    ActiveProfileSummary, ApplyState, CoreLifecycle, CoreStatus, LatencySample, ProbeQueueStatus,
+    SampleState, SelectedNodeSummary, StatusSnapshot, StreamHealthSet, StreamState,
+    SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason, TunStatus,
 };
 
 pub const SCHEMA_VERSION: u16 = 1;
@@ -872,6 +872,7 @@ pub struct StatusViewV1 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_generation: Option<String>,
     pub apply_state: ApplyStateViewV1,
+    pub probe_queue: ProbeQueueViewV1,
     pub stream_health: StreamHealthViewV1,
 }
 
@@ -891,8 +892,58 @@ impl From<StatusSnapshot> for StatusViewV1 {
                 .runtime_generation
                 .map(|generation| generation.0.to_string()),
             apply_state: snapshot.apply_state.into(),
+            probe_queue: snapshot.probe_queue.into(),
             stream_health: snapshot.stream_health.into(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ProbeQueueViewV1 {
+    pub active_node_count: u64,
+    pub queue_depth: u64,
+    pub in_flight_count: u64,
+    pub overloaded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_due_age_ms: Option<u64>,
+    pub estimated_full_pass_duration_ms: u64,
+    pub stale_ratio: ProbeStaleRatioViewV1,
+}
+
+impl From<ProbeQueueStatus> for ProbeQueueViewV1 {
+    fn from(status: ProbeQueueStatus) -> Self {
+        Self {
+            active_node_count: status.active_node_count,
+            queue_depth: status.queue_depth,
+            in_flight_count: status.in_flight_count,
+            overloaded: status.overloaded,
+            oldest_due_age_ms: status.oldest_due_age_ms,
+            estimated_full_pass_duration_ms: status.estimated_full_pass_duration_ms,
+            stale_ratio: ProbeStaleRatioViewV1 {
+                stale_node_count: status.stale_node_count,
+                active_node_count: status.active_node_count,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProbeStaleRatioViewV1 {
+    stale_node_count: u64,
+    active_node_count: u64,
+}
+
+impl Serialize for ProbeStaleRatioViewV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let ratio = if self.active_node_count == 0 {
+            0.0
+        } else {
+            self.stale_node_count as f64 / self.active_node_count as f64
+        };
+        serializer.serialize_f64(ratio)
     }
 }
 

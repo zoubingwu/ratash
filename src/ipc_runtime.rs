@@ -37,10 +37,10 @@ use crate::constants::{
 };
 use crate::domain::{
     ActiveProfileSummary, ApplyState, CoreInstanceGeneration, CoreLifecycle, CoreStatus,
-    LatencySample, LocalRuleSetRevision, NodeRecordId, ProbeGeneration, ProfileId,
-    RuntimeGeneration, SampleState, SelectedNodeSummary, StatusSnapshot, StreamHealthSet,
-    StreamState, SubscriptionUrl, SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason,
-    TunStatus,
+    LatencySample, LocalRuleSetRevision, NodeRecordId, ProbeGeneration, ProbeQueueStatus,
+    ProfileId, RuntimeGeneration, SampleState, SelectedNodeSummary, StatusSnapshot,
+    StreamHealthSet, StreamState, SubscriptionUrl, SupervisorLifecycle, SupervisorStatus,
+    TrafficSample, TunReason, TunStatus,
 };
 use crate::error::ErrorCode;
 use crate::ipc::{
@@ -3018,6 +3018,8 @@ struct WireStatusSnapshot {
     connection_count: u64,
     runtime_generation: Option<u64>,
     apply_state: WireApplyState,
+    #[serde(default)]
+    probe_queue: WireProbeQueueStatus,
     stream_health: WireStreamHealthSet,
 }
 
@@ -3035,6 +3037,7 @@ impl From<StatusSnapshot> for WireStatusSnapshot {
             connection_count: status.connection_count,
             runtime_generation: status.runtime_generation.map(|generation| generation.0),
             apply_state: status.apply_state.into(),
+            probe_queue: status.probe_queue.into(),
             stream_health: status.stream_health.into(),
         }
     }
@@ -3056,7 +3059,59 @@ impl TryFrom<WireStatusSnapshot> for StatusSnapshot {
             connection_count: status.connection_count,
             runtime_generation: status.runtime_generation.map(RuntimeGeneration),
             apply_state: status.apply_state.into(),
+            probe_queue: status.probe_queue.try_into()?,
             stream_health: status.stream_health.into(),
+        })
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct WireProbeQueueStatus {
+    active_node_count: u64,
+    queue_depth: u64,
+    in_flight_count: u64,
+    overloaded: bool,
+    oldest_due_age_ms: Option<u64>,
+    estimated_full_pass_duration_ms: u64,
+    stale_node_count: u64,
+}
+
+impl From<ProbeQueueStatus> for WireProbeQueueStatus {
+    fn from(status: ProbeQueueStatus) -> Self {
+        Self {
+            active_node_count: status.active_node_count,
+            queue_depth: status.queue_depth,
+            in_flight_count: status.in_flight_count,
+            overloaded: status.overloaded,
+            oldest_due_age_ms: status.oldest_due_age_ms,
+            estimated_full_pass_duration_ms: status.estimated_full_pass_duration_ms,
+            stale_node_count: status.stale_node_count,
+        }
+    }
+}
+
+impl TryFrom<WireProbeQueueStatus> for ProbeQueueStatus {
+    type Error = WireConversionError;
+
+    fn try_from(status: WireProbeQueueStatus) -> Result<Self, Self::Error> {
+        let scheduled = status
+            .queue_depth
+            .checked_add(status.in_flight_count)
+            .ok_or(WireConversionError)?;
+        if status.stale_node_count > status.active_node_count
+            || scheduled > status.active_node_count
+            || status.oldest_due_age_ms.is_some() != (status.queue_depth > 0)
+        {
+            return Err(WireConversionError);
+        }
+        Ok(Self {
+            active_node_count: status.active_node_count,
+            queue_depth: status.queue_depth,
+            in_flight_count: status.in_flight_count,
+            overloaded: status.overloaded,
+            oldest_due_age_ms: status.oldest_due_age_ms,
+            estimated_full_pass_duration_ms: status.estimated_full_pass_duration_ms,
+            stale_node_count: status.stale_node_count,
         })
     }
 }

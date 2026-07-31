@@ -12,8 +12,8 @@ use hopash::application::{
 };
 use hopash::constants::LOG_CAPACITY;
 use hopash::domain::{
-    ActiveProfileSummary, ApplyState, CoreLifecycle, CoreStatus, NodeRecordId, ProfileId,
-    SampleState, StatusSnapshot, StreamHealthSet, StreamState, SupervisorLifecycle,
+    ActiveProfileSummary, ApplyState, CoreLifecycle, CoreStatus, NodeRecordId, ProbeQueueStatus,
+    ProfileId, SampleState, StatusSnapshot, StreamHealthSet, StreamState, SupervisorLifecycle,
     SupervisorStatus, TrafficSample, TunStatus,
 };
 use hopash::ipc::RequestId;
@@ -916,6 +916,7 @@ fn status(upload: u64) -> StatusSnapshot {
         connection_count: 0,
         runtime_generation: None,
         apply_state: ApplyState::Idle,
+        probe_queue: ProbeQueueStatus::default(),
         stream_health: StreamHealthSet {
             traffic: StreamState::Healthy,
             connections: StreamState::Healthy,

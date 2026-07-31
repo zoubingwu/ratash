@@ -2,6 +2,7 @@ use hopash::application::{ApplicationClient, ApplicationOperation, ApplicationOu
 use hopash::config::{
     AuthoritativeConfig, ConfigCompiler, CoreConfigValidator, CoreValidationError,
 };
+use hopash::constants::LATENCY_FRESHNESS;
 use hopash::core::{
     Availability, CoreControlEndpoint, CoreRuntimeStatus, ManagedCoreHandle, MihomoError,
     NodeSelection, NodeSource, ProviderState, ProxyGroup, ProxyMember, ProxyNode, ProxyView,
@@ -977,6 +978,37 @@ fn profile_add_reports_the_stable_error_for_an_unsupported_catalog_field() {
     assert!(!error.retryable);
     assert_eq!(harness.transactions.apply_count.load(Ordering::Relaxed), 0);
     assert!(profile_list(&supervisor).is_empty());
+}
+
+#[test]
+fn status_publishes_probe_queue_overload_metrics() {
+    let harness = Harness::new("probe-queue-status");
+    harness.queue_profile("Primary", "node-a");
+    let supervisor = harness.open();
+    add_profile(&supervisor, "https://example.test/primary.yaml");
+    let freshness_ms: u64 = LATENCY_FRESHNESS
+        .as_millis()
+        .try_into()
+        .expect("the freshness threshold should fit");
+    harness
+        .clock
+        .now
+        .store(10_001_u64.saturating_add(freshness_ms), Ordering::Relaxed);
+
+    let ApplicationOutput::Status(status) = supervisor
+        .execute(ApplicationOperation::GetStatus)
+        .expect("status should remain available under probe load")
+    else {
+        panic!("status should return Status")
+    };
+
+    assert_eq!(status.probe_queue.active_node_count, 1);
+    assert_eq!(status.probe_queue.queue_depth, 1);
+    assert_eq!(status.probe_queue.in_flight_count, 0);
+    assert!(status.probe_queue.overloaded);
+    assert_eq!(status.probe_queue.oldest_due_age_ms, Some(freshness_ms + 1));
+    assert_eq!(status.probe_queue.stale_node_count, 1);
+    assert_eq!(status.probe_queue.stale_ratio(), 1.0);
 }
 
 #[test]

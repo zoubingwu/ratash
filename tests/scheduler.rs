@@ -171,6 +171,7 @@ fn probe_generation_deduplicates_nodes_and_enqueues_the_first_pass_immediately()
     assert_eq!(metrics.active_node_count, 2);
     assert_eq!(metrics.queue_depth, 2);
     assert_eq!(metrics.in_flight_count, 0);
+    assert_eq!(metrics.stale_node_count, 2);
     assert_eq!(metrics.stale_ratio, 1.0);
     assert_eq!(scheduler.take_due(99), []);
     assert_eq!(scheduler.take_due(100).len(), 2);

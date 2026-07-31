@@ -1988,8 +1988,17 @@ fn render_overview(state: &AppState, area: Rect, buffer: &mut Buffer) {
                     )
                 },
             );
+        let probe_queue_state = if status.probe_queue.overloaded {
+            "overloaded"
+        } else {
+            "healthy"
+        };
+        let oldest_due = status
+            .probe_queue
+            .oldest_due_age_ms
+            .map_or_else(|| "-".to_owned(), |age| format!("{age} ms"));
         format!(
-            "Connection: {connection}\nSupervisor: {:?}\nCore: {:?}\nTUN: {}\nActive Profile: {}\nPrimary Group: {}\nCurrent Node: {}\nLatency: {delay}\nSampled At: {sampled_at}\nFreshness: {freshness}\nProbe: {probe_status} (generation {probe_generation})\nConnections: {}\nUptime: {}s",
+            "Connection: {connection}\nSupervisor: {:?}\nCore: {:?}\nTUN: {}\nActive Profile: {}\nPrimary Group: {}\nCurrent Node: {}\nLatency: {delay}\nSampled At: {sampled_at}\nFreshness: {freshness}\nProbe: {probe_status} (generation {probe_generation})\nProbe Queue: {probe_queue_state}, queued {}, in-flight {}, stale {:.1}%\nProbe Window: oldest {oldest_due}, full pass {} ms\nConnections: {}\nUptime: {}s",
             status.supervisor.lifecycle,
             status.core.lifecycle,
             if status.tun.effective {
@@ -2000,6 +2009,10 @@ fn render_overview(state: &AppState, area: Rect, buffer: &mut Buffer) {
             active_profile,
             primary_group,
             current_node,
+            status.probe_queue.queue_depth,
+            status.probe_queue.in_flight_count,
+            status.probe_queue.stale_ratio() * 100.0,
+            status.probe_queue.estimated_full_pass_duration_ms,
             status.connection_count,
             status.supervisor.uptime_seconds,
         )

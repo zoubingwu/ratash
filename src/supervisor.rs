@@ -34,9 +34,9 @@ use crate::core::{
 };
 use crate::domain::{
     ActiveProfileSummary, ApplyState, CoreInstanceGeneration, CoreLifecycle, CoreStatus,
-    NodeRecordId, ProbeGeneration, ProfileId, RuntimeGeneration, SampleState, SelectedNodeSummary,
-    StatusSnapshot, StreamHealthSet, StreamState, SubscriptionUrl, SupervisorLifecycle,
-    SupervisorStatus, TrafficSample, TunReason, TunStatus,
+    NodeRecordId, ProbeGeneration, ProbeQueueStatus, ProfileId, RuntimeGeneration, SampleState,
+    SelectedNodeSummary, StatusSnapshot, StreamHealthSet, StreamState, SubscriptionUrl,
+    SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason, TunStatus,
 };
 use crate::error::ErrorCode;
 use crate::profile::{
@@ -1134,6 +1134,7 @@ impl Supervisor {
             .as_ref()
             .and_then(TelemetryStore::connection_count)
             .unwrap_or_default();
+        let probe_queue = probe_queue_status(state.probes.metrics(self.clock.now_unix_ms()));
         let zero_profile = active_profile_id.is_none();
         let core_ready = managed_core.is_some();
         let status = StatusSnapshot {
@@ -1179,6 +1180,7 @@ impl Supervisor {
             connection_count,
             runtime_generation: state.runtime_generation,
             apply_state: self.current_apply_state(),
+            probe_queue,
             stream_health: state.stream_health.clone(),
         };
         *self.last_status.lock().map_err(|_| internal_error())? = status.clone();
@@ -2778,7 +2780,20 @@ fn initial_status_snapshot(
         connection_count: 0,
         runtime_generation,
         apply_state: ApplyState::Idle,
+        probe_queue: ProbeQueueStatus::default(),
         stream_health: disconnected_stream_health(),
+    }
+}
+
+fn probe_queue_status(metrics: crate::scheduler::ProbeMetrics) -> ProbeQueueStatus {
+    ProbeQueueStatus {
+        active_node_count: metrics.active_node_count.try_into().unwrap_or(u64::MAX),
+        queue_depth: metrics.queue_depth.try_into().unwrap_or(u64::MAX),
+        in_flight_count: metrics.in_flight_count.try_into().unwrap_or(u64::MAX),
+        overloaded: metrics.overloaded,
+        oldest_due_age_ms: metrics.oldest_due_age_ms,
+        estimated_full_pass_duration_ms: metrics.estimated_full_pass_duration_ms,
+        stale_node_count: metrics.stale_node_count.try_into().unwrap_or(u64::MAX),
     }
 }
 
