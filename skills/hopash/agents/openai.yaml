@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hopash"
+  short_description: "Operate Hopash safely through its CLI"
+  default_prompt: "Use $hopash to inspect Hopash status and perform one precise operation."

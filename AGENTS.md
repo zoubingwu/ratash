@@ -68,6 +68,7 @@
 - `src/cli/process.rs` owns process argument errors, JSON usage envelopes, and sensitive argument redaction.
 - `src/cli/help.rs` generates Agent Help from the Clap command tree plus the fixed recovery workflow.
 - `src/cli/runner.rs` executes typed invocations against an injected application client and owns stdout/stderr formatting.
+- `skills/hopash/` is the packaged AI Skill and treats `hopash help agent` as the live command authority.
 - `src/main.rs` remains the thin executable composition root.
 
 ## Product Constraints
