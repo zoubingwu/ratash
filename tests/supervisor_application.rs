@@ -1772,6 +1772,26 @@ fn proxy_rows_preserve_group_and_unresolved_member_states() {
         selected_name: None,
         members: Vec::new(),
     });
+    view.groups.extend([
+        ProxyGroup {
+            name: "GLOBAL".to_owned(),
+            proxy_type: "Selector".to_owned(),
+            availability: Availability::Available,
+            selectable: true,
+            core_internal: true,
+            selected_name: None,
+            members: Vec::new(),
+        },
+        ProxyGroup {
+            name: "Fallback".to_owned(),
+            proxy_type: "Fallback".to_owned(),
+            availability: Availability::Available,
+            selectable: false,
+            core_internal: false,
+            selected_name: None,
+            members: Vec::new(),
+        },
+    ]);
     harness.core.state.lock().expect("the Core lock").view = view;
     harness.queue_profile("Primary", "node-a");
     let supervisor = harness.open();
@@ -1790,6 +1810,14 @@ fn proxy_rows_preserve_group_and_unresolved_member_states() {
         .iter()
         .map(|row| (row.name.as_str(), row.member_kind))
         .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        proxies
+            .groups
+            .iter()
+            .map(|group| group.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Main", "Nested"]
+    );
     assert_eq!(kinds["Nested"], hopash::application::ProxyMemberKind::Group);
     assert_eq!(
         kinds["missing"],

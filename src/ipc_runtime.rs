@@ -2508,6 +2508,8 @@ impl From<WireProxyGroupSummary> for ProxyGroupSummary {
 #[derive(Debug, Deserialize, Serialize)]
 struct WireProxyListOutcome {
     group: WireProxyGroupSummary,
+    #[serde(default)]
+    groups: Vec<WireProxyGroupSummary>,
     nodes: Vec<WireProxyNodeRow>,
 }
 
@@ -2515,6 +2517,7 @@ impl From<ProxyListOutcome> for WireProxyListOutcome {
     fn from(value: ProxyListOutcome) -> Self {
         Self {
             group: value.group.into(),
+            groups: value.groups.into_iter().map(Into::into).collect(),
             nodes: value.nodes.into_iter().map(Into::into).collect(),
         }
     }
@@ -2526,6 +2529,7 @@ impl TryFrom<WireProxyListOutcome> for ProxyListOutcome {
     fn try_from(value: WireProxyListOutcome) -> Result<Self, Self::Error> {
         Ok(Self {
             group: value.group.into(),
+            groups: value.groups.into_iter().map(Into::into).collect(),
             nodes: value
                 .nodes
                 .into_iter()

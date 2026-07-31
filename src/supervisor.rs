@@ -1428,7 +1428,6 @@ impl Supervisor {
             .groups
             .iter()
             .find(|group| group.name == group_name)
-            .cloned()
             .ok_or_else(|| selector_not_found(SelectorKind::ProxyGroup, "Proxy Group"))?;
         let observations = probe_observations(&state, &view, self.clock.now_unix_ms());
         let rows = view
@@ -1437,21 +1436,15 @@ impl Supervisor {
             .into_iter()
             .map(proxy_row)
             .collect();
-        let selected_node = group
-            .selected_name
-            .as_deref()
-            .and_then(|name| selection_by_selector(&view, group_name, name).ok())
-            .map(|selection| SelectorIdentity {
-                id: selection.record_id.as_str().to_owned(),
-                name: selection.node_name,
-            });
+        let groups = view
+            .groups
+            .iter()
+            .filter(|group| group.selectable && !group.core_internal)
+            .map(|group| proxy_group_summary(&view, group))
+            .collect();
         Ok(ApplicationOutput::Proxies(ProxyListOutcome {
-            group: ProxyGroupSummary {
-                name: group.name,
-                proxy_type: group.proxy_type,
-                selectable: group.selectable,
-                selected_node,
-            },
+            group: proxy_group_summary(&view, group),
+            groups,
             nodes: rows,
         }))
     }
@@ -2198,6 +2191,23 @@ fn probe_observations(
                 })
         })
         .collect()
+}
+
+fn proxy_group_summary(view: &ProxyView, group: &crate::core::ProxyGroup) -> ProxyGroupSummary {
+    let selected_node = group
+        .selected_name
+        .as_deref()
+        .and_then(|name| selection_by_selector(view, &group.name, name).ok())
+        .map(|selection| SelectorIdentity {
+            id: selection.record_id.as_str().to_owned(),
+            name: selection.node_name,
+        });
+    ProxyGroupSummary {
+        name: group.name.clone(),
+        proxy_type: group.proxy_type.clone(),
+        selectable: group.selectable,
+        selected_node,
+    }
 }
 
 fn proxy_row(row: crate::core::NodeRowV1) -> ProxyNodeRow {

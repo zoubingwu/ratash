@@ -15,15 +15,18 @@ use ratatui::backend::{Backend, CrosstermBackend};
 
 use crate::application::{
     ApplicationClient, ApplicationOperation, ApplicationOutput, ProfileMutationAction,
-    ProfileRefreshState, ProxyAvailability, ProxyMemberKind,
+    ProfileRefreshState, ProxyAvailability, ProxyGroupSummary, ProxyListOutcome, ProxyMemberKind,
 };
-use crate::constants::{LOG_CAPACITY, RECONNECT_INITIAL_BACKOFF, RECONNECT_MAX_BACKOFF};
+use crate::constants::{
+    LOG_CAPACITY, MAX_ACTIVE_NODES, RECONNECT_INITIAL_BACKOFF, RECONNECT_MAX_BACKOFF,
+};
 use crate::domain::StatusSnapshot;
 use crate::ipc::RequestId;
 use crate::tui::{
     AppState, Command, ConnectionStatus, CrosstermControl, EventSource, FairEventInbox,
-    FullViewSnapshot, InteractionMap, MutationSuccess, ProfileRow, ProxyRow, TerminalControl,
-    TerminalSession, UiEvent, ViewLogRecord, from_crossterm_event, render, update,
+    FullViewSnapshot, InteractionMap, MutationSuccess, ProfileRow, ProxyGroupRow,
+    ProxyGroupSnapshot, ProxyRow, TerminalControl, TerminalSession, UiEvent, ViewLogRecord,
+    from_crossterm_event, render, update,
 };
 
 const COMMAND_QUEUE_CAPACITY: usize = 32;
@@ -180,6 +183,18 @@ pub trait FullSnapshotSource: Send + Sync {
         cancellation: &CancellationToken,
     ) -> Result<FullViewSnapshot, StatusInterfaceError> {
         self.fetch_full_snapshot(connection_generation, cancellation)
+    }
+
+    fn fetch_proxy_group(
+        &self,
+        _group: &str,
+        _connection_generation: u64,
+        _cancellation: &CancellationToken,
+    ) -> Result<ProxyGroupSnapshot, StatusInterfaceError> {
+        Err(StatusInterfaceError::new(
+            StatusInterfaceErrorKind::InvalidConfiguration,
+            "The snapshot source does not support Proxy Group loading",
+        ))
     }
 }
 
@@ -381,7 +396,7 @@ where
         };
 
         check_snapshot_cancellation(cancellation)?;
-        let proxies = if let Some(group) = status.primary_proxy_group.clone() {
+        let (proxy_groups, proxies) = if let Some(group) = status.primary_proxy_group.clone() {
             match self
                 .client
                 .execute(ApplicationOperation::ProxyList {
@@ -389,26 +404,14 @@ where
                 })
                 .map_err(snapshot_application_error)?
             {
-                ApplicationOutput::Proxies(outcome) => outcome
-                    .nodes
-                    .into_iter()
-                    .map(|node| ProxyRow {
-                        group: group.clone(),
-                        node_id: node.id,
-                        name: node.name,
-                        node_type: node.proxy_type.unwrap_or_else(|| {
-                            proxy_member_kind_title(node.member_kind).to_owned()
-                        }),
-                        available: node.availability == ProxyAvailability::Available,
-                        selected: node.selected,
-                        delay_ms: node.delay_ms,
-                        sampled_at_unix_ms: node.sampled_at_unix_ms,
-                    })
-                    .collect(),
+                ApplicationOutput::Proxies(outcome) => {
+                    let snapshot = proxy_group_snapshot(outcome);
+                    (snapshot.groups, snapshot.proxies)
+                }
                 _ => return Err(unexpected_snapshot_output("Proxy list")),
             }
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
 
         let tail = if include_logs {
@@ -424,6 +427,7 @@ where
         };
         Ok(FullViewSnapshot {
             status,
+            proxy_groups,
             proxies,
             profiles,
             logs: bounded_log_records(tail.records),
@@ -451,6 +455,75 @@ where
         cancellation: &CancellationToken,
     ) -> Result<FullViewSnapshot, StatusInterfaceError> {
         self.fetch_snapshot(connection_generation, cancellation, false)
+    }
+
+    fn fetch_proxy_group(
+        &self,
+        group: &str,
+        _connection_generation: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<ProxyGroupSnapshot, StatusInterfaceError> {
+        check_snapshot_cancellation(cancellation)?;
+        match self
+            .client
+            .execute(ApplicationOperation::ProxyList {
+                group: group.to_owned(),
+            })
+            .map_err(snapshot_application_error)?
+        {
+            ApplicationOutput::Proxies(outcome) => Ok(proxy_group_snapshot(outcome)),
+            _ => Err(unexpected_snapshot_output("Proxy list")),
+        }
+    }
+}
+
+fn proxy_group_snapshot(outcome: ProxyListOutcome) -> ProxyGroupSnapshot {
+    let ProxyListOutcome {
+        group,
+        groups,
+        nodes,
+    } = outcome;
+    let group_name = group.name.clone();
+    let current_group = proxy_group_row(group);
+    let mut group_rows = groups
+        .into_iter()
+        .filter(|group| group.selectable)
+        .take(MAX_ACTIVE_NODES)
+        .map(proxy_group_row)
+        .collect::<Vec<_>>();
+    if group_rows.is_empty() {
+        group_rows.push(current_group.clone());
+    }
+    let proxies = nodes
+        .into_iter()
+        .take(MAX_ACTIVE_NODES)
+        .map(|node| ProxyRow {
+            group: group_name.clone(),
+            node_id: node.id,
+            name: node.name,
+            node_type: node
+                .proxy_type
+                .unwrap_or_else(|| proxy_member_kind_title(node.member_kind).to_owned()),
+            available: node.availability == ProxyAvailability::Available,
+            selected: node.selected,
+            delay_ms: node.delay_ms,
+            sampled_at_unix_ms: node.sampled_at_unix_ms,
+            freshness: node.freshness,
+            probe_status: node.probe_status,
+        })
+        .collect();
+    ProxyGroupSnapshot {
+        group: current_group,
+        groups: group_rows,
+        proxies,
+    }
+}
+
+fn proxy_group_row(group: ProxyGroupSummary) -> ProxyGroupRow {
+    ProxyGroupRow {
+        name: group.name,
+        proxy_type: group.proxy_type,
+        selected_node: group.selected_node.map(|node| node.name),
     }
 }
 
@@ -851,17 +924,32 @@ fn execute_work(
             connection_generation,
             group,
             node_id,
-        } => mutation_result(
+        } => proxy_selection_result(
             *request_id,
             *connection_generation,
-            ApplicationOperation::ProxySelect {
-                group: group.clone(),
-                node: node_id.as_str().to_owned(),
-            },
+            group,
+            node_id,
             &work.cancellation,
             snapshots,
             commands,
         ),
+        Command::FetchProxyGroup {
+            request_id,
+            connection_generation,
+            group,
+        } => {
+            let result = snapshots
+                .fetch_proxy_group(group, *connection_generation, &work.cancellation)
+                .map_err(|error| short_terminal_text(&error.to_string()));
+            DispatchedEvent {
+                source: EventSource::CommandResult,
+                event: UiEvent::ProxyGroupLoaded {
+                    request_id: *request_id,
+                    connection_generation: *connection_generation,
+                    result,
+                },
+            }
+        }
         Command::FetchLogTail {
             connection_generation,
             after_sequence,
@@ -957,10 +1045,43 @@ fn mutation_result(
     command_result(request_id, connection_generation, result)
 }
 
+fn proxy_selection_result(
+    request_id: RequestId,
+    connection_generation: u64,
+    group: &str,
+    node_id: &crate::domain::NodeRecordId,
+    cancellation: &CancellationToken,
+    snapshots: &Arc<dyn FullSnapshotSource>,
+    commands: &Arc<dyn UiCommandExecutor>,
+) -> DispatchedEvent {
+    let result = commands
+        .execute(
+            ApplicationOperation::ProxySelect {
+                group: group.to_owned(),
+                node: node_id.as_str().to_owned(),
+            },
+            cancellation,
+        )
+        .and_then(|message| {
+            let mut snapshot =
+                snapshots.fetch_full_snapshot(connection_generation, cancellation)?;
+            let selected_group =
+                snapshots.fetch_proxy_group(group, connection_generation, cancellation)?;
+            snapshot.proxy_groups = selected_group.groups;
+            snapshot.proxies = selected_group.proxies;
+            Ok(MutationSuccess {
+                message: short_terminal_text(&message),
+                snapshot,
+            })
+        });
+    command_result(request_id, connection_generation, result)
+}
+
 fn command_request_id(command: &Command) -> Option<RequestId> {
     match command {
         Command::ActivateProfile { request_id, .. }
         | Command::SelectNode { request_id, .. }
+        | Command::FetchProxyGroup { request_id, .. }
         | Command::Cancel { request_id } => Some(*request_id),
         Command::Connect { .. }
         | Command::ScheduleReconnect { .. }
@@ -2012,6 +2133,31 @@ impl<'a> StatusInterfaceRuntime<'a> {
                             request_id,
                             connection_generation,
                             result: Err("The command queue is full".to_owned()),
+                        },
+                    );
+                }
+            }
+            command @ Command::FetchProxyGroup {
+                request_id,
+                connection_generation,
+                ..
+            } => {
+                let result = if connection_generation != self.state.connection.generation
+                    || self.state.connection.status != ConnectionStatus::Connected
+                {
+                    Some("The Supervisor connection is unavailable".to_owned())
+                } else if self.dispatcher.submit(command).is_err() {
+                    Some("The command queue is full".to_owned())
+                } else {
+                    None
+                };
+                if let Some(message) = result {
+                    self.inbox.push(
+                        EventSource::CommandResult,
+                        UiEvent::ProxyGroupLoaded {
+                            request_id,
+                            connection_generation,
+                            result: Err(message),
                         },
                     );
                 }

@@ -20,11 +20,12 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Sparkline, Tabs, Widget};
 
+use crate::application::{LatencyFreshness, LatencyProbeStatus};
 use crate::constants::{
     LOG_CAPACITY, MAX_ACTIVE_NODES, MINIMUM_TERMINAL_HEIGHT, MINIMUM_TERMINAL_WIDTH,
     TRAFFIC_SERIES_CAPACITY,
 };
-use crate::domain::{NodeRecordId, ProfileId, StatusSnapshot};
+use crate::domain::{NodeRecordId, ProfileId, SampleState, StatusSnapshot};
 use crate::ipc::RequestId;
 use crate::telemetry::{CoreLogRecord, LogLevel, LogSource};
 
@@ -77,6 +78,7 @@ impl Page {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Focus {
     Tabs,
+    ProxyGroups,
     #[default]
     Content,
     Search,
@@ -88,7 +90,8 @@ pub enum Focus {
 impl Focus {
     fn next(self) -> Self {
         match self {
-            Self::Tabs => Self::Content,
+            Self::Tabs => Self::ProxyGroups,
+            Self::ProxyGroups => Self::Content,
             Self::Content => Self::Search,
             Self::Search => Self::FooterHelp,
             Self::FooterHelp => Self::FooterQuit,
@@ -99,7 +102,8 @@ impl Focus {
     fn previous(self) -> Self {
         match self {
             Self::Tabs => Self::FooterQuit,
-            Self::Content => Self::Tabs,
+            Self::ProxyGroups => Self::Tabs,
+            Self::Content => Self::ProxyGroups,
             Self::Search => Self::Content,
             Self::FooterHelp => Self::Search,
             Self::FooterQuit => Self::FooterHelp,
@@ -132,6 +136,15 @@ pub struct ProxyRow {
     pub selected: bool,
     pub delay_ms: Option<u64>,
     pub sampled_at_unix_ms: Option<u64>,
+    pub freshness: LatencyFreshness,
+    pub probe_status: LatencyProbeStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProxyGroupRow {
+    pub name: String,
+    pub proxy_type: String,
+    pub selected_node: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -244,12 +257,23 @@ impl LogLevelFilter {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ProxiesState {
+    pub groups: Vec<ProxyGroupRow>,
+    pub group_cursor: usize,
     pub rows: Vec<ProxyRow>,
     pub selected_group: Option<String>,
+    pub group_load_pending: Option<PendingProxyGroupLoad>,
+    pub selection_pending: Option<(String, NodeRecordId)>,
     pub selected: usize,
     pub scroll: usize,
     pub filter: String,
     pub sort: ProxySort,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingProxyGroupLoad {
+    pub request_id: RequestId,
+    pub connection_generation: u64,
+    pub group: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -318,6 +342,7 @@ pub struct PendingOperation {
 #[derive(Clone, Debug)]
 pub struct FullViewSnapshot {
     pub status: StatusSnapshot,
+    pub proxy_groups: Vec<ProxyGroupRow>,
     pub proxies: Vec<ProxyRow>,
     pub profiles: Vec<ProfileRow>,
     pub logs: Vec<ViewLogRecord>,
@@ -328,6 +353,13 @@ pub struct FullViewSnapshot {
 pub struct MutationSuccess {
     pub message: String,
     pub snapshot: FullViewSnapshot,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProxyGroupSnapshot {
+    pub group: ProxyGroupRow,
+    pub groups: Vec<ProxyGroupRow>,
+    pub proxies: Vec<ProxyRow>,
 }
 
 #[derive(Clone, Debug)]
@@ -416,11 +448,18 @@ impl AppState {
     fn replace_snapshot(&mut self, generation: u64, snapshot: FullViewSnapshot) {
         self.pending = None;
         self.profiles.activation_pending = None;
+        self.proxies.group_load_pending = None;
+        self.proxies.selection_pending = None;
         self.connection = ConnectionState {
             status: ConnectionStatus::Connected,
             generation,
             snapshot_stale: false,
         };
+        self.proxies.groups = snapshot
+            .proxy_groups
+            .into_iter()
+            .take(MAX_ACTIVE_NODES)
+            .collect();
         self.proxies.rows = snapshot
             .proxies
             .into_iter()
@@ -443,11 +482,18 @@ impl AppState {
         self.logs.evicted_total = 0;
         self.logs.gap = false;
         self.status = Some(snapshot.status);
-        self.proxies.selected_group = self
+        self.proxies.selected_group = self.proxies.rows.first().map(|row| row.group.clone());
+        self.proxies.group_cursor = self
             .proxies
-            .rows
-            .get(self.proxies.selected)
-            .map(|row| row.group.clone());
+            .selected_group
+            .as_ref()
+            .and_then(|selected| {
+                self.proxies
+                    .groups
+                    .iter()
+                    .position(|group| &group.name == selected)
+            })
+            .unwrap_or(0);
         self.push_traffic_sample();
         self.clamp_selections();
         self.render_dirty = true;
@@ -465,13 +511,25 @@ impl AppState {
             .into_iter()
             .take(MAX_ACTIVE_NODES)
             .collect::<Vec<_>>();
+        let proxy_groups = snapshot
+            .proxy_groups
+            .into_iter()
+            .take(MAX_ACTIVE_NODES)
+            .collect::<Vec<_>>();
+        let incoming_group = proxies.first().map(|row| row.group.as_str());
+        let replace_proxies = self
+            .proxies
+            .selected_group
+            .as_deref()
+            .is_none_or(|selected| Some(selected) == incoming_group);
         let profiles = snapshot
             .profiles
             .into_iter()
             .take(PROFILE_VIEW_CAPACITY)
             .collect::<Vec<_>>();
         if self.status.as_ref() == Some(&snapshot.status)
-            && self.proxies.rows == proxies
+            && (!replace_proxies || self.proxies.rows == proxies)
+            && self.proxies.groups == proxy_groups
             && self.profiles.rows == profiles
             && !self.connection.snapshot_stale
         {
@@ -483,9 +541,18 @@ impl AppState {
         let selected_profile = filtered_profiles(&self.profiles)
             .get(self.profiles.selected)
             .map(|row| row.id);
-        self.proxies.rows = proxies;
+        let focused_group = self
+            .proxies
+            .groups
+            .get(self.proxies.group_cursor)
+            .map(|group| group.name.clone());
+        if replace_proxies {
+            self.proxies.rows = proxies;
+        }
+        self.proxies.groups = proxy_groups;
         self.profiles.rows = profiles;
-        if let Some(selected) = selected_proxy
+        if replace_proxies
+            && let Some(selected) = selected_proxy
             && let Some(index) = filtered_proxies(&self.proxies)
                 .iter()
                 .position(|row| row.node_id.as_ref() == Some(&selected))
@@ -501,9 +568,23 @@ impl AppState {
         }
         self.status = Some(snapshot.status);
         self.connection.snapshot_stale = false;
-        self.proxies.selected_group = filtered_proxies(&self.proxies)
-            .get(self.proxies.selected)
-            .map(|row| row.group.clone());
+        if replace_proxies {
+            self.proxies.selected_group = self.proxies.rows.first().map(|row| row.group.clone());
+        }
+        self.proxies.group_cursor = self
+            .proxies
+            .groups
+            .iter()
+            .position(|group| focused_group.as_ref() == Some(&group.name))
+            .or_else(|| {
+                self.proxies.selected_group.as_ref().and_then(|selected| {
+                    self.proxies
+                        .groups
+                        .iter()
+                        .position(|group| &group.name == selected)
+                })
+            })
+            .unwrap_or(0);
         self.clamp_selections();
         self.render_dirty = true;
     }
@@ -525,6 +606,8 @@ impl AppState {
     }
 
     fn clamp_selections(&mut self) {
+        self.proxies.group_cursor =
+            clamp_index(self.proxies.group_cursor, self.proxies.groups.len());
         self.proxies.selected = clamp_index(self.proxies.selected, self.filtered_proxy_count());
         self.profiles.selected = clamp_index(self.profiles.selected, self.filtered_profile_count());
     }
@@ -557,6 +640,11 @@ pub enum UiEvent {
         connection_generation: u64,
         snapshot: FullViewSnapshot,
     },
+    ProxyGroupLoaded {
+        request_id: RequestId,
+        connection_generation: u64,
+        result: Result<ProxyGroupSnapshot, String>,
+    },
     LogBatch {
         connection_generation: u64,
         records: Vec<ViewLogRecord>,
@@ -586,6 +674,9 @@ pub enum UiIntent {
     FocusNext,
     FocusPrevious,
     FocusSearch,
+    PreviousProxyGroup,
+    NextProxyGroup,
+    ShowProxyGroup(String),
     InputCharacter(char),
     Backspace,
     Escape,
@@ -626,6 +717,11 @@ pub enum Command {
         connection_generation: u64,
         group: String,
         node_id: NodeRecordId,
+    },
+    FetchProxyGroup {
+        request_id: RequestId,
+        connection_generation: u64,
+        group: String,
     },
     FetchLogTail {
         connection_generation: u64,
@@ -691,6 +787,52 @@ pub fn update(state: &mut AppState, event: UiEvent) -> Vec<Command> {
             state.refresh_snapshot(connection_generation, snapshot);
             Vec::new()
         }
+        UiEvent::ProxyGroupLoaded {
+            request_id,
+            connection_generation,
+            result,
+        } => {
+            let current = state
+                .proxies
+                .group_load_pending
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.request_id == request_id
+                        && pending.connection_generation == connection_generation
+                        && connection_generation == state.connection.generation
+                });
+            if current {
+                state.proxies.group_load_pending = None;
+                match result {
+                    Ok(snapshot) => {
+                        state.proxies.groups =
+                            snapshot.groups.into_iter().take(MAX_ACTIVE_NODES).collect();
+                        state.proxies.rows = snapshot
+                            .proxies
+                            .into_iter()
+                            .take(MAX_ACTIVE_NODES)
+                            .collect();
+                        state.proxies.selected_group = Some(snapshot.group.name.clone());
+                        state.proxies.group_cursor = state
+                            .proxies
+                            .groups
+                            .iter()
+                            .position(|group| group.name == snapshot.group.name)
+                            .unwrap_or(0);
+                        state.proxies.selected = 0;
+                        state.proxies.scroll = 0;
+                        state.toast = Some(format!(
+                            "Success: Loaded Proxy Group {}",
+                            snapshot.group.name
+                        ));
+                    }
+                    Err(message) => state.toast = Some(format!("Error: {message}")),
+                }
+                state.clamp_selections();
+                state.render_dirty = true;
+            }
+            Vec::new()
+        }
         UiEvent::LogBatch {
             connection_generation,
             records,
@@ -728,7 +870,7 @@ pub fn update(state: &mut AppState, event: UiEvent) -> Vec<Command> {
                 match result {
                     Ok(success) => {
                         state.replace_snapshot(connection_generation, success.snapshot);
-                        state.toast = Some(success.message);
+                        state.toast = Some(format!("Success: {}", success.message));
                     }
                     Err(message) => {
                         if state.pending.as_ref().is_some_and(|pending| {
@@ -737,7 +879,8 @@ pub fn update(state: &mut AppState, event: UiEvent) -> Vec<Command> {
                             state.profiles.activation_pending = None;
                         }
                         state.pending = None;
-                        state.toast = Some(message);
+                        state.proxies.selection_pending = None;
+                        state.toast = Some(format!("Error: {message}"));
                         state.render_dirty = true;
                     }
                 }
@@ -795,7 +938,7 @@ fn apply_intent(state: &mut AppState, intent: UiIntent) -> Vec<Command> {
         }
         UiIntent::FocusNext => {
             let mut focus = state.focus.next();
-            if state.page == Page::Overview && focus == Focus::Search {
+            while !focus_available(state.page, focus) {
                 focus = focus.next();
             }
             state.focus = focus;
@@ -803,7 +946,7 @@ fn apply_intent(state: &mut AppState, intent: UiIntent) -> Vec<Command> {
         }
         UiIntent::FocusPrevious => {
             let mut focus = state.focus.previous();
-            if state.page == Page::Overview && focus == Focus::Search {
+            while !focus_available(state.page, focus) {
                 focus = focus.previous();
             }
             state.focus = focus;
@@ -815,6 +958,9 @@ fn apply_intent(state: &mut AppState, intent: UiIntent) -> Vec<Command> {
             }
             Vec::new()
         }
+        UiIntent::PreviousProxyGroup => move_proxy_group(state, -1),
+        UiIntent::NextProxyGroup => move_proxy_group(state, 1),
+        UiIntent::ShowProxyGroup(group) => issue_proxy_group_load(state, group),
         UiIntent::InputCharacter(character) => {
             append_search(state, character);
             Vec::new()
@@ -906,6 +1052,53 @@ fn append_search(state: &mut AppState, character: char) {
     }
 }
 
+fn focus_available(page: Page, focus: Focus) -> bool {
+    match focus {
+        Focus::ProxyGroups => page == Page::Proxies,
+        Focus::Search => page != Page::Overview,
+        Focus::Modal => false,
+        Focus::Tabs | Focus::Content | Focus::FooterHelp | Focus::FooterQuit => true,
+    }
+}
+
+fn move_proxy_group(state: &mut AppState, delta: isize) -> Vec<Command> {
+    state.proxies.group_cursor = moved_index(
+        state.proxies.group_cursor,
+        state.proxies.groups.len(),
+        delta,
+    );
+    Vec::new()
+}
+
+fn issue_proxy_group_load(state: &mut AppState, group: String) -> Vec<Command> {
+    if let Some(index) = state
+        .proxies
+        .groups
+        .iter()
+        .position(|candidate| candidate.name == group)
+    {
+        state.proxies.group_cursor = index;
+    }
+    if state.proxies.selected_group.as_deref() == Some(group.as_str())
+        && state.proxies.group_load_pending.is_none()
+    {
+        return Vec::new();
+    }
+    let request_id = state.take_request_id();
+    let mut commands = cancel_group_load(state);
+    state.proxies.group_load_pending = Some(PendingProxyGroupLoad {
+        request_id,
+        connection_generation: state.connection.generation,
+        group: group.clone(),
+    });
+    commands.push(Command::FetchProxyGroup {
+        request_id,
+        connection_generation: state.connection.generation,
+        group,
+    });
+    commands
+}
+
 fn current_search_mut(state: &mut AppState) -> Option<&mut String> {
     match state.page {
         Page::Overview => None,
@@ -922,10 +1115,6 @@ fn move_selection(state: &mut AppState, delta: isize) {
             state.proxies.selected =
                 moved_index(state.proxies.selected, state.filtered_proxy_count(), delta);
             state.proxies.scroll = state.proxies.selected;
-            let selected_group = filtered_proxies(&state.proxies)
-                .get(state.proxies.selected)
-                .map(|row| row.group.clone());
-            state.proxies.selected_group = selected_group;
         }
         Page::Profiles => {
             state.profiles.selected = moved_index(
@@ -1003,6 +1192,7 @@ fn issue_node_selection(
         kind: PendingOperationKind::SelectNode,
     });
     state.proxies.selected_group = Some(group.clone());
+    state.proxies.selection_pending = Some((group.clone(), node_id.clone()));
     commands.push(Command::SelectNode {
         request_id,
         connection_generation: state.connection.generation,
@@ -1013,14 +1203,33 @@ fn issue_node_selection(
 }
 
 fn cancel_pending(state: &mut AppState) -> Vec<Command> {
+    let mut commands = cancel_mutation(state);
+    commands.extend(cancel_group_load(state));
+    commands
+}
+
+fn cancel_mutation(state: &mut AppState) -> Vec<Command> {
     state.pending.take().map_or_else(Vec::new, |pending| {
         if pending.kind == PendingOperationKind::ActivateProfile {
             state.profiles.activation_pending = None;
         }
+        state.proxies.selection_pending = None;
         vec![Command::Cancel {
             request_id: pending.request_id,
         }]
     })
+}
+
+fn cancel_group_load(state: &mut AppState) -> Vec<Command> {
+    state
+        .proxies
+        .group_load_pending
+        .take()
+        .map_or_else(Vec::new, |pending| {
+            vec![Command::Cancel {
+                request_id: pending.request_id,
+            }]
+        })
 }
 
 fn filtered_proxies(state: &ProxiesState) -> Vec<&ProxyRow> {
@@ -1048,23 +1257,76 @@ fn filtered_profiles(state: &ProfilesState) -> Vec<&ProfileRow> {
 }
 
 fn filtered_logs(state: &LogsState) -> Vec<&ViewLogRecord> {
-    let needle = state.search.to_lowercase();
+    let query = parse_log_query(&state.search);
+    let since = match (state.since_unix_ms, query.since_unix_ms) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, right) => left.or(right),
+    };
+    let until = match (state.until_unix_ms, query.until_unix_ms) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, right) => left.or(right),
+    };
     state
         .records
         .iter()
         .filter(|record| state.level_filter.matches(record.level))
+        .filter(|record| query.level.is_none_or(|level| level.matches(record.level)))
+        .filter(|record| since.is_none_or(|since| record.timestamp_unix_ms >= since))
+        .filter(|record| until.is_none_or(|until| record.timestamp_unix_ms <= until))
         .filter(|record| {
-            state
-                .since_unix_ms
-                .is_none_or(|since| record.timestamp_unix_ms >= since)
+            let message = record.message.to_lowercase();
+            query
+                .content_terms
+                .iter()
+                .all(|term| message.contains(term))
         })
-        .filter(|record| {
-            state
-                .until_unix_ms
-                .is_none_or(|until| record.timestamp_unix_ms <= until)
-        })
-        .filter(|record| needle.is_empty() || record.message.to_lowercase().contains(&needle))
         .collect()
+}
+
+#[derive(Debug, Default)]
+struct LogQuery {
+    since_unix_ms: Option<u64>,
+    until_unix_ms: Option<u64>,
+    level: Option<LogLevelFilter>,
+    content_terms: Vec<String>,
+}
+
+fn parse_log_query(input: &str) -> LogQuery {
+    let mut query = LogQuery::default();
+    for token in input.split_whitespace() {
+        let lower = token.to_lowercase();
+        if let Some(value) = lower.strip_prefix("since:")
+            && let Ok(value) = value.parse()
+        {
+            query.since_unix_ms = Some(value);
+        } else if let Some(value) = lower.strip_prefix("until:")
+            && let Ok(value) = value.parse()
+        {
+            query.until_unix_ms = Some(value);
+        } else if let Some(value) = lower.strip_prefix("level:")
+            && let Some(level) = parse_log_level_filter(value)
+        {
+            query.level = Some(level);
+        } else if let Some(value) = lower.strip_prefix("content:") {
+            if !value.is_empty() {
+                query.content_terms.push(value.to_owned());
+            }
+        } else {
+            query.content_terms.push(lower);
+        }
+    }
+    query
+}
+
+fn parse_log_level_filter(value: &str) -> Option<LogLevelFilter> {
+    match value {
+        "all" => Some(LogLevelFilter::All),
+        "debug" => Some(LogLevelFilter::Debug),
+        "info" => Some(LogLevelFilter::Info),
+        "warn" | "warning" => Some(LogLevelFilter::Warn),
+        "error" => Some(LogLevelFilter::Error),
+        _ => None,
+    }
 }
 
 fn clamp_index(index: usize, length: usize) -> usize {
@@ -1203,9 +1465,17 @@ pub fn input_to_intent(state: &AppState, input: TerminalInput) -> Option<UiInten
         KeyInput::Character('2') => Some(UiIntent::SwitchPage(Page::Proxies)),
         KeyInput::Character('3') => Some(UiIntent::SwitchPage(Page::Profiles)),
         KeyInput::Character('4') => Some(UiIntent::SwitchPage(Page::Logs)),
+        KeyInput::Character('j') | KeyInput::Down if state.focus == Focus::ProxyGroups => {
+            Some(UiIntent::NextProxyGroup)
+        }
+        KeyInput::Character('k') | KeyInput::Up if state.focus == Focus::ProxyGroups => {
+            Some(UiIntent::PreviousProxyGroup)
+        }
         KeyInput::Character('j') | KeyInput::Down => Some(UiIntent::MoveDown),
         KeyInput::Character('k') | KeyInput::Up => Some(UiIntent::MoveUp),
         KeyInput::Enter => selected_intent(state),
+        KeyInput::Left if state.focus == Focus::ProxyGroups => Some(UiIntent::PreviousProxyGroup),
+        KeyInput::Right if state.focus == Focus::ProxyGroups => Some(UiIntent::NextProxyGroup),
         KeyInput::Left => Some(UiIntent::PreviousPage),
         KeyInput::Right => Some(UiIntent::NextPage),
         KeyInput::Tab => Some(UiIntent::FocusNext),
@@ -1241,6 +1511,13 @@ pub fn input_to_intent(state: &AppState, input: TerminalInput) -> Option<UiInten
 fn selected_intent(state: &AppState) -> Option<UiIntent> {
     match state.focus {
         Focus::Tabs => return Some(UiIntent::SwitchPage(state.page)),
+        Focus::ProxyGroups => {
+            return state
+                .proxies
+                .groups
+                .get(state.proxies.group_cursor)
+                .map(|group| UiIntent::ShowProxyGroup(group.name.clone()));
+        }
         Focus::FooterHelp => return Some(UiIntent::ToggleHelp),
         Focus::FooterQuit => return Some(UiIntent::Quit),
         Focus::Search | Focus::Modal => return None,
@@ -1321,6 +1598,7 @@ pub struct LayoutRegions {
     pub navigation: Rect,
     pub content: Rect,
     pub footer: Rect,
+    pub proxy_groups: Option<Rect>,
     pub search: Option<Rect>,
     pub list: Option<Rect>,
     pub modal: Option<Rect>,
@@ -1339,6 +1617,7 @@ pub fn compute_layout(
                 navigation: Rect::default(),
                 content: area,
                 footer: Rect::default(),
+                proxy_groups: None,
                 search: None,
                 list: None,
                 modal: None,
@@ -1363,14 +1642,25 @@ pub fn compute_layout(
     let navigation = vertical[0];
     let content = vertical[1];
     let footer = vertical[2];
-    let (search, list) = match state.page {
-        Page::Overview => (None, None),
-        Page::Proxies | Page::Profiles => {
+    let (proxy_groups, search, list) = match state.page {
+        Page::Overview => (None, None, None),
+        Page::Proxies => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Min(1),
+                ])
+                .split(content);
+            (Some(rows[0]), Some(rows[1]), Some(rows[2]))
+        }
+        Page::Profiles => {
             let rows = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(3), Constraint::Min(1)])
                 .split(content);
-            (Some(rows[0]), Some(rows[1]))
+            (None, Some(rows[0]), Some(rows[1]))
         }
         Page::Logs => {
             let rows = Layout::default()
@@ -1381,7 +1671,7 @@ pub fn compute_layout(
                     Constraint::Min(1),
                 ])
                 .split(content);
-            (Some(rows[1]), Some(rows[2]))
+            (None, Some(rows[1]), Some(rows[2]))
         }
     };
     let modal = state.modal.as_ref().map(|_| centered_rect(64, 14, area));
@@ -1390,6 +1680,7 @@ pub fn compute_layout(
         navigation,
         content,
         footer,
+        proxy_groups,
         search,
         list,
         modal,
@@ -1479,6 +1770,34 @@ fn interaction_map(
                     intent: UiIntent::SetProxySort(sort),
                 });
             }
+        }
+    }
+    if let Some(group_area) = regions.proxy_groups {
+        interactions.push(Interaction {
+            area: Rect::new(
+                group_area.x.saturating_add(1),
+                group_area.y.saturating_add(1),
+                3,
+                1,
+            ),
+            intent: UiIntent::PreviousProxyGroup,
+        });
+        interactions.push(Interaction {
+            area: Rect::new(
+                group_area
+                    .x
+                    .saturating_add(group_area.width.saturating_sub(4)),
+                group_area.y.saturating_add(1),
+                3,
+                1,
+            ),
+            intent: UiIntent::NextProxyGroup,
+        });
+        for (_, group, area) in visible_proxy_groups(&state.proxies, group_area) {
+            interactions.push(Interaction {
+                area,
+                intent: UiIntent::ShowProxyGroup(group.name.clone()),
+            });
         }
     }
     if let Some(list) = regions.list {
@@ -1633,8 +1952,44 @@ fn render_overview(state: &AppState, area: Rect, buffer: &mut Buffer) {
             .selected_node
             .as_ref()
             .map_or_else(|| Cow::Borrowed("-"), |node| terminal_safe(&node.name));
+        let selected_probe_status = status.selected_node.as_ref().and_then(|selected| {
+            state
+                .proxies
+                .rows
+                .iter()
+                .find(|row| row.node_id.as_ref() == Some(&selected.id))
+                .map(|row| latency_probe_status_title(row.probe_status))
+        });
+        let (delay, sampled_at, freshness, probe_status, probe_generation) =
+            status.latency.as_ref().map_or_else(
+                || {
+                    (
+                        "not_sampled".to_owned(),
+                        "-".to_owned(),
+                        selected_probe_status.unwrap_or("not_sampled"),
+                        "not_sampled",
+                        "-".to_owned(),
+                    )
+                },
+                |sample| {
+                    (
+                        sample.delay_ms.map_or_else(
+                            || "not_sampled".to_owned(),
+                            |delay| format!("{delay} ms"),
+                        ),
+                        sample
+                            .sampled_at_unix_ms
+                            .map_or_else(|| "-".to_owned(), |sampled_at| sampled_at.to_string()),
+                        sample_state_title(sample.state),
+                        selected_probe_status.unwrap_or_else(|| {
+                            latency_sample_probe_status(sample.state, sample.delay_ms)
+                        }),
+                        sample.probe_generation.0.to_string(),
+                    )
+                },
+            );
         format!(
-            "Connection: {connection}\nSupervisor: {:?}\nCore: {:?}\nTUN: {}\nActive Profile: {}\nPrimary Group: {}\nCurrent Node: {}\nLatency: {}\nConnections: {}\nUptime: {}s",
+            "Connection: {connection}\nSupervisor: {:?}\nCore: {:?}\nTUN: {}\nActive Profile: {}\nPrimary Group: {}\nCurrent Node: {}\nLatency: {delay}\nSampled At: {sampled_at}\nFreshness: {freshness}\nProbe: {probe_status} (generation {probe_generation})\nConnections: {}\nUptime: {}s",
             status.supervisor.lifecycle,
             status.core.lifecycle,
             if status.tun.effective {
@@ -1645,11 +2000,6 @@ fn render_overview(state: &AppState, area: Rect, buffer: &mut Buffer) {
             active_profile,
             primary_group,
             current_node,
-            status
-                .latency
-                .as_ref()
-                .and_then(|sample| sample.delay_ms)
-                .map_or_else(|| "not sampled".to_owned(), |delay| format!("{delay} ms")),
             status.connection_count,
             status.supervisor.uptime_seconds,
         )
@@ -1657,7 +2007,12 @@ fn render_overview(state: &AppState, area: Rect, buffer: &mut Buffer) {
         format!("Connection: {connection}\nWaiting for the first status snapshot")
     };
     Paragraph::new(body)
-        .block(Block::default().borders(Borders::ALL).title("Status"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(focus_border(state.focus == Focus::Content))
+                .title("Status"),
+        )
         .render(columns[0], buffer);
 
     let traffic = Layout::default()
@@ -1678,7 +2033,134 @@ fn render_overview(state: &AppState, area: Rect, buffer: &mut Buffer) {
         .render(traffic[1], buffer);
 }
 
+fn visible_proxy_groups(state: &ProxiesState, area: Rect) -> Vec<(usize, &ProxyGroupRow, Rect)> {
+    let mut visible = Vec::new();
+    let mut x = area.x.saturating_add(4);
+    let end = area.x.saturating_add(area.width.saturating_sub(4));
+    for (index, group) in state
+        .groups
+        .iter()
+        .enumerate()
+        .skip(state.group_cursor.min(state.groups.len().saturating_sub(1)))
+    {
+        let width = proxy_group_chip_width(state, group).min(end.saturating_sub(x));
+        if width == 0 {
+            break;
+        }
+        visible.push((
+            index,
+            group,
+            Rect::new(x, area.y.saturating_add(1), width, 1),
+        ));
+        x = x.saturating_add(width);
+        if x >= end {
+            break;
+        }
+    }
+    visible
+}
+
+fn proxy_group_chip_width(state: &ProxiesState, group: &ProxyGroupRow) -> u16 {
+    proxy_group_chip_label(state, group)
+        .chars()
+        .count()
+        .clamp(5, 24)
+        .try_into()
+        .unwrap_or(24)
+}
+
+fn proxy_group_chip_label(state: &ProxiesState, group: &ProxyGroupRow) -> String {
+    let marker = if state
+        .group_load_pending
+        .as_ref()
+        .is_some_and(|pending| pending.group == group.name)
+    {
+        "[pending]"
+    } else if state.selected_group.as_deref() == Some(group.name.as_str()) {
+        "[current]"
+    } else {
+        ""
+    };
+    format!("{marker} {} ", terminal_safe(&group.name))
+}
+
+fn render_proxy_groups(state: &AppState, area: Rect, buffer: &mut Buffer) {
+    let focused_group = state.proxies.groups.get(state.proxies.group_cursor);
+    let focused = focused_group.map_or_else(
+        || "unconfigured".to_owned(),
+        |group| {
+            format!(
+                "{} -> {}",
+                terminal_safe(&group.name),
+                group
+                    .selected_node
+                    .as_deref()
+                    .map_or_else(|| Cow::Borrowed("-"), terminal_safe)
+            )
+        },
+    );
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(focus_border(state.focus == Focus::ProxyGroups))
+        .title(format!(
+            "Proxy Groups ({}) · focus {focused} · Enter switches",
+            state.proxies.groups.len()
+        ))
+        .render(area, buffer);
+    Paragraph::new(" < ")
+        .style(Style::default().fg(Color::Yellow))
+        .render(
+            Rect::new(area.x.saturating_add(1), area.y.saturating_add(1), 3, 1),
+            buffer,
+        );
+    Paragraph::new(" > ")
+        .style(Style::default().fg(Color::Yellow))
+        .render(
+            Rect::new(
+                area.x.saturating_add(area.width.saturating_sub(4)),
+                area.y.saturating_add(1),
+                3,
+                1,
+            ),
+            buffer,
+        );
+    for (index, group, chip_area) in visible_proxy_groups(&state.proxies, area) {
+        let current = state.proxies.selected_group.as_deref() == Some(group.name.as_str());
+        let pending = state
+            .proxies
+            .group_load_pending
+            .as_ref()
+            .is_some_and(|load| load.group == group.name);
+        let focused = index == state.proxies.group_cursor;
+        let style = if pending {
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD)
+        } else if focused && state.focus == Focus::ProxyGroups {
+            Style::default().fg(Color::Black).bg(Color::Yellow)
+        } else if current {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else if focused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        Paragraph::new(proxy_group_chip_label(&state.proxies, group))
+            .style(style)
+            .render(chip_area, buffer);
+    }
+}
+
 fn render_proxies(state: &AppState, regions: &LayoutRegions, buffer: &mut Buffer) {
+    render_proxy_groups(
+        state,
+        regions
+            .proxy_groups
+            .expect("Proxies layout includes Proxy Groups"),
+        buffer,
+    );
     let search_area = regions.search.expect("Proxies layout includes search");
     let search_style = if state.focus == Focus::Search {
         Style::default()
@@ -1718,7 +2200,20 @@ fn render_proxies(state: &AppState, regions: &LayoutRegions, buffer: &mut Buffer
         .skip(offset)
         .enumerate()
         .map(|(index, row)| {
-            let marker = if row.selected { "*" } else { " " };
+            let pending =
+                state
+                    .proxies
+                    .selection_pending
+                    .as_ref()
+                    .is_some_and(|(group, node_id)| {
+                        group == &row.group && row.node_id.as_ref() == Some(node_id)
+                    });
+            let marker = match (row.selected, pending) {
+                (true, true) => "[current][pending]",
+                (true, false) => "[current]         ",
+                (false, true) => "[pending]         ",
+                (false, false) => "                  ",
+            };
             let availability = if row.available {
                 "ready"
             } else {
@@ -1727,12 +2222,18 @@ fn render_proxies(state: &AppState, regions: &LayoutRegions, buffer: &mut Buffer
             let delay = row
                 .delay_ms
                 .map_or_else(|| "not_sampled".to_owned(), |delay| format!("{delay}ms"));
+            let sampled_at = row
+                .sampled_at_unix_ms
+                .map_or_else(|| "-".to_owned(), |sampled_at| sampled_at.to_string());
             let item = ListItem::new(format!(
-                "{marker} {:<14} {:<20} {:<12} {:<11} {delay}",
-                terminal_safe(&row.group),
+                "{marker} {:<20} {:<12} {:<11} {:<11} sampled={:<13} freshness={:<11} probe={}",
                 terminal_safe(&row.name),
                 terminal_safe(&row.node_type),
-                availability
+                availability,
+                delay,
+                sampled_at,
+                latency_freshness_title(row.freshness),
+                latency_probe_status_title(row.probe_status),
             ));
             if offset + index == state.proxies.selected {
                 item.style(selected_style(state.focus == Focus::Content))
@@ -1742,12 +2243,65 @@ fn render_proxies(state: &AppState, regions: &LayoutRegions, buffer: &mut Buffer
         })
         .collect::<Vec<_>>();
     List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            "Nodes ({}) · {:?}",
-            state.proxies.rows.len(),
-            state.proxies.sort
-        )))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(focus_border(state.focus == Focus::Content))
+                .title(format!(
+                    "Nodes ({}) · {} · {:?}",
+                    state.proxies.rows.len(),
+                    state
+                        .proxies
+                        .selected_group
+                        .as_deref()
+                        .unwrap_or("unconfigured"),
+                    state.proxies.sort
+                )),
+        )
         .render(regions.list.expect("Proxies layout includes list"), buffer);
+}
+
+fn focus_border(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    }
+}
+
+fn sample_state_title(state: SampleState) -> &'static str {
+    match state {
+        SampleState::Fresh => "fresh",
+        SampleState::Stale => "stale",
+        SampleState::Unavailable => "unavailable",
+    }
+}
+
+fn latency_sample_probe_status(state: SampleState, delay_ms: Option<u64>) -> &'static str {
+    match (state, delay_ms) {
+        (SampleState::Unavailable, _) => "failed",
+        (SampleState::Fresh | SampleState::Stale, Some(_)) => "succeeded",
+        (SampleState::Fresh | SampleState::Stale, None) => "not_sampled",
+    }
+}
+
+fn latency_freshness_title(freshness: LatencyFreshness) -> &'static str {
+    match freshness {
+        LatencyFreshness::NotSampled => "not_sampled",
+        LatencyFreshness::Fresh => "fresh",
+        LatencyFreshness::Stale => "stale",
+        LatencyFreshness::Unavailable => "unavailable",
+    }
+}
+
+fn latency_probe_status_title(status: LatencyProbeStatus) -> &'static str {
+    match status {
+        LatencyProbeStatus::NotSampled => "not_sampled",
+        LatencyProbeStatus::Queued => "queued",
+        LatencyProbeStatus::InFlight => "in_flight",
+        LatencyProbeStatus::Succeeded => "succeeded",
+        LatencyProbeStatus::Failed => "failed",
+    }
 }
 
 fn render_profiles(state: &AppState, regions: &LayoutRegions, buffer: &mut Buffer) {
@@ -1765,19 +2319,22 @@ fn render_profiles(state: &AppState, regions: &LayoutRegions, buffer: &mut Buffe
         .skip(offset)
         .enumerate()
         .map(|(index, row)| {
-            let marker = if row.active { "*" } else { " " };
-            let freshness = if row.fresh { "fresh" } else { "stale" };
-            let pending = if state.profiles.activation_pending == Some(row.id) {
-                " pending"
-            } else {
-                ""
+            let marker = match (
+                row.active,
+                state.profiles.activation_pending == Some(row.id),
+            ) {
+                (true, true) => "[active][pending]",
+                (true, false) => "[active]         ",
+                (false, true) => "[pending]        ",
+                (false, false) => "                 ",
             };
+            let freshness = if row.fresh { "fresh" } else { "stale" };
             let error = row
                 .error
                 .as_deref()
                 .map_or_else(|| Cow::Borrowed("-"), terminal_safe);
             let item = ListItem::new(format!(
-                "{marker} {:<24} {:<6}{pending} next={} error={error}",
+                "{marker} {:<24} {:<6} next={} error={error}",
                 terminal_safe(&row.name),
                 freshness,
                 row.next_refresh_at_unix_ms
@@ -1793,6 +2350,7 @@ fn render_profiles(state: &AppState, regions: &LayoutRegions, buffer: &mut Buffe
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_style(focus_border(state.focus == Focus::Content))
                 .title(format!("Profiles ({})", state.profiles.rows.len())),
         )
         .render(regions.list.expect("Profiles layout includes list"), buffer);
@@ -1824,16 +2382,27 @@ fn render_logs(state: &AppState, regions: &LayoutRegions, buffer: &mut Buffer) {
                 } else {
                     " Pause  "
                 },
-                Style::default().fg(Color::Yellow),
+                if state.logs.paused {
+                    Style::default().fg(Color::Black).bg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                },
             ),
-            Span::styled(" Follow  ", Style::default().fg(Color::Green)),
+            Span::styled(
+                " Follow  ",
+                if state.logs.follow {
+                    Style::default().fg(Color::Black).bg(Color::Green)
+                } else {
+                    Style::default().fg(Color::Green)
+                },
+            ),
         ])
         .collect::<Vec<_>>();
     Paragraph::new(Line::from(filter_spans))
         .block(Block::default().borders(Borders::ALL).title("Log controls"))
         .render(controls, buffer);
     render_search(
-        "Log search",
+        "Log query · since:<ms> until:<ms> level:<name> content:<text>",
         &state.logs.search,
         state.focus == Focus::Search,
         regions.search.expect("Logs layout includes search"),
@@ -1868,13 +2437,23 @@ fn render_logs(state: &AppState, regions: &LayoutRegions, buffer: &mut Buffer) {
         })
         .collect::<Vec<_>>();
     let state_label = if state.logs.paused { "paused" } else { "live" };
+    let follow_label = if state.logs.follow {
+        "following"
+    } else {
+        "manual"
+    };
     List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            "Core Logs · {state_label} · dropped={} evicted={}{}",
-            state.logs.dropped_total,
-            state.logs.evicted_total,
-            if state.logs.gap { " · gap" } else { "" }
-        )))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(focus_border(state.focus == Focus::Content))
+                .title(format!(
+                    "Core Logs · {state_label} · {follow_label} · dropped={} evicted={}{}",
+                    state.logs.dropped_total,
+                    state.logs.evicted_total,
+                    if state.logs.gap { " · gap" } else { "" }
+                )),
+        )
         .render(regions.list.expect("Logs layout includes list"), buffer);
 }
 

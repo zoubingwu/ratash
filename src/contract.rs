@@ -359,6 +359,7 @@ impl From<application::ProfileMutationAction> for ProfileMutationActionViewV1 {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ProxyListViewV1 {
     pub group: ProxyGroupViewV1,
+    pub groups: Vec<ProxyGroupViewV1>,
     pub nodes: Vec<ProxyNodeViewV1>,
 }
 
@@ -366,6 +367,7 @@ impl From<application::ProxyListOutcome> for ProxyListViewV1 {
     fn from(outcome: application::ProxyListOutcome) -> Self {
         Self {
             group: outcome.group.into(),
+            groups: outcome.groups.into_iter().map(Into::into).collect(),
             nodes: outcome.nodes.into_iter().map(Into::into).collect(),
         }
     }

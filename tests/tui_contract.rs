@@ -10,6 +10,7 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
+use hopash::application::{LatencyFreshness, LatencyProbeStatus};
 use hopash::constants::{
     LOG_CAPACITY, MAX_ACTIVE_NODES, MINIMUM_TERMINAL_HEIGHT, MINIMUM_TERMINAL_WIDTH,
     TRAFFIC_SERIES_CAPACITY,
@@ -24,9 +25,9 @@ use hopash::telemetry::{LogLevel, LogSource};
 use hopash::tui::{
     AppState, Command, ConnectionStatus, EventBudgets, EventSource, FairEventInbox, Focus,
     FullViewSnapshot, InteractionMap, KeyInput, LogLevelFilter, Modal, MouseInput, MouseInputKind,
-    MutationSuccess, Page, ProfileRow, ProxyRow, TerminalAction, TerminalControl, TerminalInput,
-    TerminalSession, UiEvent, UiIntent, ViewLogRecord, from_crossterm_event, input_to_intent,
-    render, render_buffer, update,
+    MutationSuccess, Page, ProfileRow, ProxyGroupRow, ProxyGroupSnapshot, ProxyRow, TerminalAction,
+    TerminalControl, TerminalInput, TerminalSession, UiEvent, UiIntent, ViewLogRecord,
+    from_crossterm_event, input_to_intent, render, render_buffer, update,
 };
 
 #[test]
@@ -60,6 +61,8 @@ fn proxy_rows_without_stable_node_ids_are_visible_and_read_only() {
         selected: false,
         delay_ms: None,
         sampled_at_unix_ms: None,
+        freshness: LatencyFreshness::NotSampled,
+        probe_status: LatencyProbeStatus::NotSampled,
     }];
     state.proxies.selected = 0;
 
@@ -205,6 +208,53 @@ fn keyboard_and_mouse_node_selection_produce_the_same_intent() {
 }
 
 #[test]
+fn keyboard_and_mouse_proxy_group_switches_share_the_same_intent() {
+    let mut state = connected_state();
+    state.page = Page::Proxies;
+    state.focus = Focus::ProxyGroups;
+    state.proxies.groups.push(manual_proxy_group());
+    state.proxies.group_cursor = 1;
+    let (_, map) = render_with_backend(&state, 140, 30);
+    let manual_hit = hit_for(&map, |intent| {
+        *intent == UiIntent::ShowProxyGroup("Manual".to_owned())
+    });
+    let next_hit = hit_for(&map, |intent| *intent == UiIntent::NextProxyGroup);
+    state.publish_interaction_map(map);
+
+    assert_eq!(
+        input_to_intent(&state, TerminalInput::Key(KeyInput::Right)),
+        input_to_intent(
+            &state,
+            TerminalInput::Mouse(MouseInput {
+                kind: MouseInputKind::LeftClick,
+                column: next_hit.0,
+                row: next_hit.1,
+            })
+        )
+    );
+
+    let keyboard = input_to_intent(&state, TerminalInput::Key(KeyInput::Enter));
+    let mouse = input_to_intent(
+        &state,
+        TerminalInput::Mouse(MouseInput {
+            kind: MouseInputKind::LeftClick,
+            column: manual_hit.0,
+            row: manual_hit.1,
+        }),
+    );
+
+    assert_eq!(keyboard, mouse);
+    assert!(matches!(
+        update(
+            &mut state,
+            UiEvent::Intent(keyboard.expect("focused Proxy Group should switch"))
+        )
+        .as_slice(),
+        [Command::FetchProxyGroup { group, .. }] if group == "Manual"
+    ));
+}
+
+#[test]
 fn keyboard_and_mouse_sort_controls_share_the_same_intent() {
     let mut state = connected_state();
     state.page = Page::Proxies;
@@ -230,9 +280,13 @@ fn keyboard_and_mouse_sort_controls_share_the_same_intent() {
         UiEvent::Intent(keyboard.expect("sort intent should exist")),
     );
     let (text, _) = render_with_backend(&state, 100, 30);
+    let nodes = text
+        .split_once("Nodes (")
+        .map(|(_, nodes)| nodes)
+        .expect("Node list should render");
     assert!(
-        text.find("Berlin").expect("Berlin should render")
-            < text.find("Tokyo").expect("Tokyo should render")
+        nodes.find("Berlin").expect("Berlin should render")
+            < nodes.find("Tokyo").expect("Tokyo should render")
     );
 }
 
@@ -370,6 +424,145 @@ fn tab_shift_tab_and_page_shortcuts_update_navigation_state() {
 }
 
 #[test]
+fn tab_and_shift_tab_visit_only_controls_present_on_each_page() {
+    for (page, first_focus) in [
+        (Page::Overview, Focus::Content),
+        (Page::Proxies, Focus::ProxyGroups),
+        (Page::Profiles, Focus::Content),
+        (Page::Logs, Focus::Content),
+    ] {
+        let mut state = connected_state();
+        state.page = page;
+        state.focus = Focus::Tabs;
+
+        update(
+            &mut state,
+            UiEvent::Terminal(TerminalInput::Key(KeyInput::Tab)),
+        );
+        assert_eq!(state.focus, first_focus, "unexpected focus on {page:?}");
+        update(
+            &mut state,
+            UiEvent::Terminal(TerminalInput::Key(KeyInput::BackTab)),
+        );
+        assert_eq!(
+            state.focus,
+            Focus::Tabs,
+            "unexpected reverse focus on {page:?}"
+        );
+    }
+}
+
+#[test]
+fn proxy_group_browsing_keeps_mutations_and_discards_late_group_results() {
+    let mut state = connected_state();
+    state.proxies.groups.push(manual_proxy_group());
+    let profile_id = state.profiles.rows[1].id;
+    let mutation_commands = update(
+        &mut state,
+        UiEvent::Intent(UiIntent::ActivateProfile(profile_id)),
+    );
+    let (mutation_request_id, generation) = activation_identity(&mutation_commands);
+    let mutation_snapshot = snapshot_from_state(&state);
+
+    let group_commands = update(
+        &mut state,
+        UiEvent::Intent(UiIntent::ShowProxyGroup("Manual".to_owned())),
+    );
+    let (group_request_id, group_generation) = proxy_group_identity(&group_commands);
+    assert_eq!(group_generation, generation);
+    assert!(
+        group_commands
+            .iter()
+            .all(|command| !matches!(command, Command::Cancel { request_id } if *request_id == mutation_request_id))
+    );
+    assert_eq!(
+        state.pending.as_ref().map(|pending| pending.request_id),
+        Some(mutation_request_id)
+    );
+
+    update(
+        &mut state,
+        UiEvent::CommandResult {
+            request_id: mutation_request_id,
+            connection_generation: generation,
+            result: Ok(MutationSuccess {
+                message: "Profile activated".to_owned(),
+                snapshot: mutation_snapshot,
+            }),
+        },
+    );
+    let toast = state.toast.clone();
+    update(
+        &mut state,
+        UiEvent::ProxyGroupLoaded {
+            request_id: group_request_id,
+            connection_generation: group_generation,
+            result: Ok(manual_proxy_snapshot()),
+        },
+    );
+
+    assert_eq!(state.proxies.selected_group.as_deref(), Some("Automatic"));
+    assert_eq!(state.toast, toast);
+}
+
+#[test]
+fn proxy_group_load_and_mutation_states_are_visually_distinct() {
+    let mut profile_state = connected_state();
+    profile_state.page = Page::Profiles;
+    profile_state.profiles.selected = 1;
+    update(
+        &mut profile_state,
+        UiEvent::Intent(UiIntent::ActivateSelected),
+    );
+    let (profile_text, _) = render_with_backend(&profile_state, 180, 30);
+    assert!(profile_text.contains("[active]"));
+    assert!(profile_text.contains("[pending]"));
+
+    let mut state = connected_state();
+    state.page = Page::Proxies;
+    state.proxies.groups.push(manual_proxy_group());
+    state.proxies.selected = 1;
+    update(&mut state, UiEvent::Intent(UiIntent::ActivateSelected));
+    let (pending_text, _) = render_with_backend(&state, 180, 30);
+    assert!(pending_text.contains("[current]"));
+    assert!(pending_text.contains("[pending]"));
+
+    let group_commands = update(
+        &mut state,
+        UiEvent::Intent(UiIntent::ShowProxyGroup("Manual".to_owned())),
+    );
+    let (request_id, generation) = proxy_group_identity(&group_commands);
+    update(
+        &mut state,
+        UiEvent::ProxyGroupLoaded {
+            request_id,
+            connection_generation: generation,
+            result: Ok(manual_proxy_snapshot()),
+        },
+    );
+    let (success_text, _) = render_with_backend(&state, 180, 30);
+    assert!(success_text.contains("[current] Manual"));
+    assert!(success_text.contains("Success: Loaded Proxy Group Manual"));
+
+    let failed_commands = update(
+        &mut state,
+        UiEvent::Intent(UiIntent::ShowProxyGroup("Automatic".to_owned())),
+    );
+    let (failed_request_id, failed_generation) = proxy_group_identity(&failed_commands);
+    update(
+        &mut state,
+        UiEvent::ProxyGroupLoaded {
+            request_id: failed_request_id,
+            connection_generation: failed_generation,
+            result: Err("injected group failure".to_owned()),
+        },
+    );
+    let (failure_text, _) = render_with_backend(&state, 180, 30);
+    assert!(failure_text.contains("Error: injected group failure"));
+    assert_eq!(state.proxies.selected_group.as_deref(), Some("Manual"));
+}
+
+#[test]
 fn stale_command_results_are_discarded_by_request_and_connection_generation() {
     let mut state = connected_state();
     state.page = Page::Profiles;
@@ -391,6 +584,7 @@ fn stale_command_results_are_discarded_by_request_and_connection_generation() {
     refreshed_status.traffic.upload_bytes_per_second = 900;
     let refreshed_snapshot = FullViewSnapshot {
         status: refreshed_status,
+        proxy_groups: vec![proxy_group()],
         proxies: vec![proxy("Tokyo", false), proxy("Berlin", true)],
         profiles: vec![
             ProfileRow {
@@ -459,7 +653,7 @@ fn stale_command_results_are_discarded_by_request_and_connection_generation() {
         },
     );
     assert!(state.pending.is_none());
-    assert_eq!(state.toast.as_deref(), Some("Profile activated"));
+    assert_eq!(state.toast.as_deref(), Some("Success: Profile activated"));
     assert_eq!(
         state
             .status
@@ -555,6 +749,7 @@ fn disconnect_retains_a_stale_snapshot_and_reconnect_replaces_all_view_data() {
             connection_generation: 2,
             snapshot: FullViewSnapshot {
                 status: replacement_status,
+                proxy_groups: vec![proxy_group()],
                 proxies: vec![replacement_node],
                 profiles: vec![replacement_profile],
                 logs: vec![log(99, LogLevel::Warn, "replacement")],
@@ -590,6 +785,7 @@ fn view_caches_remain_bounded_at_release_scale() {
             connection_generation: 1,
             snapshot: FullViewSnapshot {
                 status: status_snapshot(),
+                proxy_groups: vec![proxy_group()],
                 proxies,
                 profiles,
                 logs,
@@ -665,25 +861,52 @@ fn paused_logs_freeze_the_anchor_and_resume_requests_a_bounded_tail() {
 }
 
 #[test]
-fn log_filter_search_time_and_follow_states_are_visible() {
+fn user_log_query_filters_time_level_and_content_and_shows_stream_state() {
     let mut state = connected_state();
     state.page = Page::Logs;
-    state.logs.level_filter = LogLevelFilter::Warn;
-    state.logs.search = "retry".to_owned();
-    state.logs.since_unix_ms = Some(15);
     state.logs.records = VecDeque::from([
         log_at(10, 10, LogLevel::Warn, "retry too early"),
         log_at(11, 20, LogLevel::Info, "retry wrong level"),
         log_at(12, 30, LogLevel::Warn, "retry accepted"),
+        log_at(13, 50, LogLevel::Warn, "retry too late"),
     ]);
     state.logs.paused = true;
+    state.logs.follow = false;
+    state.logs.dropped_total = 7;
+    state.logs.gap = true;
+    state.focus = Focus::Search;
+    for character in "since:20 until:40 level:warn content:retry".chars() {
+        update(
+            &mut state,
+            UiEvent::Intent(UiIntent::InputCharacter(character)),
+        );
+    }
 
-    let (text, _) = render_with_backend(&state, 100, 30);
+    let (text, _) = render_with_backend(&state, 180, 30);
 
     assert!(text.contains("retry accepted"));
     assert!(!text.contains("retry too early"));
     assert!(!text.contains("retry wrong level"));
+    assert!(!text.contains("retry too late"));
     assert!(text.contains("paused"));
+    assert!(text.contains("manual"));
+    assert!(text.contains("dropped=7"));
+    assert!(text.contains("gap"));
+}
+
+#[test]
+fn overview_and_proxy_rows_show_latency_time_freshness_and_probe_state() {
+    let mut state = connected_state();
+    let (overview, _) = render_with_backend(&state, 180, 30);
+    assert!(overview.contains("Sampled At: 1000"));
+    assert!(overview.contains("Freshness: fresh"));
+    assert!(overview.contains("Probe: succeeded (generation 1)"));
+
+    state.page = Page::Proxies;
+    let (proxies, _) = render_with_backend(&state, 180, 30);
+    assert!(proxies.contains("sampled=1000"));
+    assert!(proxies.contains("freshness=fresh"));
+    assert!(proxies.contains("probe=succeeded"));
 }
 
 #[test]
@@ -951,6 +1174,7 @@ fn connected_state() -> AppState {
             connection_generation: 1,
             snapshot: FullViewSnapshot {
                 status: status_snapshot(),
+                proxy_groups: vec![proxy_group()],
                 proxies: vec![proxy("Tokyo", true), proxy("Berlin", false)],
                 profiles: vec![profile("Work", true), profile("Backup", false)],
                 logs: vec![log(1, LogLevel::Info, "connected to Core")],
@@ -1025,6 +1249,56 @@ fn proxy(name: &str, selected: bool) -> ProxyRow {
         selected,
         delay_ms: selected.then_some(42),
         sampled_at_unix_ms: selected.then_some(1_000),
+        freshness: if selected {
+            LatencyFreshness::Fresh
+        } else {
+            LatencyFreshness::NotSampled
+        },
+        probe_status: if selected {
+            LatencyProbeStatus::Succeeded
+        } else {
+            LatencyProbeStatus::NotSampled
+        },
+    }
+}
+
+fn proxy_group() -> ProxyGroupRow {
+    ProxyGroupRow {
+        name: "Automatic".to_owned(),
+        proxy_type: "Selector".to_owned(),
+        selected_node: Some("Tokyo".to_owned()),
+    }
+}
+
+fn manual_proxy_group() -> ProxyGroupRow {
+    ProxyGroupRow {
+        name: "Manual".to_owned(),
+        proxy_type: "Selector".to_owned(),
+        selected_node: Some("Paris".to_owned()),
+    }
+}
+
+fn manual_proxy_snapshot() -> ProxyGroupSnapshot {
+    let mut paris = proxy("Paris", true);
+    paris.group = "Manual".to_owned();
+    ProxyGroupSnapshot {
+        group: manual_proxy_group(),
+        groups: vec![proxy_group(), manual_proxy_group()],
+        proxies: vec![paris],
+    }
+}
+
+fn snapshot_from_state(state: &AppState) -> FullViewSnapshot {
+    FullViewSnapshot {
+        status: state
+            .status
+            .clone()
+            .expect("connected state should have status"),
+        proxy_groups: state.proxies.groups.clone(),
+        proxies: state.proxies.rows.clone(),
+        profiles: state.profiles.rows.clone(),
+        logs: state.logs.records.iter().cloned().collect(),
+        dropped_logs: state.logs.dropped_total,
     }
 }
 
@@ -1100,4 +1374,18 @@ fn activation_identity(commands: &[Command]) -> (RequestId, u64) {
             _ => None,
         })
         .expect("activation command should exist")
+}
+
+fn proxy_group_identity(commands: &[Command]) -> (RequestId, u64) {
+    commands
+        .iter()
+        .find_map(|command| match command {
+            Command::FetchProxyGroup {
+                request_id,
+                connection_generation,
+                ..
+            } => Some((*request_id, *connection_generation)),
+            _ => None,
+        })
+        .expect("Proxy Group command should exist")
 }

@@ -290,6 +290,7 @@ pub struct ProxyGroupSummary {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProxyListOutcome {
     pub group: ProxyGroupSummary,
+    pub groups: Vec<ProxyGroupSummary>,
     pub nodes: Vec<ProxyNodeRow>,
 }
 

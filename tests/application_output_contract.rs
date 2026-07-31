@@ -84,6 +84,15 @@ fn proxy_and_latency_outputs_preserve_resolution_and_probe_state() {
                     name: "Shared".to_owned(),
                 }),
             },
+            groups: vec![ProxyGroupSummary {
+                name: "Main".to_owned(),
+                proxy_type: "Selector".to_owned(),
+                selectable: true,
+                selected_node: Some(SelectorIdentity {
+                    id: candidate_a.as_str().to_owned(),
+                    name: "Shared".to_owned(),
+                }),
+            }],
             nodes: vec![ProxyNodeRow {
                 id: None,
                 name: "Shared".to_owned(),
@@ -102,6 +111,11 @@ fn proxy_and_latency_outputs_preserve_resolution_and_probe_state() {
     )));
     let proxy_json = serde_json::to_value(proxies).expect("Proxy output should serialize");
     assert_eq!(proxy_json["data"]["nodes"][0]["member_kind"], "ambiguous");
+    assert_eq!(proxy_json["data"]["groups"][0]["name"], "Main");
+    assert_eq!(
+        proxy_json["data"]["groups"][0]["selected_node"]["id"],
+        candidate_a.as_str()
+    );
     assert_eq!(
         proxy_json["data"]["nodes"][0]["candidate_ids"][0],
         candidate_a.as_str()

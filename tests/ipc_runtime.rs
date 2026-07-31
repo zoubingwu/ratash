@@ -416,6 +416,12 @@ fn application_output_cases() -> Vec<(ApplicationOperation, ApplicationOutput)> 
                     selectable: true,
                     selected_node: Some(identity.clone()),
                 },
+                groups: vec![ProxyGroupSummary {
+                    name: "Main".to_owned(),
+                    proxy_type: "Selector".to_owned(),
+                    selectable: true,
+                    selected_node: Some(identity.clone()),
+                }],
                 nodes: vec![ProxyNodeRow {
                     id: Some(node_id.clone()),
                     name: "Node A".to_owned(),

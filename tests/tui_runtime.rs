@@ -6,8 +6,9 @@ use std::thread;
 use std::time::Duration;
 
 use hopash::application::{
-    ApplicationClient, ApplicationError, ApplicationOperation, ApplicationOutput,
-    ProfileListOutcome,
+    ApplicationClient, ApplicationError, ApplicationOperation, ApplicationOutput, LatencyFreshness,
+    LatencyProbeStatus, ProfileListOutcome, ProxyAvailability, ProxyGroupSummary, ProxyListOutcome,
+    ProxyMemberKind, ProxyNodeRow,
 };
 use hopash::constants::LOG_CAPACITY;
 use hopash::domain::{
@@ -17,8 +18,8 @@ use hopash::domain::{
 };
 use hopash::ipc::RequestId;
 use hopash::tui::{
-    Command, FullViewSnapshot, KeyInput, ProfileRow, ProxyRow, TerminalAction, TerminalControl,
-    TerminalInput, UiEvent, ViewLogRecord,
+    Command, FullViewSnapshot, KeyInput, ProfileRow, ProxyGroupRow, ProxyGroupSnapshot, ProxyRow,
+    TerminalAction, TerminalControl, TerminalInput, UiEvent, ViewLogRecord,
 };
 use hopash::tui_runtime::{
     ApplicationSnapshotSource, BackgroundCommandDispatcher, BoundedReconnectTimer,
@@ -145,6 +146,49 @@ fn background_snapshot_adapter_skips_the_core_log_tail() {
 
     assert!(refreshed.logs.is_empty());
     assert!(events.tail_requests().is_empty());
+}
+
+#[test]
+fn application_snapshot_adapter_loads_proxy_groups_on_demand() {
+    let client = Arc::new(ProxySnapshotClient::default());
+    let events = Arc::new(FakeEvents::default());
+    let source = ApplicationSnapshotSource::new(client.clone(), events);
+
+    let full = source
+        .fetch_full_snapshot(8, &CancellationToken::default())
+        .expect("initial Proxy Group should load");
+    assert_eq!(
+        full.proxy_groups
+            .iter()
+            .map(|group| group.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Automatic", "Manual"]
+    );
+    assert_eq!(full.proxies[0].name, "Tokyo");
+
+    let manual = source
+        .fetch_proxy_group("Manual", 8, &CancellationToken::default())
+        .expect("selected Proxy Group should load on demand");
+    assert_eq!(manual.group.name, "Manual");
+    assert_eq!(manual.proxies[0].name, "Paris");
+    assert_eq!(manual.proxies[0].freshness, LatencyFreshness::Fresh);
+    assert_eq!(
+        manual.proxies[0].probe_status,
+        LatencyProbeStatus::Succeeded
+    );
+    assert_eq!(
+        client
+            .operations
+            .lock()
+            .expect("operation lock should be available")
+            .iter()
+            .filter_map(|operation| match operation {
+                ApplicationOperation::ProxyList { group } => Some(group.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["Automatic", "Manual"]
+    );
 }
 
 #[test]
@@ -390,6 +434,8 @@ fn background_snapshot_refresh_replaces_profiles_and_proxies() {
         selected: true,
         delay_ms: Some(24),
         sampled_at_unix_ms: Some(30_000),
+        freshness: LatencyFreshness::Fresh,
+        probe_status: LatencyProbeStatus::Succeeded,
     });
     let mut dispatcher = RecordingDispatcher::default();
     dispatcher.results.push_back(DispatchedEvent {
@@ -680,7 +726,62 @@ fn successful_mutation_dispatches_a_refreshed_full_snapshot() {
             .lock()
             .expect("order lock should be available")
             .as_slice(),
-        ["command", "snapshot"]
+        ["command", "snapshot", "group"]
+    );
+    dispatcher.shutdown();
+}
+
+#[test]
+fn background_dispatcher_loads_one_proxy_group_without_a_full_snapshot() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let mut view = snapshot(0);
+    view.proxy_groups = vec![ProxyGroupRow {
+        name: "Manual".to_owned(),
+        proxy_type: "Selector".to_owned(),
+        selected_node: Some("Paris".to_owned()),
+    }];
+    let sources = StatusInterfaceSources {
+        snapshots: Arc::new(FakeSnapshots {
+            snapshot: view,
+            order: Arc::clone(&order),
+            fail: false,
+        }),
+        events: Arc::new(FakeEvents::default()),
+        commands: Arc::new(ImmediateCommands),
+    };
+    let mut dispatcher =
+        BackgroundCommandDispatcher::new(sources).expect("fixture command workers should start");
+    let waker = RuntimeWaker::default();
+    dispatcher.install_waker(waker.clone());
+    let checkpoint = waker.checkpoint();
+
+    dispatcher
+        .submit(Command::FetchProxyGroup {
+            request_id: RequestId(93),
+            connection_generation: 6,
+            group: "Manual".to_owned(),
+        })
+        .expect("Proxy Group request should enter the bounded queue");
+    waker.wait(checkpoint, Some(Duration::from_secs(1)));
+
+    assert!(matches!(
+        dispatcher
+            .try_next()
+            .expect("result queue should remain open")
+            .expect("Proxy Group result should be published")
+            .event,
+        UiEvent::ProxyGroupLoaded {
+            request_id: RequestId(93),
+            connection_generation: 6,
+            result: Ok(ProxyGroupSnapshot { group, .. }),
+        } if group.name == "Manual"
+    ));
+    assert_eq!(
+        order
+            .lock()
+            .expect("order lock should be available")
+            .as_slice(),
+        ["group"]
     );
     dispatcher.shutdown();
 }
@@ -761,6 +862,7 @@ fn terminal_session_restores_modes_after_errors_and_panics() {
 fn snapshot(upload: u64) -> FullViewSnapshot {
     FullViewSnapshot {
         status: status(upload),
+        proxy_groups: Vec::new(),
         proxies: Vec::new(),
         profiles: Vec::new(),
         logs: Vec::new(),
@@ -856,6 +958,39 @@ impl FullSnapshotSource for FakeSnapshots {
         } else {
             Ok(self.snapshot.clone())
         }
+    }
+
+    fn fetch_proxy_group(
+        &self,
+        group: &str,
+        _connection_generation: u64,
+        _cancellation: &CancellationToken,
+    ) -> Result<ProxyGroupSnapshot, StatusInterfaceError> {
+        self.order
+            .lock()
+            .expect("order lock should be available")
+            .push("group");
+        let group_row = self
+            .snapshot
+            .proxy_groups
+            .iter()
+            .find(|candidate| candidate.name == group)
+            .cloned()
+            .unwrap_or_else(|| ProxyGroupRow {
+                name: group.to_owned(),
+                proxy_type: "Selector".to_owned(),
+                selected_node: None,
+            });
+        let groups = if self.snapshot.proxy_groups.is_empty() {
+            vec![group_row.clone()]
+        } else {
+            self.snapshot.proxy_groups.clone()
+        };
+        Ok(ProxyGroupSnapshot {
+            group: group_row,
+            groups,
+            proxies: self.snapshot.proxies.clone(),
+        })
     }
 }
 
@@ -998,6 +1133,72 @@ impl ApplicationClient for SnapshotClient {
             }
             _ => panic!("snapshot fixture received an unexpected operation"),
         }
+    }
+}
+
+#[derive(Default)]
+struct ProxySnapshotClient {
+    operations: Mutex<Vec<ApplicationOperation>>,
+}
+
+impl ApplicationClient for ProxySnapshotClient {
+    fn execute(
+        &self,
+        operation: ApplicationOperation,
+    ) -> Result<ApplicationOutput, ApplicationError> {
+        self.operations
+            .lock()
+            .expect("operation lock should be available")
+            .push(operation.clone());
+        match operation {
+            ApplicationOperation::GetStatus => {
+                let mut snapshot = status(55);
+                snapshot.primary_proxy_group = Some("Automatic".to_owned());
+                Ok(ApplicationOutput::Status(snapshot))
+            }
+            ApplicationOperation::ProfileList => {
+                Ok(ApplicationOutput::Profiles(ProfileListOutcome {
+                    profiles: Vec::new(),
+                }))
+            }
+            ApplicationOperation::ProxyList { group } => {
+                let node_name = if group == "Manual" { "Paris" } else { "Tokyo" };
+                Ok(ApplicationOutput::Proxies(ProxyListOutcome {
+                    group: proxy_group_summary(&group, node_name),
+                    groups: vec![
+                        proxy_group_summary("Automatic", "Tokyo"),
+                        proxy_group_summary("Manual", "Paris"),
+                    ],
+                    nodes: vec![ProxyNodeRow {
+                        id: Some(NodeRecordId::for_core(node_name)),
+                        name: node_name.to_owned(),
+                        member_kind: ProxyMemberKind::Node,
+                        source: None,
+                        candidate_ids: Vec::new(),
+                        proxy_type: Some("Shadowsocks".to_owned()),
+                        availability: ProxyAvailability::Available,
+                        selected: true,
+                        delay_ms: Some(21),
+                        sampled_at_unix_ms: Some(2_000),
+                        freshness: LatencyFreshness::Fresh,
+                        probe_status: LatencyProbeStatus::Succeeded,
+                    }],
+                }))
+            }
+            _ => panic!("Proxy snapshot fixture received an unexpected operation"),
+        }
+    }
+}
+
+fn proxy_group_summary(name: &str, selected_node: &str) -> ProxyGroupSummary {
+    ProxyGroupSummary {
+        name: name.to_owned(),
+        proxy_type: "Selector".to_owned(),
+        selectable: true,
+        selected_node: Some(hopash::application::SelectorIdentity {
+            id: NodeRecordId::for_core(selected_node).as_str().to_owned(),
+            name: selected_node.to_owned(),
+        }),
     }
 }
 
