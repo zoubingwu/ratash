@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -909,32 +909,59 @@ fn pending_connection_queue_rejects_excess_work_without_growing() {
     let second_request =
         IpcRequest::new(RequestId(2), RequestOperation::GetStatus(EmptyPayload {}));
     let mut second = raw_request(socket.path(), &second_request);
-    thread::sleep(Duration::from_millis(20));
+    second
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .expect("fixture timeout should configure");
     let third_request = IpcRequest::new(RequestId(3), RequestOperation::GetStatus(EmptyPayload {}));
     let mut third = raw_request(socket.path(), &third_request);
     third
         .set_read_timeout(Some(Duration::from_millis(300)))
         .expect("fixture timeout should configure");
-    let mut byte = [0_u8; 1];
-    assert_eq!(
-        third
-            .read(&mut byte)
-            .expect("excess connection should close promptly"),
-        0
-    );
+    let second_closed = connection_closed_or_pending(&mut second);
+    let third_closed = connection_closed_or_pending(&mut third);
 
     application.release();
+    let second_closed = second_closed.expect("second admission state should be observable");
+    let third_closed = third_closed.expect("third admission state should be observable");
+    assert_ne!(
+        second_closed, third_closed,
+        "exactly one request should queue"
+    );
     assert!(matches!(
         first.join().expect("first client should finish"),
         Ok(ApplicationOutput::Status(_))
     ));
-    let second_response: IpcResponse =
-        read_frame(&mut second).expect("queued connection should complete");
-    assert_eq!(second_response.request_id, RequestId(2));
-    assert!(second_response.data().is_some());
+    let (queued, expected_request_id) = if second_closed {
+        (&mut third, RequestId(3))
+    } else {
+        (&mut second, RequestId(2))
+    };
+    let response: IpcResponse = read_frame(queued).expect("queued connection should complete");
+    assert_eq!(response.request_id, expected_request_id);
+    assert!(response.data().is_some());
     assert_eq!(application.entered.load(Ordering::Acquire), 2);
 
     server.shutdown().expect("server should stop cleanly");
+}
+
+fn connection_closed_or_pending(stream: &mut UnixStream) -> io::Result<bool> {
+    let mut byte = [0_u8; 1];
+    match stream.read(&mut byte) {
+        Ok(0) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            Ok(false)
+        }
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a blocked fixture request received an early response",
+        )),
+        Err(error) => Err(error),
+    }
 }
 
 #[test]
