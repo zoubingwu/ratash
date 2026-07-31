@@ -626,6 +626,7 @@ fn successful_transaction_orders_prepare_validation_apply_health_commit_and_clea
     assert_eq!(result.candidate_generation, RuntimeGeneration(1));
     assert_eq!(result.committed_generation, RuntimeGeneration(1));
     assert_eq!(result.apply_path, ApplyPath::Direct);
+    assert_eq!(result.recovery, RecoveryOutcome::NotRequired);
     assert_eq!(harness.committed_generation(), Some(RuntimeGeneration(1)));
     assert_eq!(harness.runtime.generation(), Some(RuntimeGeneration(1)));
     assert!(!harness.has_prepared());
@@ -895,21 +896,20 @@ fn commit_failure_rolls_back_to_the_previous_pointer_and_core() {
 }
 
 #[test]
-fn indeterminate_commit_error_observes_the_durable_candidate_pointer() {
+fn indeterminate_commit_acknowledgement_observes_the_durable_candidate_pointer() {
     let harness = Harness::new();
     harness.commit_initial();
     let candidate = harness.candidate(2);
     harness.store.fail_next(StoreFailure::CommitAfterWrite);
 
-    let error = harness
+    let result = harness
         .coordinator
         .execute(&candidate)
-        .expect_err("the post-commit acknowledgement should fail");
+        .expect("the durable candidate should be reported as committed");
 
-    assert_eq!(error.kind, ConfigTransactionErrorKind::Commit);
-    assert_eq!(error.committed_generation, Some(RuntimeGeneration(2)));
+    assert_eq!(result.committed_generation, RuntimeGeneration(2));
     assert_eq!(
-        error.recovery,
+        result.recovery,
         RecoveryOutcome::Converged {
             generation: Some(RuntimeGeneration(2))
         }
@@ -925,12 +925,18 @@ fn cleanup_failure_leaves_a_recoverable_journal_after_commit() {
     let candidate = harness.candidate(2);
     harness.store.fail_next(StoreFailure::Clear);
 
-    let error = harness
+    let result = harness
         .coordinator
         .execute(&candidate)
-        .expect_err("journal cleanup should fail");
+        .expect("the durable candidate should remain committed");
 
-    assert_eq!(error.kind, ConfigTransactionErrorKind::Cleanup);
+    assert_eq!(result.committed_generation, RuntimeGeneration(2));
+    assert_eq!(
+        result.recovery,
+        RecoveryOutcome::Pending {
+            target: Some(RuntimeGeneration(2))
+        }
+    );
     assert_eq!(harness.committed_generation(), Some(RuntimeGeneration(2)));
     assert_eq!(harness.runtime.generation(), Some(RuntimeGeneration(2)));
     assert!(harness.has_prepared());

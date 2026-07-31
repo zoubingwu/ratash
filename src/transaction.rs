@@ -161,6 +161,7 @@ pub struct ConfigTransactionSuccess {
     pub candidate_generation: RuntimeGeneration,
     pub committed_generation: RuntimeGeneration,
     pub apply_path: ApplyPath,
+    pub recovery: RecoveryOutcome,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -508,29 +509,25 @@ impl ConfigTransactionCoordinator {
             ));
         }
 
-        if self.store.commit_prepared(&prepared).is_err() {
-            return Err(self.recover_commit_failure(
+        let recovery = if self.store.commit_prepared(&prepared).is_err() {
+            self.recover_commit_failure(
                 &prepared,
                 candidate.runtime.generation,
                 committed_generation,
-            ));
-        }
-
-        if self.store.clear_prepared(&prepared).is_err() {
-            return Err(ConfigTransactionError::new(
-                ConfigTransactionErrorKind::Cleanup,
-                Some(candidate.runtime.generation),
-                Some(candidate.runtime.generation),
-                RecoveryOutcome::Pending {
-                    target: Some(candidate.runtime.generation),
-                },
-            ));
-        }
+            )?
+        } else if self.store.clear_prepared(&prepared).is_err() {
+            RecoveryOutcome::Pending {
+                target: Some(candidate.runtime.generation),
+            }
+        } else {
+            RecoveryOutcome::NotRequired
+        };
 
         Ok(ConfigTransactionSuccess {
             candidate_generation: candidate.runtime.generation,
             committed_generation: candidate.runtime.generation,
             apply_path,
+            recovery,
         })
     }
 
@@ -638,18 +635,18 @@ impl ConfigTransactionCoordinator {
         prepared: &PreparedTransaction,
         candidate_generation: RuntimeGeneration,
         previous_generation: Option<RuntimeGeneration>,
-    ) -> ConfigTransactionError {
+    ) -> Result<RecoveryOutcome, ConfigTransactionError> {
         let state = match self.store.recover() {
             Ok(state) => state,
             Err(_) => {
-                return ConfigTransactionError::new(
+                return Err(ConfigTransactionError::new(
                     ConfigTransactionErrorKind::Commit,
                     Some(candidate_generation),
                     previous_generation,
                     RecoveryOutcome::Failed {
                         target: previous_generation,
                     },
-                );
+                ));
             }
         };
         if state.committed.as_ref().map(|manifest| &manifest.current) == Some(&prepared.candidate) {
@@ -662,21 +659,16 @@ impl ConfigTransactionCoordinator {
                     target: Some(candidate_generation),
                 }
             };
-            return ConfigTransactionError::new(
-                ConfigTransactionErrorKind::Commit,
-                Some(candidate_generation),
-                Some(candidate_generation),
-                recovery,
-            );
+            return Ok(recovery);
         }
 
         let recovery = self.rollback(prepared, previous_generation);
-        ConfigTransactionError::new(
+        Err(ConfigTransactionError::new(
             ConfigTransactionErrorKind::Commit,
             Some(candidate_generation),
             previous_generation,
             recovery,
-        )
+        ))
     }
 
     fn clear_unapplied_journal(
