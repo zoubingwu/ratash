@@ -60,6 +60,8 @@
 - `src/validator.rs` verifies the pinned Mihomo binary and runs bounded `-t` validation inside the private staging root without starting the Core.
 - `fixtures/mihomo/v1.19.28/config-schema.yaml` is the closed field catalog bound to the bundled Core version.
 - `src/core.rs` defines the authenticated CoreRuntime boundary, Mihomo adapter contract, versioned Proxy View, selection resolution, and fixed API codecs.
+- `src/core_service_ipc.rs` implements the versioned privileged CoreRuntime Unix socket protocol, peer-bound owner sessions, and secure Runtime Bundle ingress.
+- `src/daemon.rs` owns lifecycle-operation serialization, Supervisor singleton ownership, detached internal launch, one-time readiness, identity-bound shutdown, and validated stale-state cleanup.
 - `src/mihomo.rs` implements bounded authenticated Mihomo REST and WebSocket access over the private Core Unix socket.
 - `src/service.rs` owns the injected privileged CoreRuntime state machine, authenticated owner sessions, verified runtime bundles, process identity enforcement, bounded log forwarding, and bounded restart policy.
 - `src/process_controller.rs` implements verified Mihomo process spawn, bounded readiness and reload control, identity-matched stop, and bounded stdout/stderr capture for the privileged runtime service.

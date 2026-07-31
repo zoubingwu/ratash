@@ -51,10 +51,7 @@ use crate::ipc::{
 };
 use crate::telemetry::CoreLogRecord;
 
-#[path = "unix_io.rs"]
-pub(crate) mod unix_io;
-
-use unix_io::DeadlineUnixStream;
+use crate::unix_io::DeadlineUnixStream;
 
 const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DEFAULT_SERVER_WORKERS: usize = 4;

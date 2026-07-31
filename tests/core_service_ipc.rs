@@ -1,0 +1,693 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::Read;
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use hopash::core::{
+    ApplyCandidateResult, ApplyDisposition, CoreControlEndpoint, CoreRuntime, CoreRuntimeError,
+    CoreRuntimeErrorKind, CoreRuntimeStatus, ForwardedCoreLog, ForwardedCoreLogBatch,
+    ManagedCoreHandle, OwnerSession, OwnerSessionProof, OwnerSessionRequest, ProcessOutputSource,
+    RuntimeBundle, StopCoreResult,
+};
+use hopash::core_service_ipc::{CoreServiceClient, CoreServiceServer, CoreServiceServerConfig};
+use hopash::domain::{CoreInstanceGeneration, RuntimeGeneration};
+use hopash::ipc::{bind_private_listener, read_frame, write_frame};
+use sha2::{Digest, Sha256};
+
+static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+struct TestDirectory {
+    path: PathBuf,
+}
+
+impl TestDirectory {
+    fn new() -> Self {
+        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let path = Path::new("/private/tmp").join(format!("hcs-{}-{sequence}", std::process::id()));
+        fs::create_dir(&path).expect("the fixture root should be created");
+        Self { path }
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.path).expect("the fixture root should be removed");
+    }
+}
+
+#[derive(Default)]
+struct FakeRuntimeState {
+    open_count: usize,
+    apply_count: usize,
+    status_count: usize,
+    logs_count: usize,
+    stop_count: usize,
+    close_count: usize,
+    managed_core: Option<ManagedCoreHandle>,
+    staged_bundles: BTreeMap<u64, RuntimeBundle>,
+    status_delay: Option<Duration>,
+    status_diagnostic: Option<String>,
+    oversized_logs: bool,
+}
+
+struct FakeRuntime {
+    runtime_root: PathBuf,
+    session: OwnerSession,
+    state: Mutex<FakeRuntimeState>,
+}
+
+impl FakeRuntime {
+    fn new(runtime_root: PathBuf, endpoint_root: &Path) -> Self {
+        Self {
+            runtime_root,
+            session: OwnerSession {
+                proof: OwnerSessionProof::new("owner-session-id", "owner-session-token"),
+                protocol_version: 1,
+                owner_generation: 7,
+                endpoint: CoreControlEndpoint::new(
+                    endpoint_root.join("core-control.sock"),
+                    "core-control-secret",
+                ),
+            },
+            state: Mutex::new(FakeRuntimeState::default()),
+        }
+    }
+
+    fn require_owner(&self, owner: &OwnerSessionProof) -> Result<(), CoreRuntimeError> {
+        if owner == &self.session.proof {
+            Ok(())
+        } else {
+            Err(CoreRuntimeError::new(
+                CoreRuntimeErrorKind::Authentication,
+                "fixture owner proof mismatch",
+            ))
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, FakeRuntimeState> {
+        self.state
+            .lock()
+            .expect("the fake runtime lock should work")
+    }
+}
+
+impl CoreRuntime for FakeRuntime {
+    fn open_owner_session(
+        &self,
+        request: &OwnerSessionRequest,
+    ) -> Result<OwnerSession, CoreRuntimeError> {
+        self.state().open_count += 1;
+        if request.protocol_version != 1 {
+            return Err(CoreRuntimeError::new(
+                CoreRuntimeErrorKind::ProtocolMismatch,
+                "fixture protocol mismatch",
+            ));
+        }
+        Ok(self.session.clone())
+    }
+
+    fn apply_candidate(
+        &self,
+        owner: &OwnerSessionProof,
+        bundle: &RuntimeBundle,
+    ) -> Result<ApplyCandidateResult, CoreRuntimeError> {
+        self.require_owner(owner)?;
+        assert!(bundle.generation_root.starts_with(&self.runtime_root));
+        assert_eq!(
+            fs::read(bundle.generation_root.join("config.yaml"))
+                .expect("the staged configuration should be readable"),
+            b"mode: rule\n"
+        );
+        assert_eq!(
+            fs::read(bundle.generation_root.join("providers/local.yaml"))
+                .expect("the staged provider should be readable"),
+            b"payload: []\n"
+        );
+        let managed_core = ManagedCoreHandle {
+            pid: 4_242,
+            process_start_identity: "fixture-core-start".to_owned(),
+            endpoint: self.session.endpoint.clone(),
+            instance_generation: CoreInstanceGeneration(9),
+            runtime_generation: bundle.generation,
+        };
+        let mut state = self.state();
+        state.apply_count += 1;
+        state
+            .staged_bundles
+            .insert(bundle.generation.0, bundle.clone());
+        state.managed_core = Some(managed_core.clone());
+        Ok(ApplyCandidateResult {
+            disposition: ApplyDisposition::Spawned,
+            managed_core,
+        })
+    }
+
+    fn status(&self, owner: &OwnerSessionProof) -> Result<CoreRuntimeStatus, CoreRuntimeError> {
+        self.require_owner(owner)?;
+        let (delay, diagnostic, managed_core) = {
+            let mut state = self.state();
+            state.status_count += 1;
+            (
+                state.status_delay,
+                state.status_diagnostic.clone(),
+                state.managed_core.clone(),
+            )
+        };
+        if let Some(delay) = delay {
+            std::thread::sleep(delay);
+        }
+        if let Some(diagnostic) = diagnostic {
+            return Err(CoreRuntimeError::new(
+                CoreRuntimeErrorKind::Unavailable,
+                diagnostic,
+            ));
+        }
+        Ok(CoreRuntimeStatus { managed_core })
+    }
+
+    fn logs(
+        &self,
+        owner: &OwnerSessionProof,
+        after_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<ForwardedCoreLogBatch, CoreRuntimeError> {
+        self.require_owner(owner)?;
+        let mut state = self.state();
+        state.logs_count += 1;
+        if state.oversized_logs {
+            return Ok(ForwardedCoreLogBatch {
+                records: (1..=32)
+                    .map(|sequence| ForwardedCoreLog {
+                        sequence,
+                        timestamp_unix_ms: 123_456,
+                        source: ProcessOutputSource::Stdout,
+                        message: "\0".repeat(64 * 1_024),
+                        instance_generation: CoreInstanceGeneration(9),
+                    })
+                    .collect(),
+                next_sequence: Some(32),
+                dropped_before: 0,
+            });
+        }
+        drop(state);
+        assert_eq!(after_sequence, Some(40));
+        assert_eq!(limit, 2);
+        Ok(ForwardedCoreLogBatch {
+            records: vec![ForwardedCoreLog {
+                sequence: 41,
+                timestamp_unix_ms: 123_456,
+                source: ProcessOutputSource::Stderr,
+                message: "fixture log".to_owned(),
+                instance_generation: CoreInstanceGeneration(9),
+            }],
+            next_sequence: Some(41),
+            dropped_before: 3,
+        })
+    }
+
+    fn stop(&self, owner: &OwnerSessionProof) -> Result<StopCoreResult, CoreRuntimeError> {
+        self.require_owner(owner)?;
+        let mut state = self.state();
+        state.stop_count += 1;
+        state.managed_core = None;
+        Ok(StopCoreResult {
+            stopped: true,
+            instance_generation: Some(CoreInstanceGeneration(9)),
+        })
+    }
+
+    fn close_owner_session(&self, owner: &OwnerSessionProof) -> Result<(), CoreRuntimeError> {
+        self.require_owner(owner)?;
+        self.state().close_count += 1;
+        Ok(())
+    }
+}
+
+struct Harness {
+    directory: TestDirectory,
+    socket_path: PathBuf,
+    runtime_root: PathBuf,
+    runtime: Arc<FakeRuntime>,
+    server: CoreServiceServer,
+    client: CoreServiceClient,
+}
+
+impl Harness {
+    fn new() -> Self {
+        let directory = TestDirectory::new();
+        let service_root = directory.path.join("service-owned");
+        fs::create_dir(&service_root).expect("the service root should be created");
+        let runtime_root = service_root.join("runtime");
+        let socket_path = directory.path.join("ipc/core-runtime.sock");
+        let runtime = Arc::new(FakeRuntime::new(runtime_root.clone(), &service_root));
+        let owner_uid = nix::unistd::geteuid().as_raw();
+        let server = CoreServiceServer::start(
+            &socket_path,
+            Arc::clone(&runtime),
+            CoreServiceServerConfig::new(&runtime_root, owner_uid),
+        )
+        .expect("the Core service IPC server should start");
+        let client = CoreServiceClient::new(&socket_path);
+        Self {
+            directory,
+            socket_path,
+            runtime_root,
+            runtime,
+            server,
+            client,
+        }
+    }
+
+    fn owner_request(&self) -> OwnerSessionRequest {
+        OwnerSessionRequest {
+            owner_uid: nix::unistd::geteuid().as_raw(),
+            supervisor_pid: std::process::id(),
+            supervisor_start_identity: "fixture-supervisor-start".to_owned(),
+            instance_token: "fixture-instance-token".to_owned(),
+            protocol_version: 1,
+        }
+    }
+
+    fn source_bundle(&self, generation: u64) -> RuntimeBundle {
+        write_bundle(
+            &self.directory.path.join(format!("source-{generation}")),
+            RuntimeGeneration(generation),
+        )
+    }
+}
+
+#[test]
+fn all_core_runtime_operations_round_trip_through_staged_service_owned_state() {
+    let mut harness = Harness::new();
+    let session = harness
+        .client
+        .open_owner_session(&harness.owner_request())
+        .expect("the owner session should open");
+    assert_eq!(session, harness.runtime.session);
+
+    let source = harness.source_bundle(11);
+    let applied = harness
+        .client
+        .apply_candidate(&session.proof, &source)
+        .expect("the candidate should apply");
+    assert_eq!(applied.disposition, ApplyDisposition::Spawned);
+    assert_eq!(
+        applied.managed_core.runtime_generation,
+        RuntimeGeneration(11)
+    );
+    let staged_root = harness
+        .runtime
+        .state()
+        .staged_bundles
+        .get(&11)
+        .expect("the staged bundle should be recorded")
+        .generation_root
+        .clone();
+    assert!(staged_root.starts_with(&harness.runtime_root));
+    assert_ne!(staged_root, source.generation_root);
+
+    let status = harness
+        .client
+        .status(&session.proof)
+        .expect("status should load");
+    assert_eq!(status.managed_core, Some(applied.managed_core));
+    let logs = harness
+        .client
+        .logs(&session.proof, Some(40), 2)
+        .expect("logs should load");
+    assert_eq!(logs.records[0].message, "fixture log");
+    assert_eq!(logs.next_sequence, Some(41));
+    assert_eq!(logs.dropped_before, 3);
+    let stopped = harness
+        .client
+        .stop(&session.proof)
+        .expect("the Managed Core should stop");
+    assert_eq!(stopped.instance_generation, Some(CoreInstanceGeneration(9)));
+    harness
+        .client
+        .close_owner_session(&session.proof)
+        .expect("the owner session should close");
+
+    let error = harness
+        .client
+        .status(&session.proof)
+        .expect_err("the closed session should be rejected by the transport binding");
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Authentication);
+    let state = harness.runtime.state();
+    assert_eq!(state.open_count, 1);
+    assert_eq!(state.apply_count, 1);
+    assert_eq!(state.status_count, 1);
+    assert_eq!(state.logs_count, 1);
+    assert_eq!(state.stop_count, 1);
+    assert_eq!(state.close_count, 1);
+    drop(state);
+    let socket_metadata = fs::symlink_metadata(&harness.socket_path)
+        .expect("the service socket metadata should load");
+    let parent_metadata = fs::symlink_metadata(
+        harness
+            .socket_path
+            .parent()
+            .expect("the socket should have a parent"),
+    )
+    .expect("the service socket parent metadata should load");
+    assert_eq!(socket_metadata.uid(), nix::unistd::geteuid().as_raw());
+    assert_eq!(socket_metadata.mode() & 0o777, 0o600);
+    assert_eq!(parent_metadata.uid(), nix::unistd::geteuid().as_raw());
+    assert_eq!(parent_metadata.mode() & 0o777, 0o711);
+
+    harness
+        .server
+        .shutdown()
+        .expect("the server should shut down cleanly");
+    assert!(!harness.socket_path.exists());
+}
+
+#[test]
+fn peer_uid_must_match_the_claimed_owner_before_session_bootstrap() {
+    let harness = Harness::new();
+    let mut request = harness.owner_request();
+    request.owner_uid = request.owner_uid.wrapping_add(1);
+
+    let error = harness
+        .client
+        .open_owner_session(&request)
+        .expect_err("a mismatched owner UID should be rejected");
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Authentication);
+    assert_eq!(harness.runtime.state().open_count, 0);
+}
+
+#[test]
+fn session_id_is_peer_bound_and_the_runtime_still_checks_the_secret_token() {
+    let harness = Harness::new();
+    let session = harness
+        .client
+        .open_owner_session(&harness.owner_request())
+        .expect("the owner session should open");
+    let unknown = OwnerSessionProof::new("unknown-session", session.proof.session_token());
+    let unknown_error = harness
+        .client
+        .status(&unknown)
+        .expect_err("an unknown session ID should be rejected by the transport");
+    assert_eq!(unknown_error.kind, CoreRuntimeErrorKind::Authentication);
+    assert_eq!(harness.runtime.state().status_count, 0);
+
+    let wrong_token = OwnerSessionProof::new(session.proof.session_id(), "wrong-token");
+    let token_error = harness
+        .client
+        .status(&wrong_token)
+        .expect_err("the runtime should reject the wrong session token");
+    assert_eq!(token_error.kind, CoreRuntimeErrorKind::Authentication);
+    assert_eq!(harness.runtime.state().status_count, 0);
+}
+
+#[test]
+fn bundle_ingress_rejects_symlinked_provider_files_before_runtime_apply() {
+    let harness = Harness::new();
+    let session = harness
+        .client
+        .open_owner_session(&harness.owner_request())
+        .expect("the owner session should open");
+    let bundle = harness.source_bundle(12);
+    let provider = bundle.generation_root.join("providers/local.yaml");
+    let outside = harness.directory.path.join("outside-provider.yaml");
+    fs::write(&outside, b"payload: [escaped]\n").expect("the outside provider should be written");
+    fs::remove_file(&provider).expect("the provider fixture should be removed");
+    symlink(&outside, &provider).expect("the provider symlink should be created");
+
+    let error = harness
+        .client
+        .apply_candidate(&session.proof, &bundle)
+        .expect_err("a symlinked provider should be rejected");
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::InvalidBundle);
+    assert_eq!(harness.runtime.state().apply_count, 0);
+}
+
+#[test]
+fn absolute_response_deadline_bounds_a_stalled_runtime_operation() {
+    let harness = Harness::new();
+    let session = harness
+        .client
+        .open_owner_session(&harness.owner_request())
+        .expect("the owner session should open");
+    harness.runtime.state().status_delay = Some(Duration::from_millis(250));
+    let client = CoreServiceClient::with_timeouts(
+        &harness.socket_path,
+        Duration::from_secs(1),
+        Duration::from_millis(40),
+    );
+    let started = Instant::now();
+
+    let error = client
+        .status(&session.proof)
+        .expect_err("the stalled response should time out");
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Unavailable);
+    assert!(started.elapsed() < Duration::from_millis(200));
+}
+
+#[test]
+fn debug_and_remote_errors_redact_paths_tokens_and_service_diagnostics() {
+    let harness = Harness::new();
+    let session = harness
+        .client
+        .open_owner_session(&harness.owner_request())
+        .expect("the owner session should open");
+    let sensitive_path = harness.directory.path.display().to_string();
+    let diagnostic = format!(
+        "secret={} path={sensitive_path}",
+        session.proof.session_token()
+    );
+    harness.runtime.state().status_diagnostic = Some(diagnostic.clone());
+
+    let error = harness
+        .client
+        .status(&session.proof)
+        .expect_err("the fixture status should fail");
+    let client_debug = format!("{:?}", harness.client);
+    let server_debug = format!("{:?}", harness.server);
+    let error_debug = format!("{error:?}");
+    let error_display = error.to_string();
+
+    for rendered in [client_debug, server_debug, error_debug, error_display] {
+        assert!(!rendered.contains(&sensitive_path));
+        assert!(!rendered.contains(session.proof.session_token()));
+        assert!(!rendered.contains(&diagnostic));
+    }
+}
+
+#[test]
+fn encoded_responses_remain_inside_the_shared_frame_limit() {
+    let harness = Harness::new();
+    let session = harness
+        .client
+        .open_owner_session(&harness.owner_request())
+        .expect("the owner session should open");
+    harness.runtime.state().oversized_logs = true;
+
+    let error = harness
+        .client
+        .logs(&session.proof, None, usize::MAX)
+        .expect_err("an oversized encoded log response should be rejected");
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Unavailable);
+}
+
+#[test]
+fn invalid_server_limits_fail_before_binding_a_socket() {
+    let directory = TestDirectory::new();
+    let service_root = directory.path.join("service-owned");
+    fs::create_dir(&service_root).expect("the service root should be created");
+    let runtime_root = service_root.join("runtime");
+    let socket_path = directory.path.join("ipc/core-runtime.sock");
+    let runtime = Arc::new(FakeRuntime::new(runtime_root.clone(), &service_root));
+    let mut config = CoreServiceServerConfig::new(runtime_root, nix::unistd::geteuid().as_raw());
+    config.worker_count = 0;
+
+    let error = CoreServiceServer::start(&socket_path, runtime, config)
+        .expect_err("zero workers should be rejected");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(!socket_path.exists());
+}
+
+#[test]
+fn server_rejects_protocol_versions_with_the_original_request_id() {
+    let mut harness = Harness::new();
+    let mut stream =
+        UnixStream::connect(&harness.socket_path).expect("the raw protocol fixture should connect");
+    let request = serde_json::json!({
+        "protocol_version": 999,
+        "request_id": 73,
+        "operation": {
+            "operation": "status",
+            "payload": {
+                "owner": {
+                    "session_id": "unknown",
+                    "session_token": "unknown"
+                }
+            }
+        }
+    });
+
+    write_frame(&mut stream, &request).expect("the raw request should be written");
+    let response: serde_json::Value =
+        read_frame(&mut stream).expect("the protocol response should be read");
+
+    assert_eq!(response["protocol_version"], 1);
+    assert_eq!(response["request_id"], 73);
+    assert_eq!(response["outcome"]["outcome"], "failure");
+    assert_eq!(response["outcome"]["payload"]["kind"], "protocol_mismatch");
+    harness
+        .server
+        .shutdown()
+        .expect("the protocol fixture server should stop");
+}
+
+#[test]
+fn client_rejects_a_response_with_a_different_request_id() {
+    let directory = TestDirectory::new();
+    let socket_path = directory.path.join("raw/correlation.sock");
+    let listener =
+        bind_private_listener(&socket_path).expect("the raw correlation listener should bind");
+    let responder = std::thread::spawn(move || {
+        let (mut stream, _) = listener
+            .accept()
+            .expect("the raw correlation request should connect");
+        let request: serde_json::Value =
+            read_frame(&mut stream).expect("the raw correlation request should be read");
+        let response = serde_json::json!({
+            "protocol_version": 1,
+            "request_id": request["request_id"].as_u64().expect("request ID") + 1,
+            "outcome": {
+                "outcome": "success",
+                "payload": {
+                    "operation": "status",
+                    "payload": { "managed_core": null }
+                }
+            }
+        });
+        write_frame(&mut stream, &response).expect("the raw correlation response should be sent");
+    });
+    let client = CoreServiceClient::new(&socket_path);
+
+    let error = client
+        .status(&OwnerSessionProof::new("fixture", "fixture"))
+        .expect_err("the mismatched response should be rejected");
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::ProtocolMismatch);
+    responder
+        .join()
+        .expect("the raw correlation responder should finish");
+    fs::remove_file(socket_path).expect("the raw correlation socket should be removed");
+}
+
+#[test]
+fn pending_connection_capacity_rejects_excess_clients_and_shutdown_stays_bounded() {
+    let directory = TestDirectory::new();
+    let service_root = directory.path.join("service-owned");
+    fs::create_dir(&service_root).expect("the service root should be created");
+    let runtime_root = service_root.join("runtime");
+    let socket_path = directory.path.join("ipc/core-runtime.sock");
+    let runtime = Arc::new(FakeRuntime::new(runtime_root.clone(), &service_root));
+    let mut config = CoreServiceServerConfig::new(runtime_root, nix::unistd::geteuid().as_raw());
+    config.worker_count = 1;
+    config.pending_connection_capacity = 1;
+    config.io_timeout = Duration::from_secs(1);
+    let mut server = CoreServiceServer::start(&socket_path, runtime, config)
+        .expect("the bounded fixture server should start");
+
+    let first = UnixStream::connect(&socket_path).expect("the active client should connect");
+    std::thread::sleep(Duration::from_millis(40));
+    let second = UnixStream::connect(&socket_path).expect("the queued client should connect");
+    std::thread::sleep(Duration::from_millis(40));
+    let mut excess = UnixStream::connect(&socket_path).expect("the excess client should connect");
+    excess
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("the excess client deadline should be configured");
+    let mut byte = [0_u8; 1];
+
+    let rejected = match excess.read(&mut byte) {
+        Ok(0) => true,
+        Err(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+        ),
+        Ok(_) => false,
+    };
+
+    assert!(rejected);
+    drop(excess);
+    drop(second);
+    drop(first);
+    let started = Instant::now();
+    server
+        .shutdown()
+        .expect("the bounded fixture server should stop");
+    assert!(started.elapsed() < Duration::from_millis(300));
+}
+
+fn write_bundle(root: &Path, generation: RuntimeGeneration) -> RuntimeBundle {
+    fs::create_dir_all(root.join("providers"))
+        .expect("the bundle fixture directories should be created");
+    let binary = b"fixture-mihomo-binary";
+    let configuration = b"mode: rule\n";
+    let provider = b"payload: []\n";
+    let binary_sha256 = sha256(binary);
+    let configuration_sha256 = sha256(configuration);
+    let provider_sha256 = sha256(provider);
+    let policy_sha256 = sha256(b"fixture-compiler-policy");
+    fs::write(root.join("mihomo"), binary).expect("the fixture binary should be written");
+    fs::set_permissions(root.join("mihomo"), fs::Permissions::from_mode(0o500))
+        .expect("the fixture binary should be executable");
+    fs::write(root.join("config.yaml"), configuration)
+        .expect("the fixture configuration should be written");
+    fs::write(root.join("providers/local.yaml"), provider)
+        .expect("the fixture provider should be written");
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "runtime_generation": generation.0,
+        "compiler_policy_sha256": policy_sha256,
+        "mihomo_binary_sha256": binary_sha256,
+        "configuration_sha256": configuration_sha256,
+        "executable": "mihomo",
+        "configuration": "config.yaml",
+        "provider_files": [{
+            "path": "providers/local.yaml",
+            "sha256": provider_sha256,
+            "size": provider.len(),
+        }],
+    });
+    let manifest_bytes = serde_json::to_vec(&manifest).expect("the manifest should serialize");
+    fs::write(root.join("manifest.json"), &manifest_bytes)
+        .expect("the fixture manifest should be written");
+    RuntimeBundle {
+        generation,
+        generation_root: root.to_path_buf(),
+        manifest_sha256: sha256(&manifest_bytes),
+        compiler_policy_sha256: manifest["compiler_policy_sha256"]
+            .as_str()
+            .expect("the policy digest should be a string")
+            .to_owned(),
+        mihomo_binary_sha256: manifest["mihomo_binary_sha256"]
+            .as_str()
+            .expect("the binary digest should be a string")
+            .to_owned(),
+    }
+}
+
+fn sha256(content: &[u8]) -> String {
+    let digest = Sha256::digest(content);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String should work");
+    }
+    encoded
+}
