@@ -10,6 +10,7 @@ mod digest;
 pub mod domain;
 pub mod error;
 pub mod ipc;
+pub mod lifecycle;
 pub mod persistence;
 pub mod profile;
 pub mod profile_source;
