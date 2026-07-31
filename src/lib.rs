@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod application;
+pub mod background;
 pub mod cli;
 pub mod config;
 pub mod constants;
