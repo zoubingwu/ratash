@@ -203,6 +203,12 @@ impl HarnessApplication {
 }
 
 impl BackgroundApplication for HarnessApplication {
+    fn cancel_pending_refreshes(&self) {
+        if let Some(gate) = &self.refresh_gate {
+            gate.release();
+        }
+    }
+
     fn take_due_refreshes(&self) -> Result<Vec<RefreshTask>, ApplicationError> {
         Ok(self
             .refreshes
@@ -357,6 +363,7 @@ impl BackgroundApplication for HarnessApplication {
 
 struct HarnessCore {
     probe_gate: Option<Arc<WorkGate>>,
+    blocking_stream_gate: Option<Arc<WorkGate>>,
     event_generation: Option<CoreInstanceGeneration>,
     traffic_opened: AtomicBool,
     connections_opened: AtomicBool,
@@ -369,6 +376,7 @@ impl HarnessCore {
     fn unavailable() -> Self {
         Self {
             probe_gate: None,
+            blocking_stream_gate: None,
             event_generation: None,
             traffic_opened: AtomicBool::new(false),
             connections_opened: AtomicBool::new(false),
@@ -392,6 +400,14 @@ impl HarnessCore {
         }
     }
 
+    fn for_blocking_traffic(event_generation: CoreInstanceGeneration, gate: Arc<WorkGate>) -> Self {
+        Self {
+            blocking_stream_gate: Some(gate),
+            event_generation: Some(event_generation),
+            ..Self::unavailable()
+        }
+    }
+
     fn for_stale_traffic(clock: Arc<FixedClock>) -> Self {
         Self {
             stale_traffic_clock: Some(clock),
@@ -406,6 +422,15 @@ impl HarnessCore {
 }
 
 impl BackgroundCorePort for HarnessCore {
+    fn cancel_pending(&self) {
+        if let Some(gate) = &self.probe_gate {
+            gate.release();
+        }
+        if let Some(gate) = &self.blocking_stream_gate {
+            gate.release();
+        }
+    }
+
     fn probe_delay(
         &self,
         _core: &ManagedCoreHandle,
@@ -436,6 +461,11 @@ impl BackgroundCorePort for HarnessCore {
         let generation = self.event_generation.ok_or_else(unavailable)?;
         if self.traffic_opened.swap(true, Ordering::AcqRel) {
             return Err(unavailable());
+        }
+        if let Some(gate) = &self.blocking_stream_gate {
+            return Ok(Box::new(BlockingEventStream {
+                gate: Arc::clone(gate),
+            }));
         }
         Ok(Box::new(SingleEventStream::new(
             generation,
@@ -527,6 +557,21 @@ impl<T: Send> CoreEventStream<T> for SingleEventStream<T> {
     }
 }
 
+struct BlockingEventStream {
+    gate: Arc<WorkGate>,
+}
+
+impl CoreEventStream<TrafficFrame> for BlockingEventStream {
+    fn next_event(&mut self) -> Result<Option<CoreEvent<TrafficFrame>>, MihomoError> {
+        self.gate.enter();
+        Ok(None)
+    }
+
+    fn cancel(&mut self) {
+        self.gate.release();
+    }
+}
+
 #[test]
 fn overdue_refresh_execution_uses_the_fixed_worker_limit() {
     let clock = Arc::new(FixedClock::new(0));
@@ -545,6 +590,25 @@ fn overdue_refresh_execution_uses_the_fixed_worker_limit() {
     application.wait_for_refreshes(PROFILE_REFRESH_CONCURRENCY);
 
     runtime.shutdown().expect("background runtime should stop");
+}
+
+#[test]
+fn shutdown_cancels_an_in_flight_profile_refresh() {
+    let clock = Arc::new(FixedClock::new(0));
+    let gate = Arc::new(WorkGate::default());
+    let application = Arc::new(HarnessApplication::for_refresh(
+        Arc::clone(&clock),
+        1,
+        Arc::clone(&gate),
+    ));
+    let core = Arc::new(HarnessCore::unavailable());
+    let mut runtime = start_runtime(&application, &core, &clock);
+
+    gate.wait_for_started(1);
+    let started = Instant::now();
+    runtime.shutdown().expect("background runtime should stop");
+
+    assert!(started.elapsed() < Duration::from_secs(1));
 }
 
 #[test]
@@ -575,6 +639,43 @@ fn delay_probe_execution_uses_fixed_workers_and_publishes_completions() {
     drop(observed);
 
     runtime.shutdown().expect("background runtime should stop");
+}
+
+#[test]
+fn shutdown_cancels_an_in_flight_delay_probe() {
+    let clock = Arc::new(FixedClock::new(55));
+    let gate = Arc::new(WorkGate::default());
+    let application = Arc::new(HarnessApplication::for_probes(Arc::clone(&clock), 1));
+    let core = Arc::new(HarnessCore::for_probes(Arc::clone(&gate)));
+    let mut runtime = start_runtime(&application, &core, &clock);
+
+    gate.wait_for_started(1);
+    let started = Instant::now();
+    runtime.shutdown().expect("background runtime should stop");
+
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn shutdown_wakes_a_blocked_telemetry_stream() {
+    let generation = CoreInstanceGeneration(10);
+    let clock = Arc::new(FixedClock::new(0));
+    let gate = Arc::new(WorkGate::default());
+    let application = Arc::new(HarnessApplication::for_traffic_stream(
+        Arc::clone(&clock),
+        generation,
+    ));
+    let core = Arc::new(HarnessCore::for_blocking_traffic(
+        generation,
+        Arc::clone(&gate),
+    ));
+    let mut runtime = start_runtime(&application, &core, &clock);
+
+    gate.wait_for_started(1);
+    let started = Instant::now();
+    runtime.shutdown().expect("background runtime should stop");
+
+    assert!(started.elapsed() < Duration::from_secs(1));
 }
 
 #[test]

@@ -6,7 +6,10 @@ use percent_encoding::percent_decode_str;
 use reqwest::header::{CONTENT_DISPOSITION, HeaderMap};
 use reqwest::redirect::{Attempt, Policy};
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::sync::Notify;
 use tokio::time::timeout;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,6 +100,7 @@ impl fmt::Debug for ProfileDownload {
 pub enum DownloadErrorKind {
     InvalidPolicy,
     ClientInitialization,
+    Cancelled,
     Connect,
     ConnectTimeout,
     Request,
@@ -129,6 +133,7 @@ impl ProfileSourceError {
         match self.kind {
             DownloadErrorKind::InvalidPolicy
             | DownloadErrorKind::ClientInitialization
+            | DownloadErrorKind::Cancelled
             | DownloadErrorKind::RedirectRejected
             | DownloadErrorKind::HttpStatus { status: 400..=499 }
             | DownloadErrorKind::BodyTooLarge { .. } => false,
@@ -156,6 +161,7 @@ impl fmt::Display for ProfileSourceError {
             DownloadErrorKind::ClientInitialization => {
                 formatter.write_str("profile download client initialization failed")
             }
+            DownloadErrorKind::Cancelled => formatter.write_str("profile download was cancelled"),
             DownloadErrorKind::Connect => formatter.write_str("profile download connection failed"),
             DownloadErrorKind::ConnectTimeout => {
                 formatter.write_str("profile download connection timed out")
@@ -194,12 +200,17 @@ pub trait ProfileSource: Send + Sync {
         &self,
         subscription_url: &SubscriptionUrl,
     ) -> Result<ProfileDownload, ProfileSourceError>;
+
+    /// Cancels active downloads during terminal Supervisor shutdown.
+    /// Implementations may reject every later download on the same instance.
+    fn cancel_pending(&self) {}
 }
 
 #[derive(Clone)]
 pub struct ReqwestProfileSource {
     client: reqwest::Client,
     policy: ProfileSourcePolicy,
+    cancellation: Arc<DownloadCancellation>,
 }
 
 impl ReqwestProfileSource {
@@ -220,7 +231,11 @@ impl ReqwestProfileSource {
             .no_proxy()
             .build()
             .map_err(|_| ProfileSourceError::new(DownloadErrorKind::ClientInitialization))?;
-        Ok(Self { client, policy })
+        Ok(Self {
+            client,
+            policy,
+            cancellation: Arc::new(DownloadCancellation::default()),
+        })
     }
 
     async fn download_with_deadlines(
@@ -293,12 +308,46 @@ impl ProfileSource for ReqwestProfileSource {
         &self,
         subscription_url: &SubscriptionUrl,
     ) -> Result<ProfileDownload, ProfileSourceError> {
-        timeout(
-            self.policy.total_timeout,
-            self.download_with_deadlines(subscription_url),
-        )
-        .await
-        .map_err(|_| ProfileSourceError::new(DownloadErrorKind::TotalTimeout))?
+        tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => {
+                Err(ProfileSourceError::new(DownloadErrorKind::Cancelled))
+            }
+            result = timeout(
+                self.policy.total_timeout,
+                self.download_with_deadlines(subscription_url),
+            ) => {
+                result.map_err(|_| ProfileSourceError::new(DownloadErrorKind::TotalTimeout))?
+            }
+        }
+    }
+
+    fn cancel_pending(&self) {
+        self.cancellation.cancel();
+    }
+}
+
+#[derive(Default)]
+struct DownloadCancellation {
+    requested: AtomicBool,
+    changed: Notify,
+}
+
+impl DownloadCancellation {
+    fn cancel(&self) {
+        self.requested.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    async fn cancelled(&self) {
+        if self.requested.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = self.changed.notified();
+        if self.requested.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
     }
 }
 

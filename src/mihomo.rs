@@ -3,6 +3,8 @@ use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use mio::net::UnixStream as MioUnixStream;
@@ -75,9 +77,66 @@ impl fmt::Display for MihomoAdapterConfigError {
 
 impl std::error::Error for MihomoAdapterConfigError {}
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct UnixMihomoAdapter {
     config: MihomoAdapterConfig,
+    active_operations: Arc<ActiveOperations>,
+}
+
+#[derive(Debug, Default)]
+struct ActiveOperations {
+    cancelled: AtomicBool,
+    sockets: Mutex<Vec<Weak<ActiveOperation>>>,
+}
+
+impl ActiveOperations {
+    fn register(&self, stream: &UnixStream) -> Result<Arc<ActiveOperation>, MihomoError> {
+        let operation = Arc::new(ActiveOperation {
+            stream: stream
+                .try_clone()
+                .map_err(|_| unavailable("Mihomo cancellation handle creation failed"))?,
+        });
+        {
+            let mut sockets = self
+                .sockets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            sockets.retain(|socket| socket.strong_count() > 0);
+            sockets.push(Arc::downgrade(&operation));
+        }
+        if self.cancelled.load(Ordering::Acquire) {
+            operation.cancel();
+            return Err(unavailable("Mihomo operation was cancelled"));
+        }
+        Ok(operation)
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let operations = {
+            let mut sockets = self
+                .sockets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let operations = sockets.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
+            sockets.clear();
+            operations
+        };
+        for operation in operations {
+            operation.cancel();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ActiveOperation {
+    stream: UnixStream,
+}
+
+impl ActiveOperation {
+    fn cancel(&self) {
+        let _ = self.stream.shutdown(Shutdown::Both);
+    }
 }
 
 impl UnixMihomoAdapter {
@@ -106,7 +165,10 @@ impl UnixMihomoAdapter {
                 return Err(MihomoAdapterConfigError::zero(field));
             }
         }
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            active_operations: Arc::new(ActiveOperations::default()),
+        })
     }
 
     pub fn reload_configuration(
@@ -152,6 +214,7 @@ impl UnixMihomoAdapter {
         }
 
         let mut stream = self.connect(endpoint)?;
+        let _active_operation = self.active_operations.register(&stream)?;
         let request = encode_request(method, target, endpoint.secret(), body)?;
         let write_deadline = deadline_after(
             self.config.write_timeout,
@@ -232,6 +295,7 @@ impl UnixMihomoAdapter {
         validate_bearer_secret(endpoint.secret())?;
         validate_request_target(target)?;
         let mut stream = self.connect(endpoint)?;
+        let active_operation = self.active_operations.register(&stream)?;
         let key = generate_key();
         let request = encode_websocket_request(target, endpoint.secret(), &key)?;
         let write_deadline = deadline_after(
@@ -279,6 +343,7 @@ impl UnixMihomoAdapter {
             generation,
             decoder,
             cancelled: false,
+            _active_operation: active_operation,
         }))
     }
 }
@@ -290,6 +355,10 @@ impl Default for UnixMihomoAdapter {
 }
 
 impl MihomoAdapter for UnixMihomoAdapter {
+    fn cancel_pending(&self) {
+        self.active_operations.cancel();
+    }
+
     fn version(&self, endpoint: &CoreControlEndpoint) -> Result<MihomoVersion, MihomoError> {
         let response = self.request(endpoint, HttpMethod::Get, "/version", &[])?;
         require_status(&response, 200, MihomoErrorKind::InvalidResponse)?;
@@ -1196,6 +1265,7 @@ struct UnixWebSocketEventStream<T> {
     generation: CoreInstanceGeneration,
     decoder: fn(&[u8]) -> Result<T, ProjectionError>,
     cancelled: bool,
+    _active_operation: Arc<ActiveOperation>,
 }
 
 impl<T: Send> CoreEventStream<T> for UnixWebSocketEventStream<T> {

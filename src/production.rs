@@ -924,7 +924,11 @@ fn run_owned_supervisor(
     )
     .map_err(|_| startup_internal("The Supervisor shutdown IPC server could not start"))?;
     let background_application: Arc<dyn BackgroundApplication> = supervisor.clone();
-    let background_core = Arc::new(MihomoBackgroundCorePort::new(Arc::clone(&mihomo_port)));
+    let background_mihomo: Arc<dyn MihomoAdapter> = Arc::new(
+        UnixMihomoAdapter::new(MihomoAdapterConfig::default())
+            .map_err(|_| startup_internal("The background Mihomo adapter policy is invalid"))?,
+    );
+    let background_core = Arc::new(MihomoBackgroundCorePort::new(background_mihomo));
     let mut background = BackgroundRuntime::start(
         background_application,
         background_core,

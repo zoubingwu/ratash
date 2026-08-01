@@ -6,6 +6,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::sync_channel;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -911,6 +912,93 @@ fn response_and_frame_limits_content_type_and_read_deadline_are_enforced() {
         MihomoErrorKind::InvalidResponse
     );
     stream.cancel();
+    fixture.finish();
+}
+
+#[test]
+fn cancellation_interrupts_a_stalled_http_request() {
+    let (request_started_sender, request_started_receiver) = sync_channel(1);
+    let fixture = UnixFixture::new(
+        "cancel-http",
+        vec![Box::new(move |mut stream| {
+            let request = read_request(&stream);
+            assert_request(&request, "GET", "/version", SECRET);
+            request_started_sender
+                .send(())
+                .expect("the fixture should announce the stalled request");
+            wait_for_client_shutdown(&mut stream);
+        })],
+    );
+    let endpoint = fixture.endpoint(SECRET);
+    let adapter = adapter();
+    let request_adapter = adapter.clone();
+    let (result_sender, result_receiver) = sync_channel(1);
+    let request = thread::spawn(move || {
+        let _ = result_sender.send(request_adapter.version(&endpoint));
+    });
+
+    request_started_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("the fixture request should start");
+    adapter.cancel_pending();
+    let error = result_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("cancellation should release the stalled request")
+        .expect_err("the cancelled request should fail");
+
+    assert_eq!(error.kind, MihomoErrorKind::Unavailable);
+    request.join().expect("the request thread should join");
+    fixture.finish();
+}
+
+#[test]
+fn cancellation_interrupts_a_blocked_websocket_read() {
+    let (stream_started_sender, stream_started_receiver) = sync_channel(1);
+    let fixture = UnixFixture::new(
+        "cancel-websocket",
+        vec![Box::new(move |mut stream| {
+            let request = read_request(&stream);
+            assert_request(&request, "GET", "/traffic", SECRET);
+            let key = request
+                .headers
+                .get("sec-websocket-key")
+                .expect("WebSocket key should exist");
+            let accept = derive_accept_key(key.as_bytes());
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .expect("WebSocket handshake should be written");
+            stream_started_sender
+                .send(())
+                .expect("the fixture should announce the open stream");
+            wait_for_client_shutdown(&mut stream);
+        })],
+    );
+    let endpoint = fixture.endpoint(SECRET);
+    let adapter = adapter();
+    let mut stream = adapter
+        .open_traffic_stream(&endpoint, CoreInstanceGeneration(33))
+        .expect("the traffic stream should open");
+    stream_started_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("the fixture stream should start");
+    let (result_sender, result_receiver) = sync_channel(1);
+    let reader = thread::spawn(move || {
+        let _ = result_sender.send(stream.next_event());
+    });
+
+    adapter.cancel_pending();
+    let error = result_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("cancellation should release the WebSocket read")
+        .expect_err("the cancelled stream should fail");
+
+    assert_eq!(error.kind, MihomoErrorKind::StreamClosed);
+    reader.join().expect("the stream reader should join");
     fixture.finish();
 }
 

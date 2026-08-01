@@ -91,6 +91,8 @@ impl ProfileFetchError {
 
 pub trait ProfileFetchPort: Send + Sync {
     fn fetch(&self, url: &SubscriptionUrl) -> Result<FetchedProfile, ProfileFetchError>;
+
+    fn cancel_pending(&self) {}
 }
 
 pub struct BlockingProfileFetchPort {
@@ -119,6 +121,10 @@ impl ProfileFetchPort for BlockingProfileFetchPort {
             body: download.body().to_vec(),
             metadata_name: download.metadata_name().map(str::to_owned),
         })
+    }
+
+    fn cancel_pending(&self) {
+        self.source.cancel_pending();
     }
 }
 
@@ -1000,6 +1006,10 @@ impl Supervisor {
             }
         }
         self.refresh_profile(task.profile_id)
+    }
+
+    pub fn cancel_pending_profile_downloads(&self) {
+        self.source.cancel_pending();
     }
 
     pub fn take_due_probes(&self) -> Result<Vec<ScheduledProbe>, ApplicationError> {

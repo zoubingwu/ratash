@@ -24,6 +24,8 @@ use crate::telemetry::{LogLevel, LogSource};
 // -----------------------------------------------------------------------------
 
 pub trait BackgroundApplication: Send + Sync {
+    fn cancel_pending_refreshes(&self) {}
+
     fn reconcile_runtime_state(&self) -> Result<(), ApplicationError> {
         Ok(())
     }
@@ -74,6 +76,10 @@ pub trait BackgroundApplication: Send + Sync {
 }
 
 impl BackgroundApplication for Supervisor {
+    fn cancel_pending_refreshes(&self) {
+        Supervisor::cancel_pending_profile_downloads(self);
+    }
+
     fn reconcile_runtime_state(&self) -> Result<(), ApplicationError> {
         Supervisor::reconcile_runtime_state(self)
     }
@@ -142,6 +148,8 @@ impl BackgroundApplication for Supervisor {
 }
 
 pub trait BackgroundCorePort: Send + Sync {
+    fn cancel_pending(&self) {}
+
     fn probe_delay(
         &self,
         core: &ManagedCoreHandle,
@@ -176,6 +184,10 @@ impl MihomoBackgroundCorePort {
 }
 
 impl BackgroundCorePort for MihomoBackgroundCorePort {
+    fn cancel_pending(&self) {
+        self.mihomo.cancel_pending();
+    }
+
     fn probe_delay(
         &self,
         core: &ManagedCoreHandle,
@@ -217,6 +229,8 @@ impl BackgroundCorePort for MihomoBackgroundCorePort {
 
 pub struct BackgroundRuntime {
     shutdown: Arc<ShutdownSignal>,
+    application: Arc<dyn BackgroundApplication>,
+    core: Arc<dyn BackgroundCorePort>,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -236,7 +250,11 @@ impl BackgroundRuntime {
         timing: BackgroundTiming,
     ) -> io::Result<Self> {
         let shutdown = Arc::new(ShutdownSignal::default());
-        let mut start_guard = StartGuard::new(Arc::clone(&shutdown));
+        let mut start_guard = StartGuard::new(
+            Arc::clone(&shutdown),
+            Arc::clone(&application),
+            Arc::clone(&core),
+        );
         let (refresh_sender, refresh_receiver) = sync_channel(PROFILE_REFRESH_CONCURRENCY);
         let (probe_sender, probe_receiver) = sync_channel(PROBE_WORKER_COUNT);
         let refresh_receiver = Arc::new(Mutex::new(refresh_receiver));
@@ -290,7 +308,7 @@ impl BackgroundRuntime {
             timing,
         )?;
 
-        let owner_application = application;
+        let owner_application = Arc::clone(&application);
         let owner_shutdown = Arc::clone(&shutdown);
         spawn_owned(
             start_guard.threads_mut(),
@@ -307,11 +325,18 @@ impl BackgroundRuntime {
         )?;
 
         let threads = start_guard.finish();
-        Ok(Self { shutdown, threads })
+        Ok(Self {
+            shutdown,
+            application,
+            core,
+            threads,
+        })
     }
 
     pub fn shutdown(&mut self) -> Result<(), BackgroundShutdownError> {
         self.shutdown.request();
+        self.application.cancel_pending_refreshes();
+        self.core.cancel_pending();
         let mut panicked_threads = 0;
         for thread in self.threads.drain(..) {
             if thread.join().is_err() {
@@ -917,14 +942,22 @@ struct ShutdownSignal {
 
 struct StartGuard {
     shutdown: Arc<ShutdownSignal>,
+    application: Arc<dyn BackgroundApplication>,
+    core: Arc<dyn BackgroundCorePort>,
     threads: Vec<JoinHandle<()>>,
     armed: bool,
 }
 
 impl StartGuard {
-    fn new(shutdown: Arc<ShutdownSignal>) -> Self {
+    fn new(
+        shutdown: Arc<ShutdownSignal>,
+        application: Arc<dyn BackgroundApplication>,
+        core: Arc<dyn BackgroundCorePort>,
+    ) -> Self {
         Self {
             shutdown,
+            application,
+            core,
             threads: Vec::with_capacity(
                 PROFILE_REFRESH_CONCURRENCY
                     .saturating_add(PROBE_WORKER_COUNT)
@@ -948,6 +981,8 @@ impl Drop for StartGuard {
     fn drop(&mut self) {
         if self.armed {
             self.shutdown.request();
+            self.application.cancel_pending_refreshes();
+            self.core.cancel_pending();
             for thread in self.threads.drain(..) {
                 let _ = thread.join();
             }

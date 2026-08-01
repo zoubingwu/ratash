@@ -3,9 +3,11 @@ use hopash::profile::RefreshStage;
 use hopash::profile_source::{
     DownloadErrorKind, ProfileSource, ProfileSourcePolicy, ReqwestProfileSource,
 };
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 enum ServerStep {
@@ -362,6 +364,54 @@ async fn enforces_the_total_download_timeout_across_active_chunks() {
         .expect_err("the total download should time out");
 
     assert_eq!(error.kind(), DownloadErrorKind::TotalTimeout);
+}
+
+#[tokio::test]
+async fn cancellation_releases_a_stalled_response_body_immediately() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("the loopback fixture should bind");
+    let address = listener
+        .local_addr()
+        .expect("the loopback fixture should have an address");
+    let (body_stalled_sender, body_stalled_receiver) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener
+            .accept()
+            .await
+            .expect("the fixture should accept a request");
+        read_request_headers(&mut socket).await;
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 1024\r\n\r\n")
+            .await
+            .expect("the fixture response headers should write");
+        let _ = body_stalled_sender.send(());
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    let mut limits = policy(2_048);
+    limits.request_timeout = Duration::from_secs(30);
+    limits.total_timeout = Duration::from_secs(30);
+    let source: Arc<dyn ProfileSource> =
+        Arc::new(ReqwestProfileSource::new(limits).expect("the source should initialize"));
+    let url = SubscriptionUrl::parse(&format!("http://{address}/profile"))
+        .expect("the loopback fixture URL should be valid");
+    let download_source = Arc::clone(&source);
+    let download = tokio::spawn(async move { download_source.download(&url).await });
+
+    body_stalled_receiver
+        .await
+        .expect("the fixture should stall after its response headers");
+    assert!(!download.is_finished());
+    source.cancel_pending();
+    let error = tokio::time::timeout(Duration::from_millis(250), download)
+        .await
+        .expect("cancellation should release the stalled download")
+        .expect("the download task should join")
+        .expect_err("the stalled download should be cancelled");
+
+    assert_eq!(error.kind(), DownloadErrorKind::Cancelled);
+    assert!(!error.retryable());
+    server.abort();
 }
 
 #[tokio::test]

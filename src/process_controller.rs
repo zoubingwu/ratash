@@ -40,14 +40,14 @@ pub trait CoreControlClient: Send + Sync {
     ) -> Result<(), ServicePlatformError>;
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct UnixCoreControlClient {
     adapter: UnixMihomoAdapter,
 }
 
 impl UnixCoreControlClient {
     #[must_use]
-    pub const fn new(adapter: UnixMihomoAdapter) -> Self {
+    pub fn new(adapter: UnixMihomoAdapter) -> Self {
         Self { adapter }
     }
 }

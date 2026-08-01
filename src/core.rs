@@ -1251,6 +1251,10 @@ impl fmt::Display for MihomoError {
 impl std::error::Error for MihomoError {}
 
 pub trait MihomoAdapter: Send + Sync {
+    /// Cancels active operations during terminal owner shutdown.
+    /// Implementations may reject every later operation on the same instance.
+    fn cancel_pending(&self) {}
+
     fn version(&self, endpoint: &CoreControlEndpoint) -> Result<MihomoVersion, MihomoError>;
 
     fn readiness(&self, endpoint: &CoreControlEndpoint) -> Result<MihomoReadiness, MihomoError>;
