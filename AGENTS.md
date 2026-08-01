@@ -96,6 +96,7 @@
 - `examples/generate-release-assets.rs` derives Bash, Zsh, Fish, and `hopash(1)` assets from the public Clap command tree and verifies committed copies.
 - `examples/release-benchmark.rs` is the command facade for the deterministic fixture-backed release workload; `examples/release_benchmark/` separates fixture generation, workload execution, collection orchestration, process sampling, profile serving, reporting, runtime support, and tests. `support.rs` owns leaf helpers, `process_support.rs` owns child-process and PTY guards, and sibling dependencies remain acyclic. The collector digest covers every collector source file.
 - `scripts/capture-release-benchmarks-macos.sh`, `scripts/macos-release-resource-probe.sh`, and `packaging/release/benchmark-capture.md` define fixed-runner capture, resource sampling, provenance approval, and the release gate without exercising live network capture.
+- `scripts/test-profile-connectivity-docker.sh` runs an explicit local Profile and Mihomo data-plane acceptance test through digest-pinned Alpine containers and disposable Docker networks.
 - `packaging/macos/` and `scripts/package-macos.sh` define the signed per-architecture installer payload, pinned Mihomo artifacts, LaunchDaemon, and uninstaller without performing installation during development.
 - `.github/workflows/ci.yml` validates formatting, linting, tests, generated assets, and release-scale bounds; `.github/workflows/release.yml` builds, signs, notarizes, checksums, and publishes both macOS installer targets.
 - `src/production.rs` composes privileged-service startup, Supervisor ownership, shutdown coordination, and production adapters; `src/production/foreground.rs` owns the public application client, CLI and TUI runners, lifecycle error projection, shutdown control, and foreground log signal bridge; `src/production/tests.rs` owns focused unit fixtures and lifecycle tests.
@@ -119,6 +120,7 @@
 - Keep TUN devices, system proxy settings, DNS settings, routes, firewall rules, privileged-service installation, and live Mihomo traffic capture unchanged during development and verification.
 - Exercise CoreRuntime, privileged-service, and Mihomo lifecycle behavior through fakes, fixture subprocesses, temporary directories, and contract tests.
 - Use loopback-only HTTP servers and Unix sockets for integration fixtures.
+- Keep the Docker Profile connectivity acceptance unprivileged and ephemeral. Place its probe client on an internal-only network, connect Mihomo to a separate disposable egress network, mount the Profile read-only, and keep host networking, published ports, Docker socket mounts, TUN devices, and added capabilities outside the test.
 - Reserve real TUN and privileged-service end-to-end validation for a disposable isolated environment outside this development host.
 
 ## Domain Vocabulary
@@ -172,6 +174,7 @@ Keep Core, Wrapper, Supervisor, Profile selection, Node selection, Profile Refre
 - Inject failures around validation, atomic commit, Runtime Apply, and rollback.
 - Test scheduler generations, cancellation, bounded concurrency, stale results, and deterministic deadlines with a fake clock.
 - Include regression coverage for 100 Profiles, 10,000 Active Nodes, 20,000 Local Rules, sustained Core Log and Traffic Sample input, and long-running TUI resource bounds.
+- Run `scripts/test-profile-connectivity-docker.sh <profile.yaml>` explicitly when validating a real Profile against the pinned Mihomo data plane. Keep this credential-bearing network acceptance outside deterministic CI and treat it as separate from Hopash control-plane, privileged-service, and TUN end-to-end coverage.
 - Run formatting, Clippy, unit tests, integration tests, and relevant benchmarks before publication.
 
 ## Git and GitHub
