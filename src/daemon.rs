@@ -1420,11 +1420,9 @@ fn remove_instance_artifacts(
         let _ = restore_quarantined_record(&quarantine, &paths.instance_record);
         return Err(DaemonError::new(DaemonErrorKind::UnsafeStaleState));
     }
-    if socket_exists {
-        if let Err(error) = remove_verified_stale_socket(&paths.ipc_socket) {
-            let _ = restore_quarantined_record(&quarantine, &paths.instance_record);
-            return Err(DaemonError::new(DaemonErrorKind::UnsafeStaleState).with_source(error));
-        }
+    if socket_exists && let Err(error) = remove_verified_stale_socket(&paths.ipc_socket) {
+        let _ = restore_quarantined_record(&quarantine, &paths.instance_record);
+        return Err(DaemonError::new(DaemonErrorKind::UnsafeStaleState).with_source(error));
     }
     if shutdown_socket_exists
         && let Err(error) = remove_verified_stale_socket(&paths.shutdown_socket)

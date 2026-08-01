@@ -259,13 +259,12 @@ impl UnixMihomoAdapter {
             if events.is_empty() {
                 return Err(unavailable("Mihomo Unix socket connect timed out"));
             }
-            if events.iter().any(|event| event.token() == CONNECT_TOKEN) {
-                if let Some(_error) = stream
+            if events.iter().any(|event| event.token() == CONNECT_TOKEN)
+                && let Some(_error) = stream
                     .take_error()
                     .map_err(|_| unavailable("Mihomo Unix socket status failed"))?
-                {
-                    return Err(unavailable("Mihomo Unix socket connect failed"));
-                }
+            {
+                return Err(unavailable("Mihomo Unix socket connect failed"));
             }
         }
 
