@@ -502,6 +502,47 @@ impl ConfigCompiler {
         }
         Ok(())
     }
+
+    pub fn validate_privileged_candidate(
+        &self,
+        candidate: &[u8],
+        authoritative: &AuthoritativeConfig,
+        provider_files: &BTreeSet<String>,
+    ) -> Result<(), ConfigError> {
+        validate_authoritative(authoritative)?;
+        let document: Value = serde_yaml_ng::from_slice(candidate)
+            .map_err(|_| ConfigError::PersistedConfigurationInvalid)?;
+        let document = document
+            .as_mapping()
+            .ok_or(ConfigError::PersistedConfigurationInvalid)?;
+        self.catalog.validate(document)?;
+        validate_managed_fields_absent(document, &self.catalog.top_level, "")?;
+
+        if document.get("mode").and_then(Value::as_str) != Some("rule")
+            || document.get("allow-lan").and_then(Value::as_bool) != Some(false)
+            || document
+                .get("external-controller-unix")
+                .and_then(Value::as_str)
+                != Some(authoritative.controller_unix.as_str())
+            || document.get("secret").and_then(Value::as_str) != Some(authoritative.secret.as_str())
+            || document.get("tun") != Some(&authoritative_tun_baseline())
+            || !matches!(document.get("rules"), Some(Value::Sequence(_)))
+        {
+            return Err(ConfigError::PersistedConfigurationInvalid);
+        }
+
+        let dns = document
+            .get("dns")
+            .and_then(Value::as_mapping)
+            .ok_or(ConfigError::PersistedConfigurationInvalid)?;
+        if dns.get("enable").and_then(Value::as_bool) != Some(true)
+            || !matches!(dns.get("fallback"), Some(Value::Sequence(values)) if values.is_empty())
+        {
+            return Err(ConfigError::PersistedConfigurationInvalid);
+        }
+
+        validate_provider_paths(document, provider_files)
+    }
 }
 
 #[derive(Deserialize)]
@@ -1003,6 +1044,143 @@ fn strip_managed_node(value: &mut Value, schema: &SchemaNode) {
         }
         _ => {}
     }
+}
+
+fn validate_managed_fields_absent(
+    mapping: &Mapping,
+    fields: &BTreeMap<String, SchemaNode>,
+    path: &str,
+) -> Result<(), ConfigError> {
+    for (field, schema) in fields {
+        let Some(value) = mapping.get(field.as_str()) else {
+            continue;
+        };
+        let field_path = child_path(path, field);
+        if matches!(schema, SchemaNode::ManagedDrop) {
+            if !matches!(field_path.as_str(), "external-controller-unix" | "secret") {
+                return Err(ConfigError::PersistedConfigurationInvalid);
+            }
+            continue;
+        }
+        validate_managed_node_absent(value, schema, &field_path)?;
+    }
+    Ok(())
+}
+
+fn validate_managed_node_absent(
+    value: &Value,
+    schema: &SchemaNode,
+    path: &str,
+) -> Result<(), ConfigError> {
+    match (value, schema) {
+        (_, SchemaNode::ManagedDrop) => Err(ConfigError::PersistedConfigurationInvalid),
+        (Value::Sequence(values), SchemaNode::Sequence { item }) => {
+            for (index, value) in values.iter().enumerate() {
+                validate_managed_node_absent(value, item, &format!("{path}[{index}]"))?;
+            }
+            Ok(())
+        }
+        (Value::Mapping(mapping), SchemaNode::Mapping { fields, .. }) => {
+            validate_managed_fields_absent(mapping, fields, path)
+        }
+        (
+            Value::Mapping(mapping),
+            SchemaNode::NamedMap {
+                value: value_schema,
+            },
+        ) => {
+            for (name, value) in mapping {
+                let name = name
+                    .as_str()
+                    .ok_or(ConfigError::PersistedConfigurationInvalid)?;
+                validate_managed_node_absent(value, value_schema, &child_path(path, name))?;
+            }
+            Ok(())
+        }
+        (
+            Value::Mapping(mapping),
+            SchemaNode::Discriminated {
+                discriminator,
+                common,
+                variants,
+                ..
+            },
+        ) => {
+            let variant = mapping
+                .get(discriminator.as_str())
+                .and_then(Value::as_str)
+                .and_then(|variant| variants.get(variant))
+                .ok_or(ConfigError::PersistedConfigurationInvalid)?;
+            for (field, value) in mapping {
+                let field = field
+                    .as_str()
+                    .ok_or(ConfigError::PersistedConfigurationInvalid)?;
+                let schema = common
+                    .get(field)
+                    .or_else(|| variant.get(field))
+                    .ok_or(ConfigError::PersistedConfigurationInvalid)?;
+                let field_path = child_path(path, field);
+                if matches!(schema, SchemaNode::ManagedDrop) {
+                    return Err(ConfigError::PersistedConfigurationInvalid);
+                }
+                validate_managed_node_absent(value, schema, &field_path)?;
+            }
+            Ok(())
+        }
+        (_, SchemaNode::OneOf { options }) => {
+            let option = options
+                .iter()
+                .find(|option| validate_node(value, option, path).is_ok())
+                .ok_or(ConfigError::PersistedConfigurationInvalid)?;
+            validate_managed_node_absent(value, option, path)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_provider_paths(
+    document: &Mapping,
+    provider_files: &BTreeSet<String>,
+) -> Result<(), ConfigError> {
+    for section in ["proxy-providers", "rule-providers"] {
+        let Some(Value::Mapping(providers)) = document.get(section) else {
+            continue;
+        };
+        for provider in providers.values() {
+            let provider = provider
+                .as_mapping()
+                .ok_or(ConfigError::PersistedConfigurationInvalid)?;
+            let kind = provider
+                .get("type")
+                .and_then(Value::as_str)
+                .ok_or(ConfigError::PersistedConfigurationInvalid)?;
+            let path = provider.get("path").and_then(Value::as_str);
+            if let Some(path) = path {
+                let path = Path::new(path);
+                if path.as_os_str().is_empty()
+                    || path.is_absolute()
+                    || !path
+                        .components()
+                        .all(|component| matches!(component, Component::Normal(_)))
+                {
+                    return Err(ConfigError::PersistedConfigurationInvalid);
+                }
+            }
+            match kind {
+                "file" if path.is_none_or(|path| !provider_files.contains(path)) => {
+                    return Err(ConfigError::PersistedConfigurationInvalid);
+                }
+                "http" if path.is_none() => {
+                    return Err(ConfigError::PersistedConfigurationInvalid);
+                }
+                "inline" if path.is_some() => {
+                    return Err(ConfigError::PersistedConfigurationInvalid);
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 fn classify_provider_section(

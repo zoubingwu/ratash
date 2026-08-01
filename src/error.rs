@@ -21,6 +21,7 @@ pub enum ErrorCode {
     PolicyTargetNotFound,
     ProfileFieldUnsupported,
     TunPermissionDenied,
+    TunUnsupported,
     CoreUnavailable,
     ExternalOperationFailed,
     Internal,
@@ -49,6 +50,7 @@ impl ErrorCode {
             | Self::PolicyTargetNotFound
             | Self::ProfileFieldUnsupported => ProcessExitCode::DomainConflict,
             Self::TunPermissionDenied
+            | Self::TunUnsupported
             | Self::CoreUnavailable
             | Self::ExternalOperationFailed
             | Self::OperationUnavailable => ProcessExitCode::ExternalOperationFailure,

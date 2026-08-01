@@ -5,6 +5,7 @@ use hopash::config::{
 use hopash::profile::{ProfileSnapshot, SnapshotLimits};
 use serde_yaml_ng::Value;
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 fn snapshot(yaml: &str) -> ProfileSnapshot {
@@ -834,6 +835,103 @@ fn compiler_types_keep_secrets_and_profile_yaml_out_of_debug_output() {
             "debug output exposed {sensitive}"
         );
     }
+
+    std::fs::remove_dir_all(staging_root).expect("the staging fixture should be removed");
+}
+
+#[test]
+fn privileged_validation_rejects_forged_runtime_authority_and_provider_manifest() {
+    let staging_root = temporary_root("privileged-validation");
+    std::fs::create_dir_all(staging_root.join("providers"))
+        .expect("the provider directory should be created");
+    std::fs::write(staging_root.join("providers/local.yaml"), "payload: []\n")
+        .expect("the provider fixture should be written");
+    let authoritative = AuthoritativeConfig::new("/tmp/owned.sock", "owned-secret");
+    let compiler = ConfigCompiler::bundled().expect("the bundled catalog should load");
+    let effective = compiler
+        .compile(
+            &snapshot(
+                "rule-providers:\n  local:\n    type: file\n    behavior: domain\n    format: yaml\n    path: providers/local.yaml\nrules: ['MATCH,DIRECT']\n",
+            ),
+            &["MATCH,DIRECT".to_owned()],
+            &authoritative,
+            &staging_root,
+        )
+        .expect("the runtime candidate should compile");
+    let provider_files = effective
+        .providers()
+        .iter()
+        .map(|provider| provider.relative_path.to_string_lossy().into_owned())
+        .collect::<BTreeSet<_>>();
+
+    compiler
+        .validate_privileged_candidate(effective.yaml().as_bytes(), &authoritative, &provider_files)
+        .expect("the authoritative candidate should pass privileged validation");
+
+    let original: Value =
+        serde_yaml_ng::from_str(effective.yaml()).expect("the candidate should parse");
+    let mut forgeries = Vec::new();
+    for (field, value) in [
+        (
+            "external-controller-unix",
+            Value::String("/tmp/forged.sock".to_owned()),
+        ),
+        ("secret", Value::String("forged-secret".to_owned())),
+    ] {
+        let mut forged = original.clone();
+        forged
+            .as_mapping_mut()
+            .expect("the candidate should be a mapping")
+            .insert(field.into(), value);
+        forgeries.push(forged);
+    }
+
+    let mut forged_tun = original.clone();
+    forged_tun["tun"]
+        .as_mapping_mut()
+        .expect("TUN should be a mapping")
+        .insert("enable".into(), false.into());
+    forgeries.push(forged_tun);
+
+    let mut forged_dns_fallback = original.clone();
+    forged_dns_fallback["dns"]
+        .as_mapping_mut()
+        .expect("DNS should be a mapping")
+        .insert("fallback".into(), Value::Sequence(vec!["8.8.8.8".into()]));
+    forgeries.push(forged_dns_fallback);
+
+    let mut forged_dns_listener = original.clone();
+    forged_dns_listener["dns"]
+        .as_mapping_mut()
+        .expect("DNS should be a mapping")
+        .insert("listen".into(), "0.0.0.0:53".into());
+    forgeries.push(forged_dns_listener);
+
+    let mut forged_listener = original.clone();
+    forged_listener
+        .as_mapping_mut()
+        .expect("the candidate should be a mapping")
+        .insert("mixed-port".into(), 7_890.into());
+    forgeries.push(forged_listener);
+
+    for forged in forgeries {
+        let yaml = serde_yaml_ng::to_string(&forged).expect("the forgery should serialize");
+        assert!(
+            compiler
+                .validate_privileged_candidate(yaml.as_bytes(), &authoritative, &provider_files)
+                .is_err()
+        );
+    }
+
+    assert!(
+        compiler
+            .validate_privileged_candidate(
+                effective.yaml().as_bytes(),
+                &authoritative,
+                &BTreeSet::new(),
+            )
+            .is_err()
+    );
 
     std::fs::remove_dir_all(staging_root).expect("the staging fixture should be removed");
 }

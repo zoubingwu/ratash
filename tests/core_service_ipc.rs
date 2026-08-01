@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,12 +16,31 @@ use hopash::core::{
     ForwardedCoreLog, ForwardedCoreLogBatch, ManagedCoreHandle, OwnerSession, OwnerSessionProof,
     OwnerSessionRequest, ProcessOutputSource, RuntimeBundle, StopCoreResult,
 };
-use hopash::core_service_ipc::{CoreServiceClient, CoreServiceServer, CoreServiceServerConfig};
+use hopash::core_service_ipc::{
+    CoreServiceClient, CoreServicePeerAuthorizer, CoreServicePeerIdentity, CoreServiceServer,
+    CoreServiceServerConfig,
+};
 use hopash::domain::{CoreInstanceGeneration, RuntimeGeneration};
 use hopash::ipc::{bind_private_listener, read_frame, write_frame};
 use sha2::{Digest, Sha256};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+struct RejectPeer {
+    calls: Arc<AtomicUsize>,
+}
+
+impl CoreServicePeerAuthorizer for RejectPeer {
+    fn authorize(&self, peer: &CoreServicePeerIdentity) -> io::Result<()> {
+        assert_eq!(peer.uid(), nix::unistd::Uid::effective().as_raw());
+        assert_eq!(peer.pid(), std::process::id());
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "fixture peer authorization rejection",
+        ))
+    }
+}
 
 struct TestDirectory {
     path: PathBuf,
@@ -205,7 +225,7 @@ impl CoreRuntime for FakeRuntime {
                         sequence,
                         timestamp_unix_ms: 123_456,
                         source: ProcessOutputSource::Stdout,
-                        message: "\0".repeat(64 * 1_024),
+                        message: "\0".repeat(64 * 1_024 + 1),
                         instance_generation: CoreInstanceGeneration(9),
                     })
                     .collect(),
@@ -525,6 +545,26 @@ fn definite_apply_failure_discards_the_service_ingress_candidate() {
 }
 
 #[test]
+fn unsupported_tun_error_round_trips_through_the_service_wire() {
+    let harness = Harness::new();
+    let session = harness
+        .client
+        .open_owner_session(&harness.owner_request())
+        .expect("the owner session should open");
+    harness
+        .runtime
+        .fail_next_apply(CoreRuntimeErrorKind::TunUnsupported);
+
+    let error = harness
+        .client
+        .apply_candidate(&session.proof, &harness.source_bundle(1))
+        .expect_err("the unsupported TUN platform should reject Runtime Apply");
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::TunUnsupported);
+    assert!(service_generation_names(&harness.runtime_root).is_empty());
+}
+
+#[test]
 fn service_startup_recovers_to_the_three_newest_strict_generations() {
     let directory = TestDirectory::new();
     let service_root = directory.path.join("service-owned");
@@ -602,6 +642,107 @@ fn peer_uid_must_match_the_claimed_owner_before_session_bootstrap() {
 
     assert_eq!(error.kind, CoreRuntimeErrorKind::Authentication);
     assert_eq!(harness.runtime.state().open_count, 0);
+}
+
+#[test]
+fn peer_pid_must_match_the_claimed_supervisor_before_session_bootstrap() {
+    let harness = Harness::new();
+    let mut request = harness.owner_request();
+    request.supervisor_pid = request.supervisor_pid.wrapping_add(1);
+
+    let error = harness
+        .client
+        .open_owner_session(&request)
+        .expect_err("a mismatched Supervisor PID should be rejected");
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Authentication);
+    assert_eq!(harness.runtime.state().open_count, 0);
+}
+
+#[test]
+fn peer_authorization_rejection_precedes_request_dispatch() {
+    let directory = TestDirectory::new();
+    let (socket_path, runtime, config) = server_fixture(&directory, "peer-authorization");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let _server = CoreServiceServer::start_with_peer_authorizer(
+        &socket_path,
+        Arc::clone(&runtime),
+        config,
+        Arc::new(RejectPeer {
+            calls: Arc::clone(&calls),
+        }),
+    )
+    .expect("the authorized service fixture should start");
+    let client =
+        CoreServiceClient::for_service_uid(socket_path, nix::unistd::Uid::effective().as_raw());
+
+    let error = client
+        .open_owner_session(&OwnerSessionRequest {
+            owner_uid: nix::unistd::Uid::effective().as_raw(),
+            supervisor_pid: std::process::id(),
+            supervisor_start_identity: "fixture-start".to_owned(),
+            instance_token: "fixture-instance".to_owned(),
+            protocol_version: 1,
+        })
+        .expect_err("the rejected peer should receive a transport error");
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Unavailable);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(runtime.state().open_count, 0);
+}
+
+#[test]
+fn bound_session_proof_is_rejected_across_processes() {
+    let harness = Harness::new();
+    let session = harness
+        .client
+        .open_owner_session(&harness.owner_request())
+        .expect("the owner session should open");
+    let output = Command::new(std::env::current_exe().expect("the test executable should resolve"))
+        .args(["--exact", "bound_session_child_attempt", "--nocapture"])
+        .env("HOPASH_TEST_CORE_SERVICE_SOCKET", &harness.socket_path)
+        .env(
+            "HOPASH_TEST_CORE_SERVICE_UID",
+            nix::unistd::Uid::effective().as_raw().to_string(),
+        )
+        .env(
+            "HOPASH_TEST_CORE_SERVICE_SESSION_ID",
+            session.proof.session_id(),
+        )
+        .env(
+            "HOPASH_TEST_CORE_SERVICE_SESSION_TOKEN",
+            session.proof.session_token(),
+        )
+        .output()
+        .expect("the peer-process fixture should run");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.runtime.state().status_count, 0);
+}
+
+#[test]
+fn bound_session_child_attempt() {
+    let Ok(socket_path) = std::env::var("HOPASH_TEST_CORE_SERVICE_SOCKET") else {
+        return;
+    };
+    let uid = std::env::var("HOPASH_TEST_CORE_SERVICE_UID")
+        .expect("the service UID should be provided")
+        .parse()
+        .expect("the service UID should be numeric");
+    let session_id = std::env::var("HOPASH_TEST_CORE_SERVICE_SESSION_ID")
+        .expect("the session ID should be provided");
+    let session_token = std::env::var("HOPASH_TEST_CORE_SERVICE_SESSION_TOKEN")
+        .expect("the session token should be provided");
+    let client = CoreServiceClient::for_service_uid(socket_path, uid);
+
+    let error = client
+        .status(&OwnerSessionProof::new(session_id, session_token))
+        .expect_err("a different peer process should receive an authentication error");
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Authentication);
 }
 
 #[test]

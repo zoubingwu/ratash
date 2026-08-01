@@ -164,7 +164,7 @@ impl CoreServiceClient {
         let address = SockAddr::unix(&self.socket_path)?;
         socket.connect_timeout(&address, self.connect_timeout)?;
         let stream = UnixStream::from(socket);
-        let actual_uid = peer_uid(&stream).map_err(io::Error::other)?;
+        let actual_uid = peer_identity(&stream).map_err(io::Error::other)?.uid;
         if actual_uid != self.expected_service_uid {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -329,6 +329,43 @@ pub struct CoreServiceServerConfig {
     pub pending_connection_capacity: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoreServicePeerIdentity {
+    uid: u32,
+    pid: u32,
+    audit_token: Option<[u32; 8]>,
+}
+
+impl CoreServicePeerIdentity {
+    #[must_use]
+    pub const fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    #[must_use]
+    pub const fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    #[must_use]
+    pub const fn audit_token(&self) -> Option<&[u32; 8]> {
+        self.audit_token.as_ref()
+    }
+}
+
+pub trait CoreServicePeerAuthorizer: Send + Sync {
+    fn authorize(&self, peer: &CoreServicePeerIdentity) -> io::Result<()>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AcceptPeerIdentity;
+
+impl CoreServicePeerAuthorizer for AcceptPeerIdentity {
+    fn authorize(&self, _peer: &CoreServicePeerIdentity) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl CoreServiceServerConfig {
     #[must_use]
     pub fn new(runtime_staging_root: impl Into<PathBuf>, allowed_owner_uid: u32) -> Self {
@@ -381,6 +418,18 @@ impl CoreServiceServer {
     where
         R: CoreRuntime + 'static,
     {
+        Self::start_with_peer_authorizer(socket_path, runtime, config, Arc::new(AcceptPeerIdentity))
+    }
+
+    pub fn start_with_peer_authorizer<R>(
+        socket_path: impl AsRef<Path>,
+        runtime: Arc<R>,
+        config: CoreServiceServerConfig,
+        peer_authorizer: Arc<dyn CoreServicePeerAuthorizer>,
+    ) -> io::Result<Self>
+    where
+        R: CoreRuntime + 'static,
+    {
         validate_server_config(&config)?;
         let runtime_staging_root = prepare_runtime_root(&config.runtime_staging_root)
             .map_err(|error| safe_io_error(error, "Core service runtime root setup failed"))?;
@@ -427,6 +476,7 @@ impl CoreServiceServer {
                     poll,
                     context,
                     config,
+                    peer_authorizer,
                     thread_shutdown,
                     thread_accept_metrics,
                 )
@@ -583,13 +633,13 @@ impl From<ServiceRuntimeRetention> for RuntimeGenerationRetention {
 }
 
 struct BoundSession {
-    owner_uid: u32,
+    peer: CoreServicePeerIdentity,
     session_id: String,
 }
 
 struct AcceptedConnection {
     stream: UnixStream,
-    peer_uid: u32,
+    peer: CoreServicePeerIdentity,
 }
 
 fn validate_server_config(config: &CoreServiceServerConfig) -> io::Result<()> {
@@ -624,6 +674,7 @@ fn run_server(
     mut poll: Poll,
     context: Arc<ServerContext>,
     config: CoreServiceServerConfig,
+    peer_authorizer: Arc<dyn CoreServicePeerAuthorizer>,
     shutdown: Arc<AtomicBool>,
     accept_metrics: CoreServiceAcceptMetrics,
 ) -> io::Result<()> {
@@ -641,6 +692,7 @@ fn run_server(
         &mut poll,
         &sender,
         config.allowed_owner_uid,
+        peer_authorizer.as_ref(),
         &shutdown,
         &accept_metrics,
     );
@@ -704,6 +756,7 @@ fn accept_loop(
     poll: &mut Poll,
     sender: &SyncSender<AcceptedConnection>,
     allowed_owner_uid: u32,
+    peer_authorizer: &dyn CoreServicePeerAuthorizer,
     shutdown: &AtomicBool,
     metrics: &CoreServiceAcceptMetrics,
 ) -> io::Result<()> {
@@ -729,7 +782,13 @@ fn accept_loop(
             .iter()
             .any(|event| event.token() == CORE_SERVICE_LISTENER_TOKEN)
         {
-            accept_ready_connections(listener, sender, allowed_owner_uid, shutdown)?;
+            accept_ready_connections(
+                listener,
+                sender,
+                allowed_owner_uid,
+                peer_authorizer,
+                shutdown,
+            )?;
         }
     }
 }
@@ -738,6 +797,7 @@ fn accept_ready_connections(
     listener: &MioUnixListener,
     sender: &SyncSender<AcceptedConnection>,
     allowed_owner_uid: u32,
+    peer_authorizer: &dyn CoreServicePeerAuthorizer,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
     loop {
@@ -748,8 +808,8 @@ fn accept_ready_connections(
                     let _ = stream.shutdown(Shutdown::Both);
                     return Ok(());
                 }
-                let peer_uid = match peer_uid(&stream) {
-                    Ok(peer_uid) if peer_uid == allowed_owner_uid => peer_uid,
+                let peer = match peer_identity(&stream) {
+                    Ok(peer) if peer.uid == allowed_owner_uid => peer,
                     Err(_) => {
                         let _ = stream.shutdown(Shutdown::Both);
                         continue;
@@ -759,7 +819,11 @@ fn accept_ready_connections(
                         continue;
                     }
                 };
-                let connection = AcceptedConnection { stream, peer_uid };
+                if peer_authorizer.authorize(&peer).is_err() {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                }
+                let connection = AcceptedConnection { stream, peer };
                 match sender.try_send(connection) {
                     Ok(()) => {}
                     Err(TrySendError::Full(connection))
@@ -804,7 +868,7 @@ fn handle_connection(
         );
         return;
     }
-    let response = match dispatch(context, connection.peer_uid, request.operation) {
+    let response = match dispatch(context, &connection.peer, request.operation) {
         Ok(success) => WireResponse::success(request.request_id, success),
         Err(error) => WireResponse::failure(request.request_id, error.kind),
     };
@@ -813,7 +877,7 @@ fn handle_connection(
 
 fn dispatch(
     context: &ServerContext,
-    peer_uid: u32,
+    peer: &CoreServicePeerIdentity,
     operation: WireOperation,
 ) -> Result<WireSuccess, CoreRuntimeError> {
     let mut binding = context
@@ -823,8 +887,10 @@ fn dispatch(
     match operation {
         WireOperation::OpenOwnerSession(request) => {
             let request = request.into_core();
-            if peer_uid != request.owner_uid {
-                return Err(authentication_error("Core service peer UID mismatch"));
+            if peer.uid != request.owner_uid || peer.pid != request.supervisor_pid {
+                return Err(authentication_error(
+                    "Core service peer process identity mismatch",
+                ));
             }
             let session = context.runtime.open_owner_session(&request)?;
             if session.proof.session_id().is_empty()
@@ -836,14 +902,14 @@ fn dispatch(
                 ));
             }
             *binding = Some(BoundSession {
-                owner_uid: peer_uid,
+                peer: peer.clone(),
                 session_id: session.proof.session_id().to_owned(),
             });
             Ok(WireSuccess::OwnerSession((&session).into()))
         }
         WireOperation::ApplyCandidate(request) => {
             let owner = request.owner.into_core();
-            authorize_bound_session(binding.as_ref(), peer_uid, &owner)?;
+            authorize_bound_session(binding.as_ref(), peer, &owner)?;
             let bundle = request.bundle.into_core();
             let mut retention = context.runtime_retention.lock().map_err(|_| {
                 unavailable_error("Core service Runtime Generation state is unavailable")
@@ -851,7 +917,7 @@ fn dispatch(
             let planned = retention
                 .plan(bundle.generation)
                 .map_err(|error| error.into_core())?;
-            let staged = stage_runtime_bundle(&context.runtime_staging_root, peer_uid, &bundle)?;
+            let staged = stage_runtime_bundle(&context.runtime_staging_root, peer.uid, &bundle)?;
             prune_runtime_generations_with_reserved(
                 &context.runtime_staging_root,
                 planned.into(),
@@ -879,7 +945,7 @@ fn dispatch(
         }
         WireOperation::Status(request) => {
             let owner = request.owner.into_core();
-            authorize_bound_session(binding.as_ref(), peer_uid, &owner)?;
+            authorize_bound_session(binding.as_ref(), peer, &owner)?;
             context
                 .runtime
                 .status(&owner)
@@ -887,7 +953,7 @@ fn dispatch(
         }
         WireOperation::Logs(request) => {
             let owner = request.owner.into_core();
-            authorize_bound_session(binding.as_ref(), peer_uid, &owner)?;
+            authorize_bound_session(binding.as_ref(), peer, &owner)?;
             let limit = usize::try_from(request.limit)
                 .map_err(|_| protocol_error("Core service log limit is invalid"))?;
             let limit = limit.min(CORE_SERVICE_LOG_BATCH_MAX);
@@ -908,7 +974,7 @@ fn dispatch(
         }
         WireOperation::Stop(request) => {
             let owner = request.owner.into_core();
-            authorize_bound_session(binding.as_ref(), peer_uid, &owner)?;
+            authorize_bound_session(binding.as_ref(), peer, &owner)?;
             context
                 .runtime
                 .stop(&owner)
@@ -916,7 +982,7 @@ fn dispatch(
         }
         WireOperation::CloseOwnerSession(request) => {
             let owner = request.owner.into_core();
-            authorize_bound_session(binding.as_ref(), peer_uid, &owner)?;
+            authorize_bound_session(binding.as_ref(), peer, &owner)?;
             context.runtime.close_owner_session(&owner)?;
             *binding = None;
             Ok(WireSuccess::CloseOwnerSession(WireEmpty {}))
@@ -926,12 +992,12 @@ fn dispatch(
 
 fn authorize_bound_session(
     binding: Option<&BoundSession>,
-    peer_uid: u32,
+    peer: &CoreServicePeerIdentity,
     proof: &OwnerSessionProof,
 ) -> Result<(), CoreRuntimeError> {
-    if binding.is_some_and(|binding| {
-        binding.owner_uid == peer_uid && binding.session_id == proof.session_id()
-    }) {
+    if binding
+        .is_some_and(|binding| binding.peer == *peer && binding.session_id == proof.session_id())
+    {
         Ok(())
     } else {
         Err(authentication_error(
@@ -1576,6 +1642,7 @@ enum WireCoreRuntimeErrorKind {
     Authentication,
     ProtocolMismatch,
     TunPermissionDenied,
+    TunUnsupported,
     InvalidBundle,
     ProcessIdentityMismatch,
     Apply,
@@ -1590,6 +1657,7 @@ impl From<CoreRuntimeErrorKind> for WireCoreRuntimeErrorKind {
             CoreRuntimeErrorKind::Authentication => Self::Authentication,
             CoreRuntimeErrorKind::ProtocolMismatch => Self::ProtocolMismatch,
             CoreRuntimeErrorKind::TunPermissionDenied => Self::TunPermissionDenied,
+            CoreRuntimeErrorKind::TunUnsupported => Self::TunUnsupported,
             CoreRuntimeErrorKind::InvalidBundle => Self::InvalidBundle,
             CoreRuntimeErrorKind::ProcessIdentityMismatch => Self::ProcessIdentityMismatch,
             CoreRuntimeErrorKind::Apply => Self::Apply,
@@ -1606,6 +1674,7 @@ impl WireCoreRuntimeErrorKind {
             Self::Authentication => CoreRuntimeErrorKind::Authentication,
             Self::ProtocolMismatch => CoreRuntimeErrorKind::ProtocolMismatch,
             Self::TunPermissionDenied => CoreRuntimeErrorKind::TunPermissionDenied,
+            Self::TunUnsupported => CoreRuntimeErrorKind::TunUnsupported,
             Self::InvalidBundle => CoreRuntimeErrorKind::InvalidBundle,
             Self::ProcessIdentityMismatch => CoreRuntimeErrorKind::ProcessIdentityMismatch,
             Self::Apply => CoreRuntimeErrorKind::Apply,
@@ -2353,15 +2422,29 @@ fn cleanup_socket(path: &Path, identity: SocketIdentity) -> io::Result<()> {
     target_os = "tvos",
     target_os = "visionos"
 ))]
-fn peer_uid(peer: &UnixStream) -> nix::Result<u32> {
-    nix::sys::socket::getsockopt(peer, nix::sys::socket::sockopt::LocalPeerCred)
-        .map(|credentials| credentials.uid())
+fn peer_identity(peer: &UnixStream) -> nix::Result<CoreServicePeerIdentity> {
+    let uid = nix::sys::socket::getsockopt(peer, nix::sys::socket::sockopt::LocalPeerCred)?.uid();
+    let pid = nix::sys::socket::getsockopt(peer, nix::sys::socket::sockopt::LocalPeerPid)?;
+    let pid = u32::try_from(pid).map_err(|_| nix::errno::Errno::EINVAL)?;
+    let audit_token =
+        nix::sys::socket::getsockopt(peer, nix::sys::socket::sockopt::LocalPeerToken)?.val;
+    Ok(CoreServicePeerIdentity {
+        uid,
+        pid,
+        audit_token: Some(audit_token),
+    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn peer_uid(peer: &UnixStream) -> nix::Result<u32> {
-    nix::sys::socket::getsockopt(peer, nix::sys::socket::sockopt::PeerCredentials)
-        .map(|credentials| credentials.uid())
+fn peer_identity(peer: &UnixStream) -> nix::Result<CoreServicePeerIdentity> {
+    let credentials =
+        nix::sys::socket::getsockopt(peer, nix::sys::socket::sockopt::PeerCredentials)?;
+    let pid = u32::try_from(credentials.pid()).map_err(|_| nix::errno::Errno::EINVAL)?;
+    Ok(CoreServicePeerIdentity {
+        uid: credentials.uid(),
+        pid,
+        audit_token: None,
+    })
 }
 
 #[cfg(not(any(
@@ -2373,7 +2456,7 @@ fn peer_uid(peer: &UnixStream) -> nix::Result<u32> {
     target_os = "linux",
     target_os = "android"
 )))]
-fn peer_uid(_peer: &UnixStream) -> nix::Result<u32> {
+fn peer_identity(_peer: &UnixStream) -> nix::Result<CoreServicePeerIdentity> {
     Err(nix::errno::Errno::ENOTSUP)
 }
 
@@ -2470,6 +2553,7 @@ mod accept_loop_tests {
                 &mut poll,
                 &sender,
                 nix::unistd::geteuid().as_raw(),
+                &AcceptPeerIdentity,
                 &thread_shutdown,
                 &thread_metrics,
             )
@@ -2521,6 +2605,7 @@ mod accept_loop_tests {
                 &mut poll,
                 &sender,
                 nix::unistd::geteuid().as_raw(),
+                &AcceptPeerIdentity,
                 &thread_shutdown,
                 &thread_metrics,
             )

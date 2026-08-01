@@ -154,6 +154,7 @@ pub const fn classify_runtime_apply_error(error: &CoreRuntimeError) -> RuntimeAp
             RuntimeApplyFailure::Indeterminate
         }
         CoreRuntimeErrorKind::TunPermissionDenied => RuntimeApplyFailure::TunPermissionDenied,
+        CoreRuntimeErrorKind::TunUnsupported => RuntimeApplyFailure::TunUnsupported,
         CoreRuntimeErrorKind::Authentication
         | CoreRuntimeErrorKind::ProtocolMismatch
         | CoreRuntimeErrorKind::InvalidBundle

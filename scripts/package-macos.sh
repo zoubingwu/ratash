@@ -130,7 +130,7 @@ done
 /usr/bin/install -m 0755 "$project_root/packaging/macos/scripts/postinstall" "$package_scripts/postinstall"
 
 if [ -n "$application_identity" ]; then
-    /usr/bin/codesign --force --options runtime --timestamp --sign "$application_identity" "$payload/usr/local/bin/hopash"
+    /usr/bin/codesign --force --options runtime --timestamp --identifier 'hopash' --sign "$application_identity" "$payload/usr/local/bin/hopash"
     /usr/bin/codesign --force --options runtime --timestamp --sign "$application_identity" "$payload/Library/PrivilegedHelperTools/io.hopash.core-runtime"
     /usr/bin/codesign --force --options runtime --timestamp --sign "$application_identity" "$payload/Library/Application Support/Hopash RS/bin/mihomo"
     /usr/bin/codesign --verify --strict --verbose=2 "$payload/usr/local/bin/hopash"

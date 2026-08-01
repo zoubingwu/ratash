@@ -186,6 +186,13 @@ fn apply_transport_uncertainty_is_classified_as_indeterminate() {
         )),
         RuntimeApplyFailure::TunPermissionDenied
     );
+    assert_eq!(
+        classify_runtime_apply_error(&CoreRuntimeError::new(
+            CoreRuntimeErrorKind::TunUnsupported,
+            "fixture"
+        )),
+        RuntimeApplyFailure::TunUnsupported
+    );
 }
 
 fn managed_core() -> ManagedCoreHandle {

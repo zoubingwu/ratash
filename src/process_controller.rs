@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, chown};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
@@ -11,6 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
+#[cfg(target_os = "macos")]
+use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::constants::{
     CORE_LOG_LINE_MAX_BYTES, CORE_PROCESS_STOP_TIMEOUT, CORE_READINESS_TIMEOUT, LOG_CAPACITY,
@@ -899,15 +901,56 @@ impl ProcessIdentityProbe for SystemProcessIdentityProbe {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct RootTunCapabilityPreflight;
+pub struct MacOsTunCapabilityPreflight;
 
-impl TunCapabilityPreflight for RootTunCapabilityPreflight {
+impl TunCapabilityPreflight for MacOsTunCapabilityPreflight {
     fn check(&self, _owner_uid: u32) -> Result<(), ServicePlatformError> {
-        if nix::unistd::Uid::effective().is_root() {
-            Ok(())
-        } else {
-            Err(platform_error(ServicePlatformErrorKind::TunUnavailable))
+        check_macos_tun_control_socket()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn check_macos_tun_control_socket() -> Result<(), ServicePlatformError> {
+    Socket::new(
+        Domain::from(nix::libc::PF_SYSTEM),
+        Type::DGRAM,
+        Some(Protocol::from(nix::libc::SYSPROTO_CONTROL)),
+    )
+    .map(drop)
+    .map_err(map_tun_socket_error)
+}
+
+fn map_tun_socket_error(error: io::Error) -> ServicePlatformError {
+    let kind = match error.raw_os_error() {
+        Some(nix::libc::EAFNOSUPPORT | nix::libc::EPROTONOSUPPORT | nix::libc::ENOPROTOOPT) => {
+            ServicePlatformErrorKind::TunUnsupported
         }
+        Some(nix::libc::EACCES | nix::libc::EPERM) => ServicePlatformErrorKind::TunUnavailable,
+        _ if error.kind() == io::ErrorKind::Unsupported => ServicePlatformErrorKind::TunUnsupported,
+        _ => ServicePlatformErrorKind::TunUnavailable,
+    };
+    platform_error(kind)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn check_macos_tun_control_socket() -> Result<(), ServicePlatformError> {
+    Err(platform_error(ServicePlatformErrorKind::TunUnsupported))
+}
+
+#[cfg(test)]
+mod tun_preflight_tests {
+    use super::*;
+
+    #[test]
+    fn tun_socket_errors_keep_permission_and_platform_support_distinct() {
+        assert_eq!(
+            map_tun_socket_error(io::Error::from_raw_os_error(nix::libc::EPERM)).kind,
+            ServicePlatformErrorKind::TunUnavailable
+        );
+        assert_eq!(
+            map_tun_socket_error(io::Error::from_raw_os_error(nix::libc::EAFNOSUPPORT)).kind,
+            ServicePlatformErrorKind::TunUnsupported
+        );
     }
 }
 

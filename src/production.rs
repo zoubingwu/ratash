@@ -1,5 +1,6 @@
 //! Production process composition for the public CLI and hidden service modes.
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
@@ -10,6 +11,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+#[cfg(target_os = "macos")]
+use core_foundation::base::TCFType;
+#[cfg(target_os = "macos")]
+use core_foundation::data::CFData;
+#[cfg(target_os = "macos")]
+use core_foundation::url::CFURL;
+#[cfg(target_os = "macos")]
+use security_framework::os::macos::code_signing::{
+    Flags as CodeSigningFlags, GuestAttributes, SecCode, SecRequirement, SecStaticCode,
+};
 
 use crate::application::{
     ApplicationClient, ApplicationError, ApplicationErrorDetails, ApplicationOperation,
@@ -30,7 +42,10 @@ use crate::constants::{
 use crate::core::{
     CoreRuntime, MihomoAdapter, OwnerSessionProof, OwnerSessionRequest, ProcessOutputSource,
 };
-use crate::core_service_ipc::{CoreServiceClient, CoreServiceServer, CoreServiceServerConfig};
+use crate::core_service_ipc::{
+    CoreServiceClient, CoreServicePeerAuthorizer, CoreServicePeerIdentity, CoreServiceServer,
+    CoreServiceServerConfig,
+};
 use crate::daemon::{
     DaemonAction, DaemonError, DaemonErrorKind, DaemonLifecycle, DaemonTimeouts,
     InternalSupervisorInvocation, ReadinessFailure, ShutdownAcknowledgement, ShutdownIntent,
@@ -55,7 +70,7 @@ use crate::lifecycle::{
 use crate::mihomo::{MihomoAdapterConfig, UnixMihomoAdapter};
 use crate::persistence::PersistenceStore;
 use crate::process_controller::{
-    NativeCoreProcessController, RootTunCapabilityPreflight, SystemProcessIdentityProbe,
+    MacOsTunCapabilityPreflight, NativeCoreProcessController, SystemProcessIdentityProbe,
 };
 use crate::profile::{ActiveProfileRevision, ProfileRevision};
 use crate::profile_source::{ProfileSourcePolicy, ReqwestProfileSource};
@@ -65,8 +80,8 @@ use crate::runtime_adapters::{
 use crate::runtime_bundle::RuntimeBundleStager;
 use crate::service::{
     CORE_RUNTIME_PROTOCOL_VERSION, CallerCredentialValidator, PrivilegedCoreRuntimeService,
-    PrivilegedServiceConfig, PrivilegedServiceDependencies, ServicePlatformError,
-    ServicePlatformErrorKind, UuidSecretGenerator,
+    PrivilegedServiceConfig, PrivilegedServiceDependencies, RuntimeConfigurationPolicy,
+    RuntimeManifestFileV1, ServicePlatformError, ServicePlatformErrorKind, UuidSecretGenerator,
 };
 use crate::shutdown_ipc::{
     ShutdownControlError, ShutdownControlHandler, ShutdownIpcServer,
@@ -93,6 +108,9 @@ use crate::validator::MihomoCommandValidator;
 pub const INTERNAL_CORE_SERVICE_MODE: &str = "__core-service";
 pub const CORE_SERVICE_SOCKET_PATH: &str = "/var/run/hopash-rs/core-service.sock";
 pub const BUNDLED_MIHOMO_PATH: &str = "/Library/Application Support/Hopash RS/bin/mihomo";
+
+const INSTALLED_HOPASH_PATH: &str = "/usr/local/bin/hopash";
+pub const HOPASH_CODE_IDENTIFIER: &str = "hopash";
 
 #[cfg(debug_assertions)]
 const DEBUG_CORE_SERVICE_SOCKET_ENV: &str = "HOPASH_CORE_SERVICE_SOCKET";
@@ -403,6 +421,9 @@ fn map_daemon_error(error: DaemonError) -> ApplicationError {
         (DaemonErrorKind::StartupRejected, Some(StartupFailureCategory::Permission)) => {
             ErrorCode::TunPermissionDenied
         }
+        (DaemonErrorKind::StartupRejected, Some(StartupFailureCategory::Unsupported)) => {
+            ErrorCode::TunUnsupported
+        }
         (DaemonErrorKind::LifecycleOperationBusy | DaemonErrorKind::SupervisorOwnershipBusy, _) => {
             ErrorCode::OperationUnavailable
         }
@@ -495,6 +516,7 @@ fn startup_stage_name(stage: StartupStage) -> &'static str {
 fn startup_category_name(category: StartupFailureCategory) -> &'static str {
     match category {
         StartupFailureCategory::Permission => "permission",
+        StartupFailureCategory::Unsupported => "unsupported",
         StartupFailureCategory::Configuration => "configuration",
         StartupFailureCategory::Process => "process",
         StartupFailureCategory::Readiness => "readiness",
@@ -558,6 +580,165 @@ impl CoreServiceInvocation {
     }
 }
 
+#[derive(Clone, Debug)]
+struct InstalledHopashPeerAuthorizer {
+    executable: PathBuf,
+}
+
+struct BundledConfigurationPolicy {
+    compiler: ConfigCompiler,
+}
+
+impl RuntimeConfigurationPolicy for BundledConfigurationPolicy {
+    fn validate(
+        &self,
+        configuration: &[u8],
+        endpoint: &crate::core::CoreControlEndpoint,
+        provider_files: &[RuntimeManifestFileV1],
+    ) -> Result<(), ServicePlatformError> {
+        let controller_unix = endpoint.socket_path.to_str().ok_or_else(|| {
+            ServicePlatformError::new(ServicePlatformErrorKind::ConfigurationPolicy)
+        })?;
+        let authoritative = AuthoritativeConfig::new(controller_unix, endpoint.secret());
+        let provider_files = provider_files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<BTreeSet<_>>();
+        self.compiler
+            .validate_privileged_candidate(configuration, &authoritative, &provider_files)
+            .map_err(|_| ServicePlatformError::new(ServicePlatformErrorKind::ConfigurationPolicy))
+    }
+}
+
+impl InstalledHopashPeerAuthorizer {
+    #[cfg(target_os = "macos")]
+    fn new() -> io::Result<Self> {
+        let expected = PathBuf::from(INSTALLED_HOPASH_PATH);
+        let metadata = fs::symlink_metadata(&expected).map_err(peer_signature_error)?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != 0
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the installed Hopash executable has unsafe ownership or permissions",
+            ));
+        }
+        let executable = fs::canonicalize(&expected).map_err(peer_signature_error)?;
+        if executable != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the installed Hopash executable path is not canonical",
+            ));
+        }
+
+        let requirement = developer_id_requirement()?;
+        let url = CFURL::from_path(&executable, false).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the installed Hopash executable path is invalid",
+            )
+        })?;
+        let code =
+            SecStaticCode::from_path(&url, CodeSigningFlags::NONE).map_err(peer_signature_error)?;
+        code.check_validity(code_validation_flags(), &requirement)
+            .map_err(peer_signature_error)?;
+
+        Ok(Self { executable })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn new() -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the privileged Core service is supported only on macOS",
+        ))
+    }
+}
+
+impl CoreServicePeerAuthorizer for InstalledHopashPeerAuthorizer {
+    #[cfg(target_os = "macos")]
+    fn authorize(&self, peer: &CoreServicePeerIdentity) -> io::Result<()> {
+        let token = peer.audit_token().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the Core service peer has no audit token",
+            )
+        })?;
+        let pid = i32::try_from(peer.pid()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the Core service peer PID is invalid",
+            )
+        })?;
+        let token_bytes = token
+            .iter()
+            .flat_map(|word| word.to_ne_bytes())
+            .collect::<Vec<_>>();
+        let token_data = CFData::from_buffer(&token_bytes);
+        let mut attributes = GuestAttributes::new();
+        attributes.set_pid(pid);
+        attributes.set_audit_token(token_data.as_concrete_TypeRef());
+
+        let requirement = developer_id_requirement()?;
+        let code = SecCode::copy_guest_with_attribues(None, &attributes, CodeSigningFlags::NONE)
+            .map_err(peer_signature_error)?;
+        code.check_validity(code_validation_flags(), &requirement)
+            .map_err(peer_signature_error)?;
+        let executable = code
+            .path(CodeSigningFlags::NONE)
+            .map_err(peer_signature_error)?
+            .to_path()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "the Core service peer executable path is unavailable",
+                )
+            })?;
+        if executable != self.executable {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the Core service peer executable path is unauthorized",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn authorize(&self, _peer: &CoreServicePeerIdentity) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the privileged Core service is supported only on macOS",
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn code_validation_flags() -> CodeSigningFlags {
+    CodeSigningFlags::STRICT_VALIDATE
+        | CodeSigningFlags::CHECK_ALL_ARCHITECTURES
+        | CodeSigningFlags::CHECK_TRUSTED_ANCHORS
+        | CodeSigningFlags::NO_NETWORK_ACCESS
+}
+
+#[cfg(target_os = "macos")]
+fn developer_id_requirement() -> io::Result<SecRequirement> {
+    format!(
+        "anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate 1[field.1.2.840.113635.100.6.2.6] exists and identifier \"{HOPASH_CODE_IDENTIFIER}\""
+    )
+        .parse()
+        .map_err(peer_signature_error)
+}
+
+#[cfg(target_os = "macos")]
+fn peer_signature_error(error: impl fmt::Debug) -> io::Error {
+    let _ = error;
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "the installed Hopash signature is invalid",
+    )
+}
+
 struct ExactCallerCredentials {
     owner_uid: u32,
 }
@@ -596,6 +777,7 @@ pub fn run_core_service(invocation: CoreServiceInvocation) -> io::Result<()> {
             "the privileged Core service requires root privileges",
         ));
     }
+    let peer_authorizer = Arc::new(InstalledHopashPeerAuthorizer::new()?);
     let compiler = ConfigCompiler::bundled().map_err(invalid_product_configuration)?;
     let compiler_policy_sha256 = compiler.compiler_policy_sha256().to_owned();
     let mihomo_binary_sha256 = verified_binary_sha256(&invocation.mihomo_binary)?;
@@ -611,17 +793,19 @@ pub fn run_core_service(invocation: CoreServiceInvocation) -> io::Result<()> {
                     owner_uid: invocation.owner_uid,
                 }),
                 identities: Box::new(SystemProcessIdentityProbe),
-                tun: Box::new(RootTunCapabilityPreflight),
+                tun: Box::new(MacOsTunCapabilityPreflight),
+                configuration_policy: Box::new(BundledConfigurationPolicy { compiler }),
                 secrets: Box::new(UuidSecretGenerator),
                 processes: Box::new(NativeCoreProcessController::product_defaults()),
             },
         )
         .map_err(|_| io::Error::other("the privileged Core service could not initialize"))?,
     );
-    let mut server = CoreServiceServer::start(
+    let mut server = CoreServiceServer::start_with_peer_authorizer(
         &invocation.socket_path,
         Arc::clone(&runtime),
         CoreServiceServerConfig::new(invocation.runtime_root, invocation.owner_uid),
+        peer_authorizer,
     )?;
     let signal = ProcessSignalSource::new()
         .map_err(|_| io::Error::other("the Core service signal listener could not start"))?;
@@ -1524,6 +1708,10 @@ fn map_core_session_startup(error: crate::core::CoreRuntimeError) -> StartupErro
         crate::core::CoreRuntimeErrorKind::TunPermissionDenied => (
             StartupFailureCategory::Permission,
             "TUN capability is unavailable",
+        ),
+        crate::core::CoreRuntimeErrorKind::TunUnsupported => (
+            StartupFailureCategory::Unsupported,
+            "TUN is unsupported on this platform",
         ),
         crate::core::CoreRuntimeErrorKind::ProtocolMismatch => (
             StartupFailureCategory::Configuration,

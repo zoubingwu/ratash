@@ -37,6 +37,14 @@ fn public_error_codes_map_to_stable_process_exit_classes() {
             ProcessExitCode::DomainConflict,
         ),
         (
+            ErrorCode::TunPermissionDenied,
+            ProcessExitCode::ExternalOperationFailure,
+        ),
+        (
+            ErrorCode::TunUnsupported,
+            ProcessExitCode::ExternalOperationFailure,
+        ),
+        (
             ErrorCode::ExternalOperationFailed,
             ProcessExitCode::ExternalOperationFailure,
         ),

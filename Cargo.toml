@@ -33,6 +33,10 @@ tungstenite = { version = "0.26.2", default-features = false, features = ["hands
 url = "2"
 uuid = { version = "1.24", features = ["v4"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"
+security-framework = "3.7"
+
 [lints.rust]
 unsafe_code = "forbid"
 

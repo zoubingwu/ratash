@@ -23,8 +23,8 @@ use hopash::runtime_bundle::RuntimeBundleStager;
 use hopash::service::{
     CORE_RUNTIME_PROTOCOL_VERSION, CallerCredentialValidator, CoreProcessController,
     PrivilegedCoreRuntimeService, PrivilegedServiceConfig, PrivilegedServiceDependencies,
-    ServiceMaintenanceOutcome, ServicePlatformError, TunCapabilityPreflight, UnexpectedExitOutcome,
-    UuidSecretGenerator,
+    RuntimeConfigurationPolicy, RuntimeManifestFileV1, ServiceMaintenanceOutcome,
+    ServicePlatformError, TunCapabilityPreflight, UnexpectedExitOutcome, UuidSecretGenerator,
 };
 use sha2::{Digest, Sha256};
 
@@ -90,6 +90,19 @@ impl TunCapabilityPreflight for AllowTun {
     }
 }
 
+struct AllowConfiguration;
+
+impl RuntimeConfigurationPolicy for AllowConfiguration {
+    fn validate(
+        &self,
+        _configuration: &[u8],
+        _endpoint: &CoreControlEndpoint,
+        _provider_files: &[RuntimeManifestFileV1],
+    ) -> Result<(), ServicePlatformError> {
+        Ok(())
+    }
+}
+
 #[test]
 fn verified_runtime_spawns_reloads_forwards_bounded_logs_and_stops() {
     let directory = TestDirectory::new("lifecycle");
@@ -144,6 +157,7 @@ fn verified_runtime_spawns_reloads_forwards_bounded_logs_and_stops() {
             credentials: Box::new(AllowCaller),
             identities: Box::new(SystemProcessIdentityProbe),
             tun: Box::new(AllowTun),
+            configuration_policy: Box::new(AllowConfiguration),
             secrets: Box::new(UuidSecretGenerator),
             processes: Box::new(process_controller),
         },
@@ -312,6 +326,7 @@ fn guarded_controller_stop_and_drop_contain_the_exact_core() {
             credentials: Box::new(AllowCaller),
             identities: Box::new(SystemProcessIdentityProbe),
             tun: Box::new(AllowTun),
+            configuration_policy: Box::new(AllowConfiguration),
             secrets: Box::new(UuidSecretGenerator),
             processes: Box::new(process_controller),
         },

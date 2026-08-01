@@ -3139,6 +3139,21 @@ fn map_transaction_error(error: SupervisorTransactionFailure) -> ApplicationErro
                 recovery: application_recovery(error.recovery),
             },
         ))),
+        SupervisorTransactionFailureKind::Coordinator(
+            ConfigTransactionErrorKind::TunUnsupported,
+        ) => ApplicationError::new(
+            ErrorCode::TunUnsupported,
+            "TUN is unsupported on this platform",
+            false,
+        )
+        .with_details(ApplicationErrorDetails::RuntimeApplyFailure(Box::new(
+            RuntimeApplyFailureDetails {
+                candidate_generation: error.candidate_generation,
+                committed_generation: error.committed_generation,
+                stage: RuntimeApplyFailureStage::Apply,
+                recovery: application_recovery(error.recovery),
+            },
+        ))),
         kind => ApplicationError::new(
             ErrorCode::ExternalOperationFailed,
             "Runtime Apply failed and the committed configuration was retained",
@@ -3173,7 +3188,8 @@ fn transaction_failure_stage(kind: SupervisorTransactionFailureKind) -> RuntimeA
             }
             ConfigTransactionErrorKind::Validation => RuntimeApplyFailureStage::Validation,
             ConfigTransactionErrorKind::Prepare => RuntimeApplyFailureStage::Prepare,
-            ConfigTransactionErrorKind::TunPermissionDenied => RuntimeApplyFailureStage::Apply,
+            ConfigTransactionErrorKind::TunPermissionDenied
+            | ConfigTransactionErrorKind::TunUnsupported => RuntimeApplyFailureStage::Apply,
             ConfigTransactionErrorKind::Apply => RuntimeApplyFailureStage::Apply,
             ConfigTransactionErrorKind::IndeterminateApply => {
                 RuntimeApplyFailureStage::IndeterminateApply

@@ -45,6 +45,20 @@ fn error_envelope_has_a_stable_code_and_retry_contract() {
 }
 
 #[test]
+fn tun_unsupported_has_a_stable_machine_code() {
+    let envelope = JsonEnvelope::<serde_json::Value>::failure(ApiError::new(
+        ErrorCode::TunUnsupported,
+        "TUN is unsupported on this platform",
+        false,
+    ));
+
+    let json = serde_json::to_value(envelope).expect("TUN error should serialize");
+
+    assert_eq!(json["error"]["code"], "tun_unsupported");
+    assert_eq!(json["error"]["retryable"], false);
+}
+
+#[test]
 fn error_details_are_present_only_when_the_operation_provides_them() {
     let envelope = JsonEnvelope::<serde_json::Value>::failure(
         ApiError::new(

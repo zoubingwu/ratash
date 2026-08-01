@@ -95,6 +95,7 @@ pub enum RuntimeApplyFailure {
     Definite,
     Indeterminate,
     TunPermissionDenied,
+    TunUnsupported,
 }
 
 pub trait RuntimeApplyPort: Send + Sync {
@@ -205,6 +206,7 @@ pub enum ConfigTransactionErrorKind {
     Validation,
     Prepare,
     TunPermissionDenied,
+    TunUnsupported,
     Apply,
     IndeterminateApply,
     Health,
@@ -262,6 +264,7 @@ impl fmt::Display for ConfigTransactionError {
                 "configuration transaction journal preparation failed"
             }
             ConfigTransactionErrorKind::TunPermissionDenied => "TUN capability preflight failed",
+            ConfigTransactionErrorKind::TunUnsupported => "TUN is unsupported on this platform",
             ConfigTransactionErrorKind::Apply => "Runtime Apply failed",
             ConfigTransactionErrorKind::IndeterminateApply => {
                 "Runtime Apply result remained indeterminate after candidate restart"
@@ -700,6 +703,19 @@ impl ConfigTransactionCoordinator {
                 );
                 return Err(ConfigTransactionError::new(
                     ConfigTransactionErrorKind::TunPermissionDenied,
+                    Some(candidate.runtime.generation),
+                    committed_generation,
+                    recovery,
+                ));
+            }
+            Err(RuntimeApplyFailure::TunUnsupported) => {
+                let recovery = self.recover_failed_candidate(
+                    &prepared,
+                    committed_generation,
+                    failure_recovery_mode,
+                );
+                return Err(ConfigTransactionError::new(
+                    ConfigTransactionErrorKind::TunUnsupported,
                     Some(candidate.runtime.generation),
                     committed_generation,
                     recovery,

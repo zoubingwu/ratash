@@ -264,6 +264,7 @@ enum ApplyScript {
     DefiniteFailure,
     IndeterminateFailure,
     TunPermissionDenied,
+    TunUnsupported,
 }
 
 struct FakeRuntimeState {
@@ -342,6 +343,7 @@ impl RuntimeApplyPort for FakeRuntime {
             }
             ApplyScript::DefiniteFailure => Err(RuntimeApplyFailure::Definite),
             ApplyScript::TunPermissionDenied => Err(RuntimeApplyFailure::TunPermissionDenied),
+            ApplyScript::TunUnsupported => Err(RuntimeApplyFailure::TunUnsupported),
             ApplyScript::IndeterminateFailure => {
                 state.next_instance_generation += 1;
                 state.managed_core = Some(core_handle(
@@ -905,6 +907,30 @@ fn tun_preflight_failure_retains_its_transaction_category() {
         .expect_err("the TUN preflight should fail");
 
     assert_eq!(error.kind, ConfigTransactionErrorKind::TunPermissionDenied);
+    assert_eq!(
+        error.recovery,
+        RecoveryOutcome::Converged {
+            generation: Some(RuntimeGeneration(1))
+        }
+    );
+    assert_eq!(harness.committed_generation(), Some(RuntimeGeneration(1)));
+    assert_eq!(harness.runtime.generation(), Some(RuntimeGeneration(1)));
+    assert!(!harness.has_prepared());
+}
+
+#[test]
+fn unsupported_tun_retains_its_transaction_category() {
+    let harness = Harness::new();
+    harness.commit_initial();
+    let candidate = harness.candidate(2);
+    harness.runtime.script([ApplyScript::TunUnsupported]);
+
+    let error = harness
+        .coordinator
+        .execute(&candidate)
+        .expect_err("the unsupported TUN platform should reject the candidate");
+
+    assert_eq!(error.kind, ConfigTransactionErrorKind::TunUnsupported);
     assert_eq!(
         error.recovery,
         RecoveryOutcome::Converged {

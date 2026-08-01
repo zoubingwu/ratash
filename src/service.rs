@@ -116,6 +116,7 @@ pub enum ServicePlatformErrorKind {
     Logs,
     TunUnavailable,
     TunUnsupported,
+    ConfigurationPolicy,
     Randomness,
 }
 
@@ -141,6 +142,15 @@ pub trait ProcessIdentityProbe: Send + Sync {
 
 pub trait TunCapabilityPreflight: Send + Sync {
     fn check(&self, owner_uid: u32) -> Result<(), ServicePlatformError>;
+}
+
+pub trait RuntimeConfigurationPolicy: Send + Sync {
+    fn validate(
+        &self,
+        configuration: &[u8],
+        endpoint: &CoreControlEndpoint,
+        provider_files: &[RuntimeManifestFileV1],
+    ) -> Result<(), ServicePlatformError>;
 }
 
 pub trait SecretGenerator: Send + Sync {
@@ -297,6 +307,7 @@ pub struct PrivilegedServiceDependencies {
     pub credentials: Box<dyn CallerCredentialValidator>,
     pub identities: Box<dyn ProcessIdentityProbe>,
     pub tun: Box<dyn TunCapabilityPreflight>,
+    pub configuration_policy: Box<dyn RuntimeConfigurationPolicy>,
     pub secrets: Box<dyn SecretGenerator>,
     pub processes: Box<dyn CoreProcessController>,
 }
@@ -785,15 +796,20 @@ impl PrivilegedCoreRuntimeService {
         let attempt = state.consecutive_restart_failures.saturating_add(1);
         state.consecutive_restart_failures = attempt;
 
-        let restarted = self.verify_bundle(&bundle).and_then(|verified| {
-            self.dependencies.tun.check(owner.owner_uid).map_err(|_| {
-                service_error(
-                    CoreRuntimeErrorKind::TunPermissionDenied,
-                    "TUN capability preflight failed",
-                )
-            })?;
-            self.spawn_verified(state, owner, &verified)
-        });
+        let restarted = self
+            .verify_bundle(&bundle, &owner.endpoint)
+            .and_then(|verified| {
+                self.dependencies
+                    .tun
+                    .check(owner.owner_uid)
+                    .map_err(map_tun_preflight_error)?;
+                self.spawn_verified(state, owner, &verified)
+            });
+        if let Err(error) = &restarted
+            && error.kind == CoreRuntimeErrorKind::InvalidBundle
+        {
+            return Err(error.clone());
+        }
         if let Ok(record) = restarted {
             let managed_core = record.handle.clone();
             state.managed_core = Some(record);
@@ -804,7 +820,6 @@ impl PrivilegedCoreRuntimeService {
                 managed_core,
             });
         }
-
         if attempt >= self.restart_limit {
             let diagnostic = CoreRuntimeDiagnosticCategory::CoreRestartLimitReached;
             state.degraded = true;
@@ -877,6 +892,7 @@ impl PrivilegedCoreRuntimeService {
     fn verify_bundle(
         &self,
         bundle: &RuntimeBundle,
+        endpoint: &CoreControlEndpoint,
     ) -> Result<VerifiedRuntimeBundle, CoreRuntimeError> {
         if !valid_digest(&bundle.manifest_sha256)
             || bundle.compiler_policy_sha256 != self.compiler_policy_sha256
@@ -926,6 +942,10 @@ impl PrivilegedCoreRuntimeService {
             return Err(invalid_bundle("runtime configuration identity mismatch"));
         }
         verify_provider_files(&generation_root, &manifest.provider_files)?;
+        self.dependencies
+            .configuration_policy
+            .validate(&configuration, endpoint, &manifest.provider_files)
+            .map_err(|_| invalid_bundle("runtime configuration policy mismatch"))?;
 
         Ok(VerifiedRuntimeBundle {
             bundle: RuntimeBundle {
@@ -1296,16 +1316,11 @@ impl CoreRuntime for PrivilegedCoreRuntimeService {
     ) -> Result<ApplyCandidateResult, CoreRuntimeError> {
         let mut state = self.lock_state()?;
         let authenticated = authenticated_owner(&state, owner)?.clone();
-        let verified = self.verify_bundle(bundle)?;
+        let verified = self.verify_bundle(bundle, &authenticated.endpoint)?;
         self.dependencies
             .tun
             .check(authenticated.owner_uid)
-            .map_err(|_| {
-                service_error(
-                    CoreRuntimeErrorKind::TunPermissionDenied,
-                    "TUN capability preflight failed",
-                )
-            })?;
+            .map_err(map_tun_preflight_error)?;
 
         if let Some(mut record) = state.managed_core.clone() {
             self.require_owned_process(&record)?;
@@ -2362,6 +2377,23 @@ fn map_readiness_error(_error: ServicePlatformError) -> CoreRuntimeError {
 
 fn map_stop_error(_error: ServicePlatformError) -> CoreRuntimeError {
     service_error(CoreRuntimeErrorKind::Apply, "Core stop failed")
+}
+
+fn map_tun_preflight_error(error: ServicePlatformError) -> CoreRuntimeError {
+    match error.kind {
+        ServicePlatformErrorKind::TunUnavailable => service_error(
+            CoreRuntimeErrorKind::TunPermissionDenied,
+            "TUN capability permission check failed",
+        ),
+        ServicePlatformErrorKind::TunUnsupported => service_error(
+            CoreRuntimeErrorKind::TunUnsupported,
+            "TUN control sockets are unsupported",
+        ),
+        _ => service_error(
+            CoreRuntimeErrorKind::Unavailable,
+            "TUN capability inspection failed",
+        ),
+    }
 }
 
 fn service_error(kind: CoreRuntimeErrorKind, message: &'static str) -> CoreRuntimeError {

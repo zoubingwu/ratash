@@ -555,6 +555,7 @@ fn error_code_name(code: ErrorCode) -> &'static str {
         ErrorCode::PolicyTargetNotFound => "policy_target_not_found",
         ErrorCode::ProfileFieldUnsupported => "profile_field_unsupported",
         ErrorCode::TunPermissionDenied => "tun_permission_denied",
+        ErrorCode::TunUnsupported => "tun_unsupported",
         ErrorCode::CoreUnavailable => "core_unavailable",
         ErrorCode::ExternalOperationFailed => "external_operation_failed",
         ErrorCode::Internal => "internal",

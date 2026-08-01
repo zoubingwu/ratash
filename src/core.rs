@@ -278,6 +278,7 @@ pub enum CoreRuntimeErrorKind {
     Authentication,
     ProtocolMismatch,
     TunPermissionDenied,
+    TunUnsupported,
     InvalidBundle,
     ProcessIdentityMismatch,
     Apply,
@@ -319,6 +320,9 @@ impl fmt::Display for CoreRuntimeError {
             CoreRuntimeErrorKind::ProtocolMismatch => "Core runtime protocol mismatch",
             CoreRuntimeErrorKind::TunPermissionDenied => {
                 "TUN capability is unavailable for the Managed Core"
+            }
+            CoreRuntimeErrorKind::TunUnsupported => {
+                "TUN is unsupported on this Core runtime platform"
             }
             CoreRuntimeErrorKind::InvalidBundle => "Core runtime bundle is invalid",
             CoreRuntimeErrorKind::ProcessIdentityMismatch => {

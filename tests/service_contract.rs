@@ -9,10 +9,10 @@ use hopash::service::{
     CORE_RUNTIME_PROTOCOL_VERSION, CallerCredentialValidator, CoreExitIdentity,
     CoreProcessController, CoreProcessLog, CoreProcessLogBatch, OwnedProcessIdentity,
     PrivilegedCoreRuntimeService, PrivilegedServiceConfig, PrivilegedServiceDependencies,
-    PrivilegedServiceLifecycle, ProcessIdentityProbe, RuntimeManifestFileV1, RuntimeManifestV1,
-    SecretGenerator, ServiceGenerationStateCommitFault, ServiceMaintenanceOutcome,
-    ServicePlatformError, ServicePlatformErrorKind, SpawnedCoreProcess, TunCapabilityPreflight,
-    UnexpectedExitOutcome, VerifiedRuntimeBundle,
+    PrivilegedServiceLifecycle, ProcessIdentityProbe, RuntimeConfigurationPolicy,
+    RuntimeManifestFileV1, RuntimeManifestV1, SecretGenerator, ServiceGenerationStateCommitFault,
+    ServiceMaintenanceOutcome, ServicePlatformError, ServicePlatformErrorKind, SpawnedCoreProcess,
+    TunCapabilityPreflight, UnexpectedExitOutcome, VerifiedRuntimeBundle,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
@@ -125,6 +125,34 @@ impl TunCapabilityPreflight for FakeTun {
         match *self.error.lock().expect("TUN error lock") {
             Some(kind) => Err(ServicePlatformError::new(kind)),
             None => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct FakeConfigurationPolicy {
+    denied: Arc<AtomicBool>,
+}
+
+impl FakeConfigurationPolicy {
+    fn deny(&self, denied: bool) {
+        self.denied.store(denied, Ordering::Release);
+    }
+}
+
+impl RuntimeConfigurationPolicy for FakeConfigurationPolicy {
+    fn validate(
+        &self,
+        _configuration: &[u8],
+        _endpoint: &CoreControlEndpoint,
+        _provider_files: &[RuntimeManifestFileV1],
+    ) -> Result<(), ServicePlatformError> {
+        if self.denied.load(Ordering::Acquire) {
+            Err(ServicePlatformError::new(
+                ServicePlatformErrorKind::ConfigurationPolicy,
+            ))
+        } else {
+            Ok(())
         }
     }
 }
@@ -331,6 +359,7 @@ struct Harness {
     identities: IdentityRegistry,
     credentials: FakeCredentials,
     tun: FakeTun,
+    configuration_policy: FakeConfigurationPolicy,
     processes: FakeProcesses,
     restart_limit: usize,
     log_capacity: usize,
@@ -352,6 +381,7 @@ impl Harness {
         let identities = IdentityRegistry::default();
         let credentials = FakeCredentials::default();
         let tun = FakeTun::default();
+        let configuration_policy = FakeConfigurationPolicy::default();
         let processes = FakeProcesses::new(identities.clone());
         let service = PrivilegedCoreRuntimeService::new(
             PrivilegedServiceConfig {
@@ -367,6 +397,7 @@ impl Harness {
                 credentials: Box::new(credentials.clone()),
                 identities: Box::new(identities.clone()),
                 tun: Box::new(tun.clone()),
+                configuration_policy: Box::new(configuration_policy.clone()),
                 secrets: Box::new(CountingSecrets::default()),
                 processes: Box::new(processes.clone()),
             },
@@ -383,6 +414,7 @@ impl Harness {
             identities,
             credentials,
             tun,
+            configuration_policy,
             processes,
             restart_limit,
             log_capacity,
@@ -453,6 +485,7 @@ impl Harness {
                 credentials: Box::new(self.credentials.clone()),
                 identities: Box::new(self.identities.clone()),
                 tun: Box::new(self.tun.clone()),
+                configuration_policy: Box::new(self.configuration_policy.clone()),
                 secrets,
                 processes: Box::new(self.processes.clone()),
             },
@@ -1646,6 +1679,81 @@ fn tun_preflight_failure_prevents_process_changes() {
 }
 
 #[test]
+fn unsupported_tun_preflight_has_a_distinct_runtime_error() {
+    let harness = Harness::new();
+    let session = harness.open();
+    harness.tun.unsupported();
+
+    let error = harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect_err("an unsupported TUN platform should reject Runtime Apply");
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::TunUnsupported);
+    assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn configuration_policy_rejection_precedes_spawn_and_reload() {
+    let harness = Harness::new();
+    let session = harness.open();
+    harness.configuration_policy.deny(true);
+
+    let spawn_error = harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect_err("a rejected configuration should not spawn the Core");
+    assert_eq!(spawn_error.kind, CoreRuntimeErrorKind::InvalidBundle);
+    assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 0);
+    assert_eq!(harness.processes.reload_count.load(Ordering::Relaxed), 0);
+
+    harness.configuration_policy.deny(false);
+    let applied = harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(2))
+        .expect("an accepted configuration should spawn the Core");
+    assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 1);
+    harness.configuration_policy.deny(true);
+
+    let reload_error = harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(3))
+        .expect_err("a rejected configuration should not reload the Core");
+    assert_eq!(reload_error.kind, CoreRuntimeErrorKind::InvalidBundle);
+    assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 1);
+    assert_eq!(harness.processes.reload_count.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        applied.managed_core.runtime_generation,
+        RuntimeGeneration(2)
+    );
+}
+
+#[test]
+fn configuration_policy_rejection_blocks_recovery_before_spawn() {
+    let harness = Harness::new();
+    let session = harness.open();
+    let applied = harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect("the initial Core should spawn");
+    harness.processes.mark_exited(applied.managed_core.pid);
+    harness
+        .service
+        .maintenance_step(Duration::ZERO)
+        .expect("maintenance should schedule recovery");
+    harness.configuration_policy.deny(true);
+
+    let error = harness
+        .service
+        .maintenance_step(CORE_RESTART_INITIAL_BACKOFF)
+        .expect_err("a rejected recovery configuration should stop before spawn");
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::InvalidBundle);
+    assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 1);
+    assert_eq!(harness.processes.reload_count.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn runtime_bundle_checks_root_manifest_policy_binary_and_configuration_identity() {
     let harness = Harness::new();
     let session = harness.open();
@@ -2058,6 +2166,7 @@ fn fixture_subprocess_supports_spawn_reload_readiness_and_owned_stop() {
             credentials: Box::new(FakeCredentials::default()),
             identities: Box::new(identities),
             tun: Box::new(FakeTun::default()),
+            configuration_policy: Box::new(FakeConfigurationPolicy::default()),
             secrets: Box::new(CountingSecrets::default()),
             processes: Box::new(processes.clone()),
         },
