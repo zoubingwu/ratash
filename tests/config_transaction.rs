@@ -1099,6 +1099,35 @@ fn cleanup_failure_leaves_a_recoverable_journal_after_commit() {
 }
 
 #[test]
+fn the_next_transaction_retries_committed_journal_cleanup_online() {
+    let harness = Harness::new();
+    harness.commit_initial();
+    harness.store.fail_next(StoreFailure::Clear);
+
+    let pending = harness
+        .coordinator
+        .execute(&harness.candidate(2))
+        .expect("the durable candidate should remain committed");
+    assert_eq!(
+        pending.recovery,
+        RecoveryOutcome::Pending {
+            target: Some(RuntimeGeneration(2))
+        }
+    );
+    assert!(harness.has_prepared());
+
+    let recovered = harness
+        .coordinator
+        .execute(&harness.candidate(3))
+        .expect("the next transaction should clear the committed journal and proceed");
+
+    assert_eq!(recovered.committed_generation, RuntimeGeneration(3));
+    assert_eq!(recovered.recovery, RecoveryOutcome::NotRequired);
+    assert_eq!(harness.runtime.generation(), Some(RuntimeGeneration(3)));
+    assert!(!harness.has_prepared());
+}
+
+#[test]
 fn prepare_acknowledgement_failure_clears_the_durable_journal() {
     let harness = Harness::new();
     harness.commit_initial();

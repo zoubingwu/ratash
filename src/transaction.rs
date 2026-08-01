@@ -523,7 +523,7 @@ impl ConfigTransactionCoordinator {
         _guard: MutexGuard<'_, ()>,
         failure_recovery_mode: FailureRecoveryMode,
     ) -> Result<ConfigTransactionSuccess, ConfigTransactionError> {
-        let initial_state = self.store.recover().map_err(|_| {
+        let mut initial_state = self.store.recover().map_err(|_| {
             ConfigTransactionError::new(
                 ConfigTransactionErrorKind::Recovery,
                 Some(candidate.runtime.generation),
@@ -541,6 +541,33 @@ impl ConfigTransactionCoordinator {
                     RecoveryOutcome::Failed { target: None },
                 )
             })?;
+        if let Some(prepared) = initial_state.prepared.as_ref()
+            && initial_state
+                .committed
+                .as_ref()
+                .is_some_and(|committed| committed.current == prepared.candidate)
+        {
+            self.clear_prepared_and_prune(prepared).map_err(|_| {
+                ConfigTransactionError::new(
+                    ConfigTransactionErrorKind::RecoveryRequired,
+                    Some(candidate.runtime.generation),
+                    committed_generation,
+                    RecoveryOutcome::Pending {
+                        target: committed_generation,
+                    },
+                )
+            })?;
+            initial_state = self.store.recover().map_err(|_| {
+                ConfigTransactionError::new(
+                    ConfigTransactionErrorKind::Recovery,
+                    Some(candidate.runtime.generation),
+                    committed_generation,
+                    RecoveryOutcome::Failed {
+                        target: committed_generation,
+                    },
+                )
+            })?;
+        }
         if initial_state.prepared.is_some() {
             return Err(ConfigTransactionError::new(
                 ConfigTransactionErrorKind::RecoveryRequired,
