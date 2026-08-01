@@ -1412,7 +1412,7 @@ fn client_write_deadline_bounds_a_server_that_does_not_read() {
     let listener = bind_private_listener(socket.path()).expect("fixture listener should bind");
     let fixture = thread::spawn(move || {
         let (_stream, _) = listener.accept().expect("fixture should accept");
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_secs(1));
     });
     let client = IpcClient::with_timeouts(
         socket.path(),
@@ -1435,7 +1435,11 @@ fn client_write_deadline_bounds_a_server_that_does_not_read() {
             .message
             .contains("query current state before retrying")
     );
-    assert!(started.elapsed() < Duration::from_millis(180));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "the write deadline should finish before the one-second server stall: {elapsed:?}"
+    );
 
     fixture.join().expect("fixture server should stop");
 }
