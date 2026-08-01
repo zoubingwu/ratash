@@ -142,6 +142,8 @@ impl IpcClient {
             IpcTimeoutPolicy::Product => match operation {
                 ApplicationOperation::ProfileAdd { .. } => IPC_PROFILE_ADD_TIMEOUT,
                 ApplicationOperation::ProfileUse { .. }
+                | ApplicationOperation::ProfileRemove { .. }
+                | ApplicationOperation::ProxySelect { .. }
                 | ApplicationOperation::RuleAdd { .. }
                 | ApplicationOperation::RuleReplace { .. }
                 | ApplicationOperation::RuleRemove { .. } => IPC_RUNTIME_MUTATION_TIMEOUT,
@@ -1088,15 +1090,20 @@ impl IpcClient {
     ) -> Result<ApplicationOutput, ApplicationError> {
         let expected_output = ExpectedOutput::for_operation(&operation);
         let response_timeout = self.response_timeout(&operation);
+        let may_commit = operation_may_commit(&operation);
         let request_id = self.request_id();
         let request = IpcRequest::new(request_id, request_operation(operation));
         let stream = self.connect().map_err(connect_error)?;
         let mut stream =
             DeadlineUnixStream::new(stream, response_timeout).map_err(connect_error)?;
         stream.begin_write().map_err(connect_error)?;
-        write_frame(&mut stream, &request).map_err(write_error)?;
-        stream.begin_read().map_err(connect_error)?;
-        let response: IpcResponse = read_frame(&mut stream).map_err(read_error)?;
+        write_frame(&mut stream, &request)
+            .map_err(|error| operation_write_error(error, may_commit))?;
+        stream
+            .begin_read()
+            .map_err(|error| operation_read_setup_error(error, may_commit))?;
+        let response: IpcResponse =
+            read_frame(&mut stream).map_err(|error| operation_read_error(error, may_commit))?;
         response
             .ensure_correlated(request_id)
             .map_err(|_| protocol_error("The IPC response did not match the request"))?;
@@ -1386,6 +1393,66 @@ fn write_error(error: crate::ipc::FrameError) -> ApplicationError {
             )
         }
     }
+}
+
+fn operation_write_error(error: crate::ipc::FrameError, may_commit: bool) -> ApplicationError {
+    if may_commit && matches!(&error, crate::ipc::FrameError::Io(_)) {
+        return unknown_mutation_outcome(
+            "The IPC mutation request was interrupted; query current state before retrying",
+        );
+    }
+    write_error(error)
+}
+
+fn operation_read_setup_error(error: io::Error, may_commit: bool) -> ApplicationError {
+    if may_commit {
+        unknown_mutation_outcome(
+            "The IPC mutation response could not be read; query current state before retrying",
+        )
+    } else {
+        connect_error(error)
+    }
+}
+
+fn operation_read_error(error: crate::ipc::FrameError, may_commit: bool) -> ApplicationError {
+    if may_commit
+        && matches!(
+            &error,
+            crate::ipc::FrameError::Io(error)
+                if is_timeout(error)
+                    || matches!(
+                        error.kind(),
+                        io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::BrokenPipe
+                    )
+        )
+    {
+        return unknown_mutation_outcome(
+            "The IPC mutation outcome is unknown; query current state before retrying",
+        );
+    }
+    read_error(error)
+}
+
+fn unknown_mutation_outcome(message: &'static str) -> ApplicationError {
+    ApplicationError::new(ErrorCode::ExternalOperationFailed, message, false)
+}
+
+fn operation_may_commit(operation: &ApplicationOperation) -> bool {
+    matches!(
+        operation,
+        ApplicationOperation::Start
+            | ApplicationOperation::Stop
+            | ApplicationOperation::Restart
+            | ApplicationOperation::ProfileAdd { .. }
+            | ApplicationOperation::ProfileUse { .. }
+            | ApplicationOperation::ProfileRemove { .. }
+            | ApplicationOperation::ProxySelect { .. }
+            | ApplicationOperation::RuleAdd { .. }
+            | ApplicationOperation::RuleReplace { .. }
+            | ApplicationOperation::RuleRemove { .. }
+    )
 }
 
 fn read_error(error: crate::ipc::FrameError) -> ApplicationError {

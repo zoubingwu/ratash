@@ -1286,6 +1286,38 @@ fn client_read_deadline_returns_a_retryable_safe_error() {
 }
 
 #[test]
+fn mutation_read_deadline_requires_state_reconciliation_before_retry() {
+    let socket = TempSocket::new("mutation-read-deadline");
+    let listener = bind_private_listener(socket.path()).expect("fixture listener should bind");
+    let fixture = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("fixture should accept");
+        let _: IpcRequest = read_frame(&mut stream).expect("fixture should read request");
+        thread::sleep(Duration::from_millis(200));
+    });
+    let client = IpcClient::with_timeouts(
+        socket.path(),
+        Duration::from_millis(100),
+        Duration::from_millis(40),
+    );
+
+    let error = client
+        .execute(ApplicationOperation::RuleRemove {
+            rule: "MATCH,DIRECT".to_owned(),
+        })
+        .expect_err("a silent mutation response should reach the read deadline");
+
+    assert_eq!(error.code, ErrorCode::ExternalOperationFailed);
+    assert!(!error.retryable);
+    assert!(
+        error
+            .message
+            .contains("query current state before retrying")
+    );
+
+    fixture.join().expect("fixture server should stop");
+}
+
+#[test]
 fn client_write_deadline_bounds_a_server_that_does_not_read() {
     let socket = TempSocket::new("write-deadline");
     let listener = bind_private_listener(socket.path()).expect("fixture listener should bind");
@@ -1307,11 +1339,12 @@ fn client_write_deadline_bounds_a_server_that_does_not_read() {
     let error = client
         .execute(operation)
         .expect_err("non-reading server should reach the write deadline");
-    assert_eq!(error.code, ErrorCode::SupervisorUnavailable);
-    assert!(error.retryable);
-    assert_eq!(
-        error.message,
-        "Timed out sending the Supervisor IPC request"
+    assert_eq!(error.code, ErrorCode::ExternalOperationFailed);
+    assert!(!error.retryable);
+    assert!(
+        error
+            .message
+            .contains("query current state before retrying")
     );
     assert!(started.elapsed() < Duration::from_millis(180));
 

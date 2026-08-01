@@ -18,6 +18,8 @@ Failure recovery:\n\
 - For `supervisor_unavailable`, run `hopash start --json`, then `hopash status --json`.\n\
 - After a Runtime Apply failure, the last committed Runtime Generation remains active. Run \
 `hopash status --json` and reread the affected resource before the next mutation.\n\
+- After a mutation response deadline or transport failure, query status and the affected resource \
+before retrying.\n\
 - Treat `retryable: true` as permission to refresh state and retry the complete operation.\n"
     )
 }
