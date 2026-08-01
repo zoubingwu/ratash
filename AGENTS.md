@@ -90,7 +90,8 @@
 - `src/cli/runner.rs` executes typed invocations against an injected application client and owns stdout/stderr formatting.
 - `skills/hopash/` is the packaged AI Skill and treats `hopash help agent` as the live command authority.
 - `examples/generate-release-assets.rs` derives Bash, Zsh, Fish, and `hopash(1)` assets from the public Clap command tree and verifies committed copies.
-- `examples/release-benchmark.rs`, `scripts/capture-release-benchmarks-macos.sh`, `scripts/macos-release-resource-probe.sh`, and `packaging/release/benchmark-capture.md` define the deterministic fixture-backed release workload, fixed-runner capture, resource sampling, provenance approval, and release gate without exercising live network capture.
+- `examples/release-benchmark.rs` is the command facade for the deterministic fixture-backed release workload; `examples/release_benchmark/` separates fixture generation, workload execution, metric collection, process sampling, profile serving, reporting, runtime support, and tests. The collector digest covers every collector source file.
+- `scripts/capture-release-benchmarks-macos.sh`, `scripts/macos-release-resource-probe.sh`, and `packaging/release/benchmark-capture.md` define fixed-runner capture, resource sampling, provenance approval, and the release gate without exercising live network capture.
 - `packaging/macos/` and `scripts/package-macos.sh` define the signed per-architecture installer payload, pinned Mihomo artifacts, LaunchDaemon, and uninstaller without performing installation during development.
 - `.github/workflows/ci.yml` validates formatting, linting, tests, generated assets, and release-scale bounds; `.github/workflows/release.yml` builds, signs, notarizes, checksums, and publishes both macOS installer targets.
 - `src/main.rs` remains the thin executable composition root.
