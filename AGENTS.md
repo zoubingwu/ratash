@@ -96,6 +96,7 @@
 - `scripts/capture-release-benchmarks-macos.sh`, `scripts/macos-release-resource-probe.sh`, and `packaging/release/benchmark-capture.md` define fixed-runner capture, resource sampling, provenance approval, and the release gate without exercising live network capture.
 - `packaging/macos/` and `scripts/package-macos.sh` define the signed per-architecture installer payload, pinned Mihomo artifacts, LaunchDaemon, and uninstaller without performing installation during development.
 - `.github/workflows/ci.yml` validates formatting, linting, tests, generated assets, and release-scale bounds; `.github/workflows/release.yml` builds, signs, notarizes, checksums, and publishes both macOS installer targets.
+- `src/production.rs` composes privileged-service startup, Supervisor ownership, shutdown coordination, and production adapters; `src/production/foreground.rs` owns the public application client, CLI and TUI runners, lifecycle error projection, shutdown control, and foreground log signal bridge; `src/production/tests.rs` owns focused unit fixtures and lifecycle tests.
 - `src/main.rs` remains the thin executable composition root.
 
 ## Product Constraints
