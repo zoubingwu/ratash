@@ -39,3 +39,4 @@ unsafe_code = "forbid"
 [dev-dependencies]
 clap_complete = "4"
 clap_mangen = "0.2"
+portable-pty = "0.9"
