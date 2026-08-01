@@ -330,15 +330,22 @@ impl NativeCoreProcessController {
         Ok(controller)
     }
 
-    #[must_use]
-    pub fn product_defaults() -> Self {
+    pub fn product_defaults() -> io::Result<Self> {
+        Self::product_defaults_with(NativeCoreProcessConfig::default(), std::env::current_exe)
+    }
+
+    fn product_defaults_with(
+        config: NativeCoreProcessConfig,
+        current_executable: impl FnOnce() -> io::Result<PathBuf>,
+    ) -> io::Result<Self> {
+        let guardian_executable = current_executable()?;
         Self::new_guarded(
-            NativeCoreProcessConfig::default(),
+            config,
             Arc::new(UnixCoreControlClient::default()),
             Arc::new(PsProcessInspector),
-            std::env::current_exe().expect("product Core guardian executable"),
+            guardian_executable,
         )
-        .expect("product Core process controller settings")
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
     }
 
     fn lock_state(
@@ -1253,6 +1260,47 @@ mod tests {
     use crate::domain::CoreInstanceGeneration;
     use std::io::{BufRead, BufReader, Cursor};
     use std::sync::Condvar;
+
+    #[test]
+    fn product_defaults_propagates_executable_and_configuration_failures() {
+        let executable_error = NativeCoreProcessController::product_defaults_with(
+            NativeCoreProcessConfig::default(),
+            || {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "fixture executable discovery failed",
+                ))
+            },
+        )
+        .err()
+        .expect("executable discovery should fail");
+        assert_eq!(executable_error.kind(), io::ErrorKind::PermissionDenied);
+
+        let config_error = NativeCoreProcessController::product_defaults_with(
+            NativeCoreProcessConfig {
+                readiness_timeout: Duration::ZERO,
+                ..NativeCoreProcessConfig::default()
+            },
+            || Ok(PathBuf::from("/private/tmp/hopash-fixture")),
+        )
+        .err()
+        .expect("invalid product settings should fail");
+        assert_eq!(config_error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn product_defaults_builds_a_guarded_controller() {
+        let expected_executable =
+            std::env::current_exe().expect("the test executable should be discoverable");
+        let controller = NativeCoreProcessController::product_defaults()
+            .expect("the test executable should configure the product controller");
+
+        assert!(matches!(
+            &controller.launch_mode,
+            CoreLaunchMode::Guardian { executable }
+                if executable == &expected_executable
+        ));
+    }
 
     struct StartingControl;
 

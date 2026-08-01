@@ -1,6 +1,20 @@
 use super::*;
 use std::sync::atomic::AtomicUsize;
 
+#[test]
+fn core_process_controller_startup_errors_preserve_kind_and_hide_diagnostics() {
+    let error = core_process_controller_startup_error(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "/private/sensitive/controller-path",
+    ));
+
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        error.to_string(),
+        "the Core process controller could not initialize"
+    );
+}
+
 #[derive(Default)]
 struct TestShutdownSignal {
     requested: AtomicBool,

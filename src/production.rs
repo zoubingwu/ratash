@@ -389,7 +389,10 @@ pub fn run_core_service(invocation: CoreServiceInvocation) -> io::Result<()> {
                 tun: Box::new(MacOsTunCapabilityPreflight),
                 configuration_policy: Box::new(BundledConfigurationPolicy { compiler }),
                 secrets: Box::new(UuidSecretGenerator),
-                processes: Box::new(NativeCoreProcessController::product_defaults()),
+                processes: Box::new(
+                    NativeCoreProcessController::product_defaults()
+                        .map_err(core_process_controller_startup_error)?,
+                ),
             },
         )
         .map_err(|_| io::Error::other("the privileged Core service could not initialize"))?,
@@ -1579,6 +1582,13 @@ fn invalid_product_configuration(_error: impl fmt::Display) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         "the bundled product configuration is invalid",
+    )
+}
+
+fn core_process_controller_startup_error(error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        "the Core process controller could not initialize",
     )
 }
 
