@@ -11,7 +11,8 @@ use serde::Serialize;
 
 use crate::application::ApplicationError;
 use crate::constants::{
-    CORE_LOG_LINE_MAX_BYTES, JSON_OUTPUT_MAX_BYTES, LOG_CAPACITY, LOG_SUBSCRIBER_CAPACITY,
+    CORE_LOG_LINE_MAX_BYTES, JSON_OUTPUT_MAX_BYTES, LOG_SUBSCRIBER_CAPACITY,
+    LOG_SUBSCRIBER_MAX_BYTES,
 };
 use crate::contract::{ApiError, JsonEnvelope, SCHEMA_VERSION};
 use crate::domain::StatusSnapshot;
@@ -78,6 +79,7 @@ struct ConnectionBufferState {
     covered_through: Option<u64>,
     remote_dropped_total: u64,
     local_dropped_total: u64,
+    queued_bytes: usize,
     gap: bool,
     disconnected: bool,
 }
@@ -261,21 +263,23 @@ impl StatusLogEventSource for IpcStatusLogEventSource {
         if cancellation.is_cancelled() {
             return Err(cancelled_stream_error());
         }
-        let records = convert_log_records(&tail.records)?;
-        buffer.apply_tail_coverage(&tail);
+        let sequence_horizon = tail.sequence_horizon;
+        let dropped_total = tail.dropped_total;
+        let records = convert_log_records(tail.records)?;
+        buffer.apply_tail_coverage(sequence_horizon, dropped_total);
         let mut resume = self
             .resume
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         resume.log_sequence = if after_sequence.is_none() {
-            tail.latest_sequence
+            sequence_horizon
         } else {
-            max_sequence(resume.log_sequence, tail.latest_sequence)
+            max_sequence(resume.log_sequence, sequence_horizon)
         };
         Ok(LogTail {
             records,
             gap: tail.gap,
-            dropped_total: tail.dropped_total,
+            dropped_total,
         })
     }
 
@@ -419,11 +423,17 @@ impl ConnectionBuffer {
             return;
         }
         let should_wake = state.logs.is_empty() && !state.gap;
-        if state.logs.len() == LOG_CAPACITY {
-            state.logs.pop_front();
+        while state.logs.len() == LOG_SUBSCRIBER_CAPACITY
+            || state.queued_bytes.saturating_add(record.message.len()) > LOG_SUBSCRIBER_MAX_BYTES
+        {
+            let Some(dropped) = state.logs.pop_front() else {
+                break;
+            };
+            state.queued_bytes = state.queued_bytes.saturating_sub(dropped.message.len());
             state.local_dropped_total = state.local_dropped_total.saturating_add(1);
             state.gap = true;
         }
+        state.queued_bytes = state.queued_bytes.saturating_add(record.message.len());
         state.logs.push_back(record);
         drop(state);
         if should_wake {
@@ -431,8 +441,8 @@ impl ConnectionBuffer {
         }
     }
 
-    fn publish_tail(&self, tail: &LogTailV1) -> Result<(), StatusInterfaceError> {
-        let records = convert_log_records(&tail.records)?;
+    fn publish_tail(&self, tail: LogTailV1) -> Result<(), StatusInterfaceError> {
+        let records = convert_log_records(tail.records)?;
         let mut state = self
             .state
             .lock()
@@ -450,11 +460,18 @@ impl ConnectionBuffer {
             {
                 continue;
             }
-            if state.logs.len() == LOG_CAPACITY {
-                state.logs.pop_front();
+            while state.logs.len() == LOG_SUBSCRIBER_CAPACITY
+                || state.queued_bytes.saturating_add(record.message.len())
+                    > LOG_SUBSCRIBER_MAX_BYTES
+            {
+                let Some(dropped) = state.logs.pop_front() else {
+                    break;
+                };
+                state.queued_bytes = state.queued_bytes.saturating_sub(dropped.message.len());
                 state.local_dropped_total = state.local_dropped_total.saturating_add(1);
                 state.gap = true;
             }
+            state.queued_bytes = state.queued_bytes.saturating_add(record.message.len());
             state.logs.push_back(record);
         }
         drop(state);
@@ -464,17 +481,17 @@ impl ConnectionBuffer {
         Ok(())
     }
 
-    fn apply_tail_coverage(&self, tail: &LogTailV1) {
+    fn apply_tail_coverage(&self, sequence_horizon: Option<u64>, dropped_total: u64) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.covered_through = max_sequence(state.covered_through, tail.latest_sequence);
+        state.covered_through = max_sequence(state.covered_through, sequence_horizon);
         if let Some(covered) = state.covered_through {
             state.logs.retain(|record| record.sequence > covered);
         }
-        state.remote_dropped_total = tail.dropped_total;
-        state.local_dropped_total = 0;
+        state.queued_bytes = state.logs.iter().map(|record| record.message.len()).sum();
+        state.remote_dropped_total = state.remote_dropped_total.max(dropped_total);
         state.gap = false;
     }
 
@@ -512,7 +529,9 @@ impl ConnectionBuffer {
             return None;
         }
         let count = state.logs.len().min(LOG_SUBSCRIBER_CAPACITY);
-        let records = state.logs.drain(..count).collect();
+        let records = state.logs.drain(..count).collect::<Vec<_>>();
+        let delivered_bytes = records.iter().map(|record| record.message.len()).sum();
+        state.queued_bytes = state.queued_bytes.saturating_sub(delivered_bytes);
         let gap = std::mem::take(&mut state.gap);
         Some(StatusLogEvent::Logs {
             connection_generation: generation,
@@ -606,7 +625,7 @@ fn run_log_reader(
     while control.active.load(Ordering::Acquire) {
         match stream.next_item() {
             Ok(Some(item)) => match item.item {
-                LogStreamItem::Record { record } => match convert_log_record(&record) {
+                LogStreamItem::Record { record } => match convert_log_record(record) {
                     Ok(record) => {
                         after_sequence = Some(record.sequence);
                         buffer.publish_log(record);
@@ -625,11 +644,12 @@ fn run_log_reader(
                                 return;
                             }
                         };
-                    if buffer.publish_tail(&tail).is_err() {
+                    let sequence_horizon = tail.sequence_horizon;
+                    if buffer.publish_tail(tail).is_err() {
                         control.fail(buffer);
                         return;
                     }
-                    after_sequence = tail.latest_sequence;
+                    after_sequence = sequence_horizon;
                     let next = match client.follow_logs_cancellable(
                         after_sequence,
                         generation,
@@ -683,17 +703,17 @@ fn recover_log_stream(
         .log_tail_cancellable(after_sequence, &control.cancellation)
         .ok()?;
     let sequence_reset = after_sequence
-        .zip(tail.latest_sequence)
+        .zip(tail.sequence_horizon)
         .is_some_and(|(after, latest)| latest < after)
-        || (after_sequence.is_some() && tail.latest_sequence.is_none());
+        || (after_sequence.is_some() && tail.sequence_horizon.is_none());
     if sequence_reset {
         tail = client
             .log_tail_cancellable(None, &control.cancellation)
             .ok()?;
         tail.gap = true;
     }
-    buffer.publish_tail(&tail).ok()?;
-    let recovered_after = tail.latest_sequence;
+    let recovered_after = tail.sequence_horizon;
+    buffer.publish_tail(tail).ok()?;
     let next = client
         .follow_logs_cancellable(recovered_after, generation, &control.cancellation)
         .ok()?;
@@ -865,7 +885,7 @@ impl ForegroundLogFollower {
                         for record in &tail.records {
                             write_log_record(record, format, stdout)?;
                         }
-                        after_sequence = tail.latest_sequence;
+                        after_sequence = tail.sequence_horizon;
                         generation = generation.wrapping_add(1).max(1);
                         break;
                     }
@@ -975,13 +995,13 @@ fn write_follow_error(
 // -----------------------------------------------------------------------------
 
 fn convert_log_records(
-    records: &[LogRecordV1],
+    records: Vec<LogRecordV1>,
 ) -> Result<Vec<ViewLogRecord>, StatusInterfaceError> {
-    records.iter().map(convert_log_record).collect()
+    records.into_iter().map(convert_log_record).collect()
 }
 
-fn convert_log_record(record: &LogRecordV1) -> Result<ViewLogRecord, StatusInterfaceError> {
-    validate_log_record(record).map_err(|()| invalid_log_record_error())?;
+fn convert_log_record(record: LogRecordV1) -> Result<ViewLogRecord, StatusInterfaceError> {
+    validate_log_record(&record).map_err(|()| invalid_log_record_error())?;
     let level = match record.level.as_str() {
         "debug" => LogLevel::Debug,
         "info" => LogLevel::Info,
@@ -1000,7 +1020,7 @@ fn convert_log_record(record: &LogRecordV1) -> Result<ViewLogRecord, StatusInter
         timestamp_unix_ms: record.timestamp_unix_ms,
         level,
         source,
-        message: record.message.clone(),
+        message: record.message.into_boxed_str().into_string(),
     })
 }
 
@@ -1074,4 +1094,55 @@ fn disconnected_application_error() -> ApplicationError {
         "The Supervisor IPC log stream disconnected",
         true,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constants::{CORE_LOG_LINE_MAX_BYTES, LOG_SUBSCRIBER_MAX_BYTES};
+
+    #[test]
+    fn connection_log_queue_reports_byte_eviction_as_a_gap() {
+        let buffer = ConnectionBuffer::new(Arc::new(Mutex::new(None)));
+        let message = "x".repeat(CORE_LOG_LINE_MAX_BYTES);
+        let retained_records = LOG_SUBSCRIBER_MAX_BYTES / CORE_LOG_LINE_MAX_BYTES;
+        for sequence in 0..=retained_records {
+            buffer.publish_log(ViewLogRecord {
+                sequence: sequence as u64,
+                timestamp_unix_ms: sequence as u64,
+                level: LogLevel::Info,
+                source: LogSource::CoreApi,
+                message: message.clone(),
+            });
+        }
+
+        let Some(StatusLogEvent::Logs {
+            records,
+            gap,
+            dropped_total,
+            ..
+        }) = buffer.take_event(7)
+        else {
+            panic!("the bounded connection queue should produce a log event");
+        };
+        assert_eq!(records.len(), retained_records);
+        assert!(gap);
+        assert_eq!(dropped_total, 1);
+
+        buffer.apply_tail_coverage(Some(retained_records as u64), 7);
+        buffer.apply_tail_coverage(Some(retained_records as u64), 3);
+        for sequence in 1_000..=1_000 + retained_records {
+            buffer.publish_log(ViewLogRecord {
+                sequence: sequence as u64,
+                timestamp_unix_ms: sequence as u64,
+                level: LogLevel::Info,
+                source: LogSource::CoreApi,
+                message: message.clone(),
+            });
+        }
+        let Some(StatusLogEvent::Logs { dropped_total, .. }) = buffer.take_event(8) else {
+            panic!("the second bounded connection queue should produce a log event");
+        };
+        assert_eq!(dropped_total, 9);
+    }
 }

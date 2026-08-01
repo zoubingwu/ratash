@@ -34,6 +34,8 @@
 - The Supervisor is the sole authoritative owner and writer of Profiles, the Local Rule Set, Effective Configuration, Runtime Apply state, Probe Queue state, and telemetry buffers.
 - A zero-Profile Supervisor is ready while the Core state is `unconfigured`. The first valid Profile creates the initial Local Rule Set, Active Profile, Runtime Generation, and Managed Core through one recoverable transaction.
 - The macOS privileged service implements the narrow `CoreRuntime` boundary. It authenticates owner sessions, stages verified runtime bundles, performs Core process operations, and forwards process logs. It owns no product or domain state.
+- Production Core-service connections bind the owner session to the kernel-reported UID, PID, and audit token, and validate the root-owned canonical `/usr/local/bin/hopash` dynamic guest against the packaged Developer ID requirement without network access.
+- The privileged service independently revalidates application-authoritative controller, secret, TUN, DNS, listener, and provider-path policy before any Core spawn, reload, or recovery. Its macOS TUN capability preflight only opens and closes a `PF_SYSTEM` control socket.
 - Route every Core configuration change through `CoreRuntime.apply_candidate`. Keep readiness, proxy queries, node selection, delay checks, connection summaries, traffic, and logs behind the Mihomo adapter.
 - Use separate operating-system locks for Supervisor singleton ownership and cross-process lifecycle operations. Verify the PID, process-start identity, instance token, and Core Instance Generation before controlling a process.
 - Serialize every Runtime Generation producer through one Config Transaction Coordinator. Use the lock order `Config Transaction Coordinator -> lifecycle lock` and revalidate captured revisions before apply.
@@ -45,26 +47,29 @@
 
 - `src/application.rs` defines transport-independent operations, outputs, errors, and the application service seam.
 - `src/background.rs` owns bounded Profile refresh, delay-probe, and generation-scoped Mihomo telemetry workers with wakeable shutdown and reconnect backoff.
-- `src/supervisor.rs` coordinates copy-on-write Profile, proxy, latency, rule, refresh, probe, telemetry, public Core health projection, and bounded list-page projection through injected persistence, Runtime Apply, Profile source, and Core ports.
+- `src/supervisor.rs` coordinates copy-on-write Profile, proxy, latency, rule, refresh, probe, telemetry, cause-scoped Wrapper health reasons and diagnostic transitions, public Core health projection, and bounded list-page projection through injected persistence, Runtime Apply, Profile source, and Core ports.
 - `src/domain.rs` defines shared lifecycle, identity, status, and validated value types.
+- `src/diagnostics.rs` owns safe typed Wrapper diagnostic categories, structured transition records, and bounded tail and gap semantics.
 - `src/contract.rs` owns the versioned JSON V1 envelope and explicit status DTO projection.
 - `src/ipc.rs` owns the versioned local wire protocol, bounded JSON framing, private Unix socket boundary, and per-subscriber status and log backpressure state.
-- `src/ipc_runtime.rs` implements the deadline-bounded one-shot IPC client, strict aggregation of bounded Profile, Proxy, and Rule pages, same-user peer authorization, request-frame allocation limits, and the stoppable bounded Unix socket server.
+- `src/ipc_runtime.rs` implements the cancellable, deadline-bounded one-shot IPC client, strict aggregation of bounded Profile, Proxy, and Rule pages, same-user peer authorization, request-frame allocation limits, count-and-byte-bounded Core Log recovery tails, and the stoppable bounded Unix socket server.
+- `src/frontend_ipc.rs` adapts status and Core Log streams for foreground clients with a count-and-byte-bounded delivery queue that preserves dropped and gap signals.
+- `src/cancellation.rs` owns the shared operation cancellation token and interrupt-registration boundary used to wake blocking foreground work.
 - `src/lifecycle.rs` owns state-root discovery, process identities, recoverable directory leases, instance records, and verified stale-socket cleanup.
 - `src/profile.rs` owns sanitized Subscription URLs, validated Profile Snapshots, Profile naming, catalog selection, and refresh revision checks.
 - `src/profile_source.rs` owns bounded HTTP(S) Profile downloads, redirect policy, metadata extraction, and safe download errors.
 - `src/persistence.rs` owns private content-addressed objects, recoverable transaction journals, the committed manifest pointer, and bounded reachability pruning after durable journal cleanup.
 - `src/state.rs` stages and hydrates the complete authoritative Supervisor state through immutable objects and the committed transaction pointer.
 - `src/transaction.rs` serializes every Runtime Generation producer, revalidates revisions, confirms Core identity and health, and converges failures to the committed pointer.
-- `src/config.rs` compiles Profile Snapshots through the bundled Mihomo field catalog, applies authoritative fields, and exposes the final Core validation seam.
+- `src/config.rs` compiles Profile Snapshots through the bundled Mihomo field catalog, applies authoritative fields, and exposes both user-side Core validation and privileged authoritative-policy validation seams.
 - `src/validator.rs` verifies the pinned Mihomo binary and runs bounded `-t` validation inside the private staging root without starting the Core.
 - `fixtures/mihomo/v1.19.28/config-schema.yaml` is the closed field catalog bound to the bundled Core version.
 - `src/core.rs` defines the authenticated CoreRuntime boundary, Mihomo adapter contract, versioned Proxy View, selection resolution, and fixed API codecs.
-- `src/core_service_ipc.rs` implements the versioned privileged CoreRuntime Unix socket protocol, peer-bound owner sessions, and secure Runtime Bundle ingress.
+- `src/core_service_ipc.rs` implements the versioned privileged CoreRuntime Unix socket protocol, kernel-identity-bound owner sessions, injectable dynamic-peer authorization, and secure Runtime Bundle ingress.
 - `src/daemon.rs` owns lifecycle-operation serialization, Supervisor singleton ownership, detached internal launch, one-time readiness, identity-bound shutdown, and validated stale-state cleanup.
 - `src/mihomo.rs` implements bounded authenticated Mihomo REST and WebSocket access over the private Core Unix socket.
-- `src/service.rs` owns the injected privileged CoreRuntime state machine, authenticated owner sessions, verified runtime bundles, process identity enforcement, bounded log forwarding, and bounded restart policy.
-- `src/process_controller.rs` launches the same-binary Core guardian, verifies its bounded PID handshake, and implements bounded readiness, reload, stop, and stdout/stderr capture for the privileged runtime service; its injected constructor retains direct fixture process control.
+- `src/service.rs` owns the injected privileged CoreRuntime state machine, authenticated owner sessions, verified runtime bundles, process identity enforcement, retained cleanup authority for uncommitted Core candidates, count-and-byte-bounded log forwarding, and bounded restart policy.
+- `src/process_controller.rs` launches the same-binary Core guardian, uses EOF-first containment until the bounded PID handshake transfers cleanup authority, performs the open-and-close-only macOS TUN capability probe, and implements bounded readiness, reload, stop, and count-and-byte-bounded stdout/stderr capture for the privileged runtime service; its injected constructor retains direct fixture process control.
 - `src/core_guardian.rs` owns and reaps one verified Mihomo child, forwards its output after a versioned handshake, and terminates that exact child when the privileged service control pipe closes.
 - `src/runtime_bundle.rs` atomically stages private Runtime Generations and binds the Effective Configuration, bundled Mihomo executable, and local provider files to one verified manifest.
 - `src/runtime_adapters.rs` confirms pinned Mihomo readiness, classifies uncertain CoreRuntime outcomes, and resolves previously staged Runtime Generations for recovery.
@@ -72,9 +77,9 @@
 - `fixtures/release/product-contract-v1.json` freezes protocol versions, user-visible timing, capacities, size limits, and process exit codes for the first release contract; `benchmark-metadata-v1.json` freezes the release workload and measurement schema.
 - `src/rule.rs` owns Rule String parsing, ordered Local Rule Set mutations, revisions, and deterministic `rules.yaml` serialization.
 - `src/scheduler.rs` owns deterministic bounded Profile Refresh and Active Profile Delay Probe scheduling state.
-- `src/telemetry.rs` owns generation-scoped latest values, fixed traffic history, and the bounded Core Log ring.
-- `src/tui.rs` owns the Ratatui view model, reducer, input mapping, pure rendering, fair event inbox, and reversible Crossterm terminal session.
-- `src/tui_runtime.rs` owns pre-terminal bootstrap, bounded background command dispatch, reconnect timing, live status and log intake, the coalesced event loop, signal handling, and the Ratatui/Crossterm runner.
+- `src/telemetry.rs` owns generation-scoped latest values, fixed traffic history, the count-and-byte-bounded authoritative Core Log ring, and bounded latest-tail projection.
+- `src/tui.rs` owns the revision-aware Ratatui view model, reducer, count-and-byte-bounded Core Log view, bounded search input, input mapping, pure rendering, fair event inbox, and reversible Crossterm terminal session.
+- `src/tui_runtime.rs` owns pre-terminal bootstrap, latest-intent mutation dispatch, cancellable foreground waits, bounded snapshot resynchronization, reconnect timing, live status and log intake, the coalesced event loop, signal handling, and the Ratatui/Crossterm runner.
 - `src/constants.rs` centralizes versioned product intervals, capacities, terminal limits, and input-size boundaries.
 - `src/digest.rs` is the internal SHA-256 helper shared by stable identities, immutable storage, and compiler policies.
 - `src/cli/command.rs` defines the public Clap command tree and maps parsed commands to typed invocations.
@@ -83,6 +88,7 @@
 - `src/cli/runner.rs` executes typed invocations against an injected application client and owns stdout/stderr formatting.
 - `skills/hopash/` is the packaged AI Skill and treats `hopash help agent` as the live command authority.
 - `examples/generate-release-assets.rs` derives Bash, Zsh, Fish, and `hopash(1)` assets from the public Clap command tree and verifies committed copies.
+- `examples/release-benchmark.rs`, `scripts/capture-release-benchmarks-macos.sh`, `scripts/macos-release-resource-probe.sh`, and `packaging/release/benchmark-capture.md` define the deterministic fixture-backed release workload, fixed-runner capture, resource sampling, provenance approval, and release gate without exercising live network capture.
 - `packaging/macos/` and `scripts/package-macos.sh` define the signed per-architecture installer payload, pinned Mihomo artifacts, LaunchDaemon, and uninstaller without performing installation during development.
 - `.github/workflows/ci.yml` validates formatting, linting, tests, generated assets, and release-scale bounds; `.github/workflows/release.yml` builds, signs, notarizes, checksums, and publishes both macOS installer targets.
 - `src/main.rs` remains the thin executable composition root.

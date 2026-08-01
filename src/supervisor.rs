@@ -27,7 +27,8 @@ use crate::config::{
 use crate::constants::{
     CORE_LOG_LINE_MAX_BYTES, IPC_LIST_PAGE_SIZE, LOG_CAPACITY, PROBE_TIMEOUT, PROBE_URL,
     PROFILE_COUNT_MAX, PROFILE_REFRESH_INTERVAL, RULE_STRING_MAX_BYTES,
-    SELECTION_RESTORE_ATTEMPT_LIMIT, TRAFFIC_SERIES_CAPACITY, YAML_MAX_DEPTH,
+    SELECTION_RESTORE_ATTEMPT_LIMIT, TRAFFIC_SERIES_CAPACITY, WRAPPER_DIAGNOSTIC_CAPACITY,
+    YAML_MAX_DEPTH,
 };
 use crate::core::{
     Availability, CoreRuntime, CoreRuntimeDiagnosticCategory as RuntimeDiagnosticCategory,
@@ -35,6 +36,9 @@ use crate::core::{
     ManagedCoreHandle, MihomoAdapter, MihomoError, MihomoErrorKind, NodeRowMemberV1, NodeSelection,
     NodeSource, ProbeObservation, ProbeStatus as CoreProbeStatus, ProxyView, RuntimeBundle,
     SelectionError,
+};
+use crate::diagnostics::{
+    WrapperDiagnosticContext, WrapperDiagnosticRing, WrapperDiagnosticState, WrapperDiagnosticTail,
 };
 use crate::domain::{
     ActiveProfileSummary, CoreDiagnosticCategory, CoreInstanceGeneration, CoreLifecycle,
@@ -146,6 +150,8 @@ pub trait SupervisorCorePort: Send + Sync {
         core: &ManagedCoreHandle,
         selection: &NodeSelection,
     ) -> Result<(), MihomoError>;
+
+    fn cancel_pending(&self) {}
 }
 
 pub struct DirectSupervisorCorePort {
@@ -191,6 +197,10 @@ impl SupervisorCorePort for DirectSupervisorCorePort {
         selection: &NodeSelection,
     ) -> Result<(), MihomoError> {
         self.mihomo.select_node(&core.endpoint, selection)
+    }
+
+    fn cancel_pending(&self) {
+        self.mihomo.cancel_pending();
     }
 }
 
@@ -287,6 +297,8 @@ pub trait SupervisorTransactionPort: Send + Sync {
     }
 
     fn set_current_revisions(&self, revisions: CandidateRevisions);
+
+    fn cancel_pending(&self) {}
 }
 
 pub trait SupervisorRuleTransactionReservation {
@@ -549,6 +561,10 @@ impl SupervisorTransactionPort for CoordinatedSupervisorTransactions {
     fn set_current_revisions(&self, revisions: CandidateRevisions) {
         self.revisions.set(revisions);
     }
+
+    fn cancel_pending(&self) {
+        self.coordinator.request_shutdown();
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -584,6 +600,7 @@ struct SupervisorState {
     selection_restore_pending: bool,
     selection_restore_attempts_remaining: usize,
     health_reasons: BTreeSet<SupervisorHealthReason>,
+    wrapper_diagnostics: WrapperDiagnosticRing,
 }
 
 #[derive(Default)]
@@ -821,13 +838,21 @@ impl Supervisor {
                 probe_core_generation: None,
                 selection_restore_pending: false,
                 selection_restore_attempts_remaining: 0,
-                health_reasons: startup_health_reasons,
+                health_reasons: BTreeSet::new(),
+                wrapper_diagnostics: WrapperDiagnosticRing::new(WRAPPER_DIAGNOSTIC_CAPACITY)
+                    .map_err(|_| internal_error())?,
             }),
             activation: Mutex::new(ActivationQueue::default()),
             apply_in_progress: AtomicBool::new(false),
             last_runtime_apply: Mutex::new(startup_runtime_apply),
             last_status: Mutex::new(initial_status),
         };
+        {
+            let mut state = supervisor.state.lock().map_err(|_| internal_error())?;
+            for reason in startup_health_reasons {
+                supervisor.set_health_reason(&mut state, reason, true);
+            }
+        }
         supervisor.reconcile_runtime_state()?;
         Ok(supervisor)
     }
@@ -1058,6 +1083,13 @@ impl Supervisor {
         self.refresh_profile(task.profile_id)
     }
 
+    pub fn cancel_pending_mutations(&self) {
+        self.source.cancel_pending();
+        self.validator.cancel_pending();
+        self.transactions.cancel_pending();
+        self.core.cancel_pending();
+    }
+
     pub fn cancel_pending_profile_downloads(&self) {
         self.source.cancel_pending();
     }
@@ -1156,6 +1188,17 @@ impl Supervisor {
             }))
     }
 
+    pub fn wrapper_diagnostic_tail(
+        &self,
+        after_sequence: Option<u64>,
+    ) -> Result<WrapperDiagnosticTail, ApplicationError> {
+        let state = self.state.lock().map_err(|_| internal_error())?;
+        state
+            .wrapper_diagnostics
+            .tail_after(after_sequence, WRAPPER_DIAGNOSTIC_CAPACITY)
+            .map_err(|_| internal_error())
+    }
+
     pub fn retry_selection_restore(&self) -> Result<bool, ApplicationError> {
         let mut state = self.state.lock().map_err(|_| internal_error())?;
         if !state.selection_restore_pending
@@ -1217,7 +1260,7 @@ impl Supervisor {
             .saturating_sub(self.started_at_unix_ms)
             / 1_000;
         if let Some(core) = &managed_core
-            && let Ok(order) = effective_group_order_with_health(&mut state)
+            && let Ok(order) = self.effective_group_order_with_health(&mut state)
             && let Ok(view) = self.core.proxy_view(core, &order)
         {
             state.cached_proxy_view = Some(view);
@@ -1313,7 +1356,7 @@ impl Supervisor {
     ) -> Result<ConfigTransactionSuccess, ApplicationError> {
         match result {
             Ok(success) => {
-                set_health_reason(
+                self.set_health_reason(
                     state,
                     SupervisorHealthReason::RuntimeRecovery,
                     recovery_requires_degraded(success.recovery),
@@ -1326,7 +1369,7 @@ impl Supervisor {
                 Ok(success)
             }
             Err(error) => {
-                set_health_reason(
+                self.set_health_reason(
                     state,
                     SupervisorHealthReason::RuntimeRecovery,
                     recovery_requires_degraded(error.recovery),
@@ -1339,6 +1382,34 @@ impl Supervisor {
                 Err(map_transaction_error(error))
             }
         }
+    }
+
+    fn set_health_reason(
+        &self,
+        state: &mut SupervisorState,
+        reason: SupervisorHealthReason,
+        active: bool,
+    ) {
+        let changed = if active {
+            state.health_reasons.insert(reason)
+        } else {
+            state.health_reasons.remove(&reason)
+        };
+        if !changed {
+            return;
+        }
+        let diagnostic_state = if active {
+            WrapperDiagnosticState::Raised
+        } else {
+            WrapperDiagnosticState::Cleared
+        };
+        let context = wrapper_diagnostic_context(state, reason);
+        let _ = state.wrapper_diagnostics.record(
+            self.clock.now_unix_ms(),
+            reason.into(),
+            diagnostic_state,
+            context,
+        );
     }
 
     fn profile_add(
@@ -1676,9 +1747,11 @@ impl Supervisor {
                 .as_ref()
                 .is_some_and(|previous| self.core.select_node(&core, previous).is_ok());
             if !compensated {
-                state
-                    .health_reasons
-                    .insert(SupervisorHealthReason::SelectionCompensation);
+                self.set_health_reason(
+                    &mut state,
+                    SupervisorHealthReason::SelectionCompensation,
+                    true,
+                );
             }
             return Err(ApplicationError::new(
                 ErrorCode::ExternalOperationFailed,
@@ -1694,12 +1767,16 @@ impl Supervisor {
         state.cached_proxy_view = None;
         state.selection_restore_pending = false;
         state.selection_restore_attempts_remaining = 0;
-        state
-            .health_reasons
-            .remove(&SupervisorHealthReason::SelectionCompensation);
-        state
-            .health_reasons
-            .remove(&SupervisorHealthReason::SelectionRestoration);
+        self.set_health_reason(
+            &mut state,
+            SupervisorHealthReason::SelectionCompensation,
+            false,
+        );
+        self.set_health_reason(
+            &mut state,
+            SupervisorHealthReason::SelectionRestoration,
+            false,
+        );
         Ok(ApplicationOutput::ProxySelection(ProxySelectionOutcome {
             group_id,
             group: group_name,
@@ -1953,7 +2030,7 @@ impl Supervisor {
             .map_err(|_| core_error("The Managed Core is unavailable"))?
             .managed_core
             .ok_or_else(|| core_error("The Managed Core is unavailable"))?;
-        let order = effective_group_order_with_health(state)?;
+        let order = self.effective_group_order_with_health(state)?;
         let view = self
             .core
             .proxy_view(&core, &order)
@@ -1978,15 +2055,13 @@ impl Supervisor {
             state.probes.deactivate();
             state.selection_restore_pending = false;
             state.selection_restore_attempts_remaining = 0;
-            state
-                .health_reasons
-                .remove(&SupervisorHealthReason::ConfigurationProjection);
-            state
-                .health_reasons
-                .remove(&SupervisorHealthReason::ProbeScheduler);
-            state
-                .health_reasons
-                .remove(&SupervisorHealthReason::SelectionRestoration);
+            self.set_health_reason(
+                state,
+                SupervisorHealthReason::ConfigurationProjection,
+                false,
+            );
+            self.set_health_reason(state, SupervisorHealthReason::ProbeScheduler, false);
+            self.set_health_reason(state, SupervisorHealthReason::SelectionRestoration, false);
             return;
         }
         let core = self
@@ -2017,7 +2092,7 @@ impl Supervisor {
         {
             return;
         }
-        let order = match effective_group_order_with_health(state) {
+        let order = match self.effective_group_order_with_health(state) {
             Ok(order) => order,
             Err(_) => return,
         };
@@ -2058,14 +2133,10 @@ impl Supervisor {
         {
             state.probes.deactivate();
             state.probe_core_generation = None;
-            state
-                .health_reasons
-                .insert(SupervisorHealthReason::ProbeScheduler);
+            self.set_health_reason(state, SupervisorHealthReason::ProbeScheduler, true);
         } else {
             state.probe_core_generation = Some(core_generation);
-            state
-                .health_reasons
-                .remove(&SupervisorHealthReason::ProbeScheduler);
+            self.set_health_reason(state, SupervisorHealthReason::ProbeScheduler, false);
         }
     }
 
@@ -2073,9 +2144,7 @@ impl Supervisor {
         let Some(active_id) = state.profiles.active_profile_id() else {
             state.selection_restore_pending = false;
             state.selection_restore_attempts_remaining = 0;
-            state
-                .health_reasons
-                .remove(&SupervisorHealthReason::SelectionRestoration);
+            self.set_health_reason(state, SupervisorHealthReason::SelectionRestoration, false);
             return;
         };
         let has_selections = state
@@ -2089,9 +2158,7 @@ impl Supervisor {
             0
         };
         if !has_selections {
-            state
-                .health_reasons
-                .remove(&SupervisorHealthReason::SelectionRestoration);
+            self.set_health_reason(state, SupervisorHealthReason::SelectionRestoration, false);
         }
     }
 
@@ -2104,9 +2171,7 @@ impl Supervisor {
         let Some(active_id) = state.profiles.active_profile_id() else {
             state.selection_restore_pending = false;
             state.selection_restore_attempts_remaining = 0;
-            state
-                .health_reasons
-                .remove(&SupervisorHealthReason::SelectionRestoration);
+            self.set_health_reason(state, SupervisorHealthReason::SelectionRestoration, false);
             return;
         };
         let selections = state
@@ -2130,9 +2195,7 @@ impl Supervisor {
             self.consume_selection_restore_attempt(state);
         } else {
             state.selection_restore_attempts_remaining = 0;
-            state
-                .health_reasons
-                .remove(&SupervisorHealthReason::SelectionRestoration);
+            self.set_health_reason(state, SupervisorHealthReason::SelectionRestoration, false);
         }
     }
 
@@ -2144,9 +2207,31 @@ impl Supervisor {
             state.selection_restore_attempts_remaining.saturating_sub(1);
         if state.selection_restore_attempts_remaining == 0 {
             state.selection_restore_pending = false;
-            state
-                .health_reasons
-                .insert(SupervisorHealthReason::SelectionRestoration);
+            self.set_health_reason(state, SupervisorHealthReason::SelectionRestoration, true);
+        }
+    }
+
+    fn effective_group_order_with_health(
+        &self,
+        state: &mut SupervisorState,
+    ) -> Result<Vec<String>, ApplicationError> {
+        match effective_group_order(&state.profiles) {
+            Ok(order) => {
+                self.set_health_reason(
+                    state,
+                    SupervisorHealthReason::ConfigurationProjection,
+                    false,
+                );
+                Ok(order)
+            }
+            Err(error) => {
+                self.set_health_reason(
+                    state,
+                    SupervisorHealthReason::ConfigurationProjection,
+                    true,
+                );
+                Err(error)
+            }
         }
     }
 
@@ -2397,30 +2482,31 @@ fn effective_group_order(profiles: &ProfileCatalog) -> Result<Vec<String>, Appli
         .collect())
 }
 
-fn effective_group_order_with_health(
-    state: &mut SupervisorState,
-) -> Result<Vec<String>, ApplicationError> {
-    match effective_group_order(&state.profiles) {
-        Ok(order) => {
-            state
-                .health_reasons
-                .remove(&SupervisorHealthReason::ConfigurationProjection);
-            Ok(order)
-        }
-        Err(error) => {
-            state
-                .health_reasons
-                .insert(SupervisorHealthReason::ConfigurationProjection);
-            Err(error)
-        }
-    }
-}
-
-fn set_health_reason(state: &mut SupervisorState, reason: SupervisorHealthReason, active: bool) {
-    if active {
-        state.health_reasons.insert(reason);
-    } else {
-        state.health_reasons.remove(&reason);
+fn wrapper_diagnostic_context(
+    state: &SupervisorState,
+    reason: SupervisorHealthReason,
+) -> WrapperDiagnosticContext {
+    match reason {
+        SupervisorHealthReason::RuntimeRecovery
+        | SupervisorHealthReason::ConfigurationProjection => WrapperDiagnosticContext {
+            runtime_generation: state.runtime_generation,
+            ..WrapperDiagnosticContext::default()
+        },
+        SupervisorHealthReason::SelectionCompensation
+        | SupervisorHealthReason::SelectionRestoration => WrapperDiagnosticContext {
+            runtime_generation: state.runtime_generation,
+            core_generation: state
+                .observed_core_generation
+                .or(state.probe_core_generation),
+            revision: None,
+        },
+        SupervisorHealthReason::ProbeScheduler => WrapperDiagnosticContext {
+            runtime_generation: state.runtime_generation,
+            core_generation: state
+                .probe_core_generation
+                .or(state.observed_core_generation),
+            revision: (state.next_probe_generation > 0).then_some(state.next_probe_generation),
+        },
     }
 }
 
@@ -3154,6 +3240,21 @@ fn map_transaction_error(error: SupervisorTransactionFailure) -> ApplicationErro
                 recovery: application_recovery(error.recovery),
             },
         ))),
+        SupervisorTransactionFailureKind::Coordinator(ConfigTransactionErrorKind::Shutdown) => {
+            ApplicationError::new(
+                ErrorCode::OperationUnavailable,
+                "The Supervisor is shutting down",
+                true,
+            )
+            .with_details(ApplicationErrorDetails::RuntimeApplyFailure(Box::new(
+                RuntimeApplyFailureDetails {
+                    candidate_generation: error.candidate_generation,
+                    committed_generation: error.committed_generation,
+                    stage: RuntimeApplyFailureStage::RecoveryRequired,
+                    recovery: application_recovery(error.recovery),
+                },
+            )))
+        }
         kind => ApplicationError::new(
             ErrorCode::ExternalOperationFailed,
             "Runtime Apply failed and the committed configuration was retained",
@@ -3198,6 +3299,7 @@ fn transaction_failure_stage(kind: SupervisorTransactionFailureKind) -> RuntimeA
             ConfigTransactionErrorKind::Commit => RuntimeApplyFailureStage::Commit,
             ConfigTransactionErrorKind::Cleanup => RuntimeApplyFailureStage::Cleanup,
             ConfigTransactionErrorKind::Recovery => RuntimeApplyFailureStage::Recovery,
+            ConfigTransactionErrorKind::Shutdown => RuntimeApplyFailureStage::RecoveryRequired,
         },
     }
 }
@@ -3403,6 +3505,7 @@ fn empty_log_tail() -> LogTail {
         gap: false,
         earliest_sequence: None,
         latest_sequence: None,
+        sequence_horizon: None,
     }
 }
 

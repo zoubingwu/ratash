@@ -1,4 +1,7 @@
-use hopash::constants::{CORE_LOG_LINE_MAX_BYTES, LOG_CAPACITY};
+use hopash::constants::{
+    CORE_LOG_LINE_MAX_BYTES, LOG_CAPACITY, LOG_RETENTION_MAX_BYTES, LOG_TAIL_MAX_BYTES,
+    LOG_TAIL_MAX_RECORDS,
+};
 use hopash::domain::{CoreInstanceGeneration, SampleState, TrafficSample};
 use hopash::telemetry::{CoreLogRecord, LogBuffer, LogFilter, LogLevel, LogSource, TelemetryStore};
 
@@ -28,6 +31,18 @@ fn log_buffer_evicts_oldest_records_and_reports_resync_gaps() {
     );
     assert_eq!(tail.earliest_sequence, Some(3));
     assert_eq!(tail.latest_sequence, Some(5));
+}
+
+#[test]
+fn fresh_log_buffer_has_no_sequence_horizon() {
+    let buffer = LogBuffer::new(3, 128).expect("fixture limits should be valid");
+
+    let tail = buffer.tail_after(None);
+
+    assert!(tail.records.is_empty());
+    assert_eq!(tail.latest_sequence, None);
+    assert_eq!(tail.sequence_horizon, None);
+    assert!(!tail.gap);
 }
 
 #[test]
@@ -66,6 +81,8 @@ fn upstream_drop_without_a_following_record_still_reports_a_gap() {
     assert_eq!(tail.dropped_total, 2);
     assert!(tail.gap);
     assert!(tail.records.is_empty());
+    assert_eq!(tail.latest_sequence, Some(1));
+    assert_eq!(tail.sequence_horizon, Some(3));
 }
 
 #[test]
@@ -193,8 +210,6 @@ fn sustained_core_log_input_keeps_the_release_capacity_and_reports_eviction() {
     }
 
     let tail = buffer.tail_after(Some(0));
-    let expected_earliest =
-        u64::try_from(total_records - LOG_CAPACITY + 1).expect("fixture sequence should fit");
     assert_eq!(buffer.len(), LOG_CAPACITY);
     assert_eq!(buffer.capacity(), LOG_CAPACITY);
     assert_eq!(
@@ -202,12 +217,88 @@ fn sustained_core_log_input_keeps_the_release_capacity_and_reports_eviction() {
         (total_records - LOG_CAPACITY) as u64
     );
     assert!(tail.gap);
-    assert_eq!(tail.records.len(), LOG_CAPACITY);
-    assert_eq!(tail.earliest_sequence, Some(expected_earliest));
+    assert_eq!(tail.records.len(), LOG_TAIL_MAX_RECORDS);
+    assert_eq!(
+        tail.earliest_sequence,
+        Some(
+            u64::try_from(total_records - LOG_TAIL_MAX_RECORDS + 1)
+                .expect("fixture sequence should fit")
+        )
+    );
     assert_eq!(
         tail.latest_sequence,
         Some(u64::try_from(total_records).expect("fixture sequence should fit"))
     );
+}
+
+#[test]
+fn authoritative_tail_clones_only_the_bounded_latest_delivery_window() {
+    let mut buffer =
+        LogBuffer::new(LOG_CAPACITY, CORE_LOG_LINE_MAX_BYTES).expect("release limits should work");
+    for index in 0..LOG_CAPACITY {
+        buffer
+            .push(
+                u64::try_from(index).expect("fixture index should fit"),
+                LogLevel::Info,
+                LogSource::CoreApi,
+                "small",
+            )
+            .expect("fixture log should fit");
+    }
+    let message = "x".repeat(CORE_LOG_LINE_MAX_BYTES);
+    for index in 0..LOG_TAIL_MAX_RECORDS {
+        buffer
+            .push(
+                u64::try_from(LOG_CAPACITY + index).expect("fixture index should fit"),
+                LogLevel::Warn,
+                LogSource::Stderr,
+                message.clone(),
+            )
+            .expect("maximum-size fixture log should fit");
+    }
+
+    let tail = buffer.tail_after(None);
+
+    assert!(tail.gap);
+    assert!(tail.records.len() <= LOG_TAIL_MAX_RECORDS);
+    assert!(
+        tail.records
+            .iter()
+            .map(|record| record.message().len())
+            .sum::<usize>()
+            <= LOG_TAIL_MAX_BYTES
+    );
+    assert_eq!(
+        tail.latest_sequence,
+        Some(u64::try_from(LOG_CAPACITY + LOG_TAIL_MAX_RECORDS).expect("sequence should fit"))
+    );
+    assert_eq!(
+        tail.earliest_sequence,
+        tail.records.first().map(CoreLogRecord::sequence)
+    );
+}
+
+#[test]
+fn authoritative_log_retention_evicts_by_aggregate_message_bytes() {
+    let mut buffer =
+        LogBuffer::new(LOG_CAPACITY, CORE_LOG_LINE_MAX_BYTES).expect("release limits should work");
+    let message = "x".repeat(CORE_LOG_LINE_MAX_BYTES);
+    let retained_records = LOG_RETENTION_MAX_BYTES / CORE_LOG_LINE_MAX_BYTES;
+    for index in 0..=retained_records {
+        buffer
+            .push(
+                u64::try_from(index).expect("fixture index should fit"),
+                LogLevel::Info,
+                LogSource::CoreApi,
+                message.clone(),
+            )
+            .expect("maximum-size fixture log should fit");
+    }
+
+    assert_eq!(buffer.len(), retained_records);
+    assert_eq!(buffer.retained_bytes(), LOG_RETENTION_MAX_BYTES);
+    assert_eq!(buffer.dropped_total(), 1);
+    assert!(buffer.tail_after(None).gap);
 }
 
 #[test]

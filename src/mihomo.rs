@@ -3,7 +3,6 @@ use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -85,8 +84,14 @@ pub struct UnixMihomoAdapter {
 
 #[derive(Debug, Default)]
 struct ActiveOperations {
-    cancelled: AtomicBool,
-    sockets: Mutex<Vec<Weak<ActiveOperation>>>,
+    state: Mutex<ActiveOperationState>,
+}
+
+#[derive(Debug, Default)]
+struct ActiveOperationState {
+    owner_generation: Option<u64>,
+    cancelled: bool,
+    sockets: Vec<Weak<ActiveOperation>>,
 }
 
 impl ActiveOperations {
@@ -96,15 +101,20 @@ impl ActiveOperations {
                 .try_clone()
                 .map_err(|_| unavailable("Mihomo cancellation handle creation failed"))?,
         });
-        {
-            let mut sockets = self
-                .sockets
+        let cancelled = {
+            let mut state = self
+                .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            sockets.retain(|socket| socket.strong_count() > 0);
-            sockets.push(Arc::downgrade(&operation));
-        }
-        if self.cancelled.load(Ordering::Acquire) {
+            state.sockets.retain(|socket| socket.strong_count() > 0);
+            if state.cancelled {
+                true
+            } else {
+                state.sockets.push(Arc::downgrade(&operation));
+                false
+            }
+        };
+        if cancelled {
             operation.cancel();
             return Err(unavailable("Mihomo operation was cancelled"));
         }
@@ -112,18 +122,54 @@ impl ActiveOperations {
     }
 
     fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.cancel_matching(None);
+    }
+
+    fn cancel_for(&self, owner_generation: u64) {
+        self.cancel_matching(Some(owner_generation));
+    }
+
+    fn cancel_matching(&self, owner_generation: Option<u64>) {
         let operations = {
-            let mut sockets = self
-                .sockets
+            let mut state = self
+                .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let operations = sockets.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
-            sockets.clear();
+            if owner_generation.is_some() && state.owner_generation != owner_generation {
+                return;
+            }
+            state.cancelled = true;
+            let operations = state
+                .sockets
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>();
+            state.sockets.clear();
             operations
         };
         for operation in operations {
             operation.cancel();
+        }
+    }
+
+    fn reset(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancelled = false;
+    }
+
+    fn reset_for(&self, owner_generation: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .owner_generation
+            .is_none_or(|current| owner_generation > current)
+        {
+            state.owner_generation = Some(owner_generation);
+            state.cancelled = false;
         }
     }
 }
@@ -169,6 +215,14 @@ impl UnixMihomoAdapter {
             config,
             active_operations: Arc::new(ActiveOperations::default()),
         })
+    }
+
+    pub(crate) fn cancel_pending_for(&self, owner_generation: u64) {
+        self.active_operations.cancel_for(owner_generation);
+    }
+
+    pub(crate) fn reset_cancellation_for(&self, owner_generation: u64) {
+        self.active_operations.reset_for(owner_generation);
     }
 
     pub fn reload_configuration(
@@ -356,6 +410,10 @@ impl Default for UnixMihomoAdapter {
 impl MihomoAdapter for UnixMihomoAdapter {
     fn cancel_pending(&self) {
         self.active_operations.cancel();
+    }
+
+    fn reset_cancellation(&self) {
+        self.active_operations.reset();
     }
 
     fn version(&self, endpoint: &CoreControlEndpoint) -> Result<MihomoVersion, MihomoError> {

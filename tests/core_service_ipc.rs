@@ -5,8 +5,8 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use hopash::core::{
@@ -83,6 +83,10 @@ struct FakeRuntime {
     runtime_root: PathBuf,
     session: OwnerSession,
     state: Mutex<FakeRuntimeState>,
+    apply_started: AtomicUsize,
+    apply_cancelled: AtomicBool,
+    apply_wake: Condvar,
+    cancel_count: AtomicUsize,
 }
 
 impl FakeRuntime {
@@ -99,6 +103,10 @@ impl FakeRuntime {
                 ),
             },
             state: Mutex::new(FakeRuntimeState::default()),
+            apply_started: AtomicUsize::new(0),
+            apply_cancelled: AtomicBool::new(false),
+            apply_wake: Condvar::new(),
+            cancel_count: AtomicUsize::new(0),
         }
     }
 
@@ -133,6 +141,7 @@ impl CoreRuntime for FakeRuntime {
         &self,
         request: &OwnerSessionRequest,
     ) -> Result<OwnerSession, CoreRuntimeError> {
+        self.apply_cancelled.store(false, Ordering::Release);
         self.state().open_count += 1;
         if request.protocol_version != 1 {
             return Err(CoreRuntimeError::new(
@@ -160,9 +169,24 @@ impl CoreRuntime for FakeRuntime {
                 .expect("the staged provider should be readable"),
             b"payload: []\n"
         );
-        if let Some(delay) = self.state().apply_delay {
-            std::thread::sleep(delay);
+        self.apply_started.fetch_add(1, Ordering::Release);
+        let delay = self.state().apply_delay;
+        if let Some(delay) = delay {
+            let state = self.state();
+            let (_state, _wait) = self
+                .apply_wake
+                .wait_timeout_while(state, delay, |_| {
+                    !self.apply_cancelled.load(Ordering::Acquire)
+                })
+                .expect("the fake Runtime Apply wait should remain available");
         }
+        if self.apply_cancelled.load(Ordering::Acquire) {
+            return Err(CoreRuntimeError::new(
+                CoreRuntimeErrorKind::ReloadTimeout,
+                "fixture Runtime Apply cancellation",
+            ));
+        }
+        let mut state = self.state();
         let managed_core = ManagedCoreHandle {
             pid: 4_242,
             process_start_identity: "fixture-core-start".to_owned(),
@@ -170,7 +194,6 @@ impl CoreRuntime for FakeRuntime {
             instance_generation: CoreInstanceGeneration(9),
             runtime_generation: bundle.generation,
         };
-        let mut state = self.state();
         state.apply_count += 1;
         if let Some(kind) = state.apply_failures.pop_front() {
             return Err(CoreRuntimeError::new(kind, "fixture Runtime Apply failure"));
@@ -231,6 +254,7 @@ impl CoreRuntime for FakeRuntime {
                     .collect(),
                 next_sequence: Some(32),
                 dropped_before: 0,
+                dropped_since_after: 0,
             });
         }
         drop(state);
@@ -246,6 +270,7 @@ impl CoreRuntime for FakeRuntime {
             }],
             next_sequence: Some(41),
             dropped_before: 3,
+            dropped_since_after: 0,
         })
     }
 
@@ -263,6 +288,14 @@ impl CoreRuntime for FakeRuntime {
     fn close_owner_session(&self, owner: &OwnerSessionProof) -> Result<(), CoreRuntimeError> {
         self.require_owner(owner)?;
         self.state().close_count += 1;
+        Ok(())
+    }
+
+    fn cancel_pending_apply(&self, owner: &OwnerSessionProof) -> Result<(), CoreRuntimeError> {
+        self.require_owner(owner)?;
+        self.cancel_count.fetch_add(1, Ordering::Relaxed);
+        self.apply_cancelled.store(true, Ordering::Release);
+        self.apply_wake.notify_all();
         Ok(())
     }
 }
@@ -399,6 +432,7 @@ fn all_core_runtime_operations_round_trip_through_staged_service_owned_state() {
     assert_eq!(logs.records[0].message, "fixture log");
     assert_eq!(logs.next_sequence, Some(41));
     assert_eq!(logs.dropped_before, 3);
+    assert_eq!(logs.dropped_since_after, 0);
     let stopped = harness
         .client
         .stop(&session.proof)
@@ -784,6 +818,27 @@ fn session_id_is_peer_bound_and_the_runtime_still_checks_the_secret_token() {
 }
 
 #[test]
+fn pending_apply_cancellation_requires_the_full_owner_proof() {
+    let harness = Harness::new();
+    let session = harness
+        .client
+        .open_owner_session(&harness.owner_request())
+        .expect("the owner session should open");
+    let client = CoreServiceClient::for_service_uid(
+        &harness.socket_path,
+        nix::unistd::Uid::effective().as_raw(),
+    );
+    let wrong_token = OwnerSessionProof::new(session.proof.session_id(), "wrong-token");
+
+    let error = client
+        .cancel_pending_apply(&wrong_token)
+        .expect_err("the wrong session token must not cancel Runtime Apply");
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Authentication);
+    assert_eq!(harness.runtime.cancel_count.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn bundle_ingress_rejects_symlinked_provider_files_before_runtime_apply() {
     let harness = Harness::new();
     let session = harness
@@ -843,7 +898,7 @@ fn runtime_mutations_use_the_extended_response_budget() {
         nix::unistd::Uid::effective().as_raw(),
         Duration::from_secs(1),
         Duration::from_millis(40),
-        Duration::from_millis(200),
+        Duration::from_secs(1),
     );
 
     let result = client
@@ -853,6 +908,71 @@ fn runtime_mutations_use_the_extended_response_budget() {
     assert_eq!(
         result.managed_core.runtime_generation,
         RuntimeGeneration(13)
+    );
+}
+
+#[test]
+fn authenticated_cancellation_interrupts_a_stalled_service_runtime_apply() {
+    let harness = Harness::new();
+    let session = harness
+        .client
+        .open_owner_session(&harness.owner_request())
+        .expect("the owner session should open");
+    harness.runtime.state().apply_delay = Some(Duration::from_secs(30));
+    let client = Arc::new(CoreServiceClient::with_service_uid_and_operation_timeouts(
+        &harness.socket_path,
+        nix::unistd::Uid::effective().as_raw(),
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    ));
+    let worker_client = Arc::clone(&client);
+    let proof = session.proof.clone();
+    let bundle = harness.source_bundle(14);
+    let worker = std::thread::spawn(move || worker_client.apply_candidate(&proof, &bundle));
+    let entered_deadline = Instant::now() + Duration::from_secs(1);
+    while harness.runtime.apply_started.load(Ordering::Acquire) == 0 {
+        assert!(
+            Instant::now() < entered_deadline,
+            "Runtime Apply should reach the fixture service"
+        );
+        std::thread::yield_now();
+    }
+    let started = Instant::now();
+
+    client
+        .cancel_pending_apply(&session.proof)
+        .expect("the authenticated Runtime Apply cancellation should succeed");
+
+    let error = worker
+        .join()
+        .expect("the Runtime Apply client should finish")
+        .expect_err("the service Runtime Apply should be cancelled");
+    assert_eq!(error.kind, CoreRuntimeErrorKind::ReloadTimeout);
+    assert!(started.elapsed() < Duration::from_millis(200));
+
+    let stop_started = Instant::now();
+    client
+        .stop_with_timeout(&session.proof, Duration::from_secs(1))
+        .expect("Managed Core cleanup should follow cancellation promptly");
+    assert!(stop_started.elapsed() < Duration::from_millis(200));
+
+    let close_started = Instant::now();
+    client
+        .close_owner_session_with_timeout(&session.proof, Duration::from_secs(1))
+        .expect("owner cleanup should follow the cancelled Runtime Apply promptly");
+    assert!(close_started.elapsed() < Duration::from_millis(200));
+    let state = harness.runtime.state();
+    assert_eq!(state.apply_count, 0);
+    assert_eq!(state.stop_count, 1);
+    assert_eq!(state.close_count, 1);
+    assert_eq!(harness.runtime.cancel_count.load(Ordering::Relaxed), 1);
+    assert!(
+        harness
+            .runtime_root
+            .join("generation-00000000000000000014")
+            .exists(),
+        "an indeterminate cancelled Runtime Apply must retain its staged generation"
     );
 }
 

@@ -143,6 +143,8 @@ pub trait CoreConfigValidator {
         configuration: &EffectiveConfiguration,
         staging_root: &Path,
     ) -> Result<(), CoreValidationError>;
+
+    fn cancel_pending(&self) {}
 }
 
 #[derive(Clone, Eq, PartialEq)]

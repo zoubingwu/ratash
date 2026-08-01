@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use hopash::application::{ApplicationOperation, RulePlacement as ApplicationRulePlacement};
-use hopash::constants::IPC_FRAME_MAX_BYTES;
+use hopash::constants::{
+    CORE_LOG_LINE_MAX_BYTES, IPC_FRAME_MAX_BYTES, LOG_SUBSCRIBER_CAPACITY, LOG_SUBSCRIBER_MAX_BYTES,
+};
 use hopash::domain::SubscriptionUrl;
 use hopash::ipc::{
     AcceptError, CorrelationError, EmptyPayload, FrameError, IPC_PROTOCOL_VERSION, IpcError,
@@ -452,6 +454,27 @@ fn log_queue_overflow_emits_one_gap_marker_with_the_delivery_anchor() {
 }
 
 #[test]
+fn log_queue_byte_overflow_emits_a_resync_marker() {
+    let mut subscriber =
+        LogSubscriber::new(LOG_SUBSCRIBER_CAPACITY, None).expect("capacity should be valid");
+    let message = "x".repeat(CORE_LOG_LINE_MAX_BYTES);
+    let retained_records = LOG_SUBSCRIBER_MAX_BYTES / CORE_LOG_LINE_MAX_BYTES;
+    for sequence in 1..=retained_records {
+        assert_eq!(
+            subscriber.publish(&log_record(sequence as u64, &message)),
+            SubscriberPublishStatus::Queued
+        );
+    }
+
+    assert_eq!(
+        subscriber.publish(&log_record((retained_records + 1) as u64, &message)),
+        SubscriberPublishStatus::ResyncRequired
+    );
+    assert_eq!(subscriber.len(), 1);
+    assert_eq!(subscriber.gap_count(), 1);
+}
+
+#[test]
 fn log_gap_recovers_through_the_retained_tail() {
     let mut buffer = LogBuffer::new(3, 128).expect("fixture limits should be valid");
     for index in 1..=5 {
@@ -499,6 +522,7 @@ fn log_record_debug_output_omits_message_content() {
         gap: false,
         earliest_sequence: Some(1),
         latest_sequence: Some(1),
+        sequence_horizon: Some(1),
     })
     .records
     .remove(0);

@@ -464,6 +464,7 @@ impl CoreRuntime for FakeCoreRuntime {
             records: Vec::new(),
             next_sequence: None,
             dropped_before: 0,
+            dropped_since_after: 0,
         })
     }
 

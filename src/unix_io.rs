@@ -38,8 +38,20 @@ impl DeadlineUnixStream {
         Ok(())
     }
 
+    pub(crate) fn begin_read_until(&mut self, deadline: Instant) -> io::Result<()> {
+        remaining_until(deadline)?;
+        self.read_deadline = Some(deadline);
+        Ok(())
+    }
+
     pub(crate) fn begin_write(&mut self) -> io::Result<()> {
         self.write_deadline = Some(deadline_after(self.timeout)?);
+        Ok(())
+    }
+
+    pub(crate) fn begin_write_until(&mut self, deadline: Instant) -> io::Result<()> {
+        remaining_until(deadline)?;
+        self.write_deadline = Some(deadline);
         Ok(())
     }
 
@@ -50,15 +62,7 @@ impl DeadlineUnixStream {
                 "Unix socket deadline is unavailable",
             )
         })?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "Unix socket deadline expired",
-            ))
-        } else {
-            Ok(remaining)
-        }
+        remaining_until(deadline)
     }
 
     fn wait(&mut self, interest: Interest, deadline: Option<Instant>) -> io::Result<()> {
@@ -125,11 +129,23 @@ impl Write for DeadlineUnixStream {
     }
 }
 
-fn deadline_after(timeout: Duration) -> io::Result<Instant> {
+pub(crate) fn deadline_after(timeout: Duration) -> io::Result<Instant> {
     Instant::now().checked_add(timeout).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "Unix socket deadline is invalid",
         )
     })
+}
+
+pub(crate) fn remaining_until(deadline: Instant) -> io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Unix socket deadline expired",
+        ))
+    } else {
+        Ok(remaining)
+    }
 }

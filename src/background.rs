@@ -3,7 +3,7 @@ use std::io;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::application::{ApplicationError, Clock};
 use crate::constants::{
@@ -350,9 +350,10 @@ impl BackgroundRuntime {
     }
 
     pub fn shutdown(&mut self) -> Result<(), BackgroundShutdownError> {
-        self.shutdown.request();
-        self.application.cancel_pending_refreshes();
-        self.core.cancel_pending();
+        if self.threads.is_empty() {
+            return Ok(());
+        }
+        self.request_shutdown();
         let mut panicked_threads = 0;
         for thread in self.threads.drain(..) {
             if thread.join().is_err() {
@@ -364,6 +365,42 @@ impl BackgroundRuntime {
         } else {
             Err(BackgroundShutdownError { panicked_threads })
         }
+    }
+
+    pub fn shutdown_until(&mut self, deadline: Instant) -> io::Result<()> {
+        if self.threads.is_empty() {
+            return Ok(());
+        }
+        self.request_shutdown();
+        let mut panicked_threads = 0_usize;
+        let mut timed_out_threads = 0_usize;
+        for thread in self.threads.drain(..) {
+            if !wait_until_finished(&thread, deadline) {
+                timed_out_threads = timed_out_threads.saturating_add(1);
+                continue;
+            }
+            if thread.join().is_err() {
+                panicked_threads = panicked_threads.saturating_add(1);
+            }
+        }
+        if timed_out_threads > 0 {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "The background runtime exceeded the Supervisor shutdown deadline",
+            ))
+        } else if panicked_threads > 0 {
+            Err(io::Error::other(
+                "A background runtime thread terminated unexpectedly",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn request_shutdown(&self) {
+        self.shutdown.request();
+        self.application.cancel_pending_refreshes();
+        self.core.cancel_pending();
     }
 }
 
@@ -389,6 +426,17 @@ impl fmt::Display for BackgroundShutdownError {
 }
 
 impl std::error::Error for BackgroundShutdownError {}
+
+fn wait_until_finished<T>(thread: &JoinHandle<T>, deadline: Instant) -> bool {
+    while !thread.is_finished() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(1)));
+    }
+    true
+}
 
 fn spawn_owned(
     threads: &mut Vec<JoinHandle<()>>,
@@ -1077,6 +1125,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deadline_wait_releases_a_stalled_background_thread_handle() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let worker = thread::spawn(move || {
+            let _ = blocked.recv();
+        });
+        let started = Instant::now();
+
+        assert!(!wait_until_finished(
+            &worker,
+            Instant::now() + Duration::from_millis(10)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        release.send(()).expect("the fixture worker should release");
+        worker.join().expect("the fixture worker should stop");
+    }
+
+    #[test]
     fn reconnect_backoff_doubles_and_stops_at_the_product_cap() {
         let mut backoff =
             ReconnectBackoff::new(Duration::from_millis(250), Duration::from_millis(1_000));
@@ -1116,7 +1182,7 @@ mod tests {
     fn log_truncation_preserves_a_utf8_boundary_before_the_marker() {
         let prefix_bytes = CORE_LOG_LINE_MAX_BYTES - LOG_TRUNCATION_MARKER.len();
         let mut message = "a".repeat(prefix_bytes - 1);
-        message.push('界');
+        message.push('\u{754c}');
         message.push_str(&"b".repeat(LOG_TRUNCATION_MARKER.len()));
 
         let truncated = truncate_log_message(message);

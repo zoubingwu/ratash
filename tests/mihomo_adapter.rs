@@ -437,9 +437,9 @@ fn proxy_projection_distinguishes_provider_outages_from_invalid_responses() {
 
 #[test]
 fn selection_and_delay_targets_encode_paths_queries_and_json_exactly() {
-    let group_name = "Main / 東京";
+    let group_name = "Main / \u{6771}\u{4eac}";
     let node_name = "Node/\"Quoted\"";
-    let core_proxy = "Core/東京";
+    let core_proxy = "Core/\u{6771}\u{4eac}";
     let provider_name = "Provider A";
     let provider_proxy = "Node/1";
     let test_url = "https://example.test/generate_204?x=1&name=two words";

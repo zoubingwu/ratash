@@ -1,5 +1,6 @@
 //! Live user-local IPC client and server adapters.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -34,8 +35,9 @@ use crate::cancellation::CancellationToken;
 use crate::constants::{
     CORE_LOG_LINE_MAX_BYTES, IPC_FRAME_MAX_BYTES, IPC_LIST_PAGE_SIZE, IPC_PROFILE_ADD_TIMEOUT,
     IPC_REQUEST_FRAME_MAX_BYTES, IPC_REQUEST_TIMEOUT, IPC_RUNTIME_MUTATION_TIMEOUT,
-    LOCAL_RULE_COUNT_MAX, LOG_CAPACITY, LOG_SUBSCRIBER_CAPACITY, MAX_ACTIVE_NODES,
-    PROFILE_COUNT_MAX, STATUS_SUBSCRIBER_CAPACITY,
+    IPC_STREAM_CAPACITY, LOCAL_RULE_COUNT_MAX, LOG_BROKER_RECOVERY_CAPACITY,
+    LOG_BROKER_RECOVERY_MAX_BYTES, LOG_SUBSCRIBER_CAPACITY, LOG_TAIL_MAX_BYTES,
+    LOG_TAIL_MAX_RECORDS, MAX_ACTIVE_NODES, PROFILE_COUNT_MAX, STATUS_SUBSCRIBER_CAPACITY,
 };
 use crate::domain::{
     ActiveProfileSummary, ApplyState, CoreDiagnosticCategory, CoreInstanceGeneration,
@@ -61,12 +63,13 @@ use crate::telemetry::{CoreLogRecord, LogTail};
 
 use crate::unix_io::DeadlineUnixStream;
 
-const DEFAULT_SERVER_WORKERS: usize = 4;
+const DEFAULT_SERVER_WORKERS: usize = IPC_STREAM_CAPACITY + 1;
 const DEFAULT_PENDING_CONNECTIONS: usize = 32;
 const LISTENER_TOKEN: Token = Token(0);
 const SHUTDOWN_TOKEN: Token = Token(1);
 const CLIENT_CONNECT_TOKEN: Token = Token(0);
 const CLIENT_CANCEL_TOKEN: Token = Token(1);
+const LOG_TAIL_ENVELOPE_MAX_BYTES: usize = 4_096;
 // -----------------------------------------------------------------------------
 // Synchronous client
 // -----------------------------------------------------------------------------
@@ -792,6 +795,9 @@ struct StatusBrokerState {
 struct LogBrokerState {
     capacity: usize,
     dropped_total: u64,
+    retained_bytes: usize,
+    gap_before_earliest: bool,
+    sequence_horizon: Option<u64>,
     records: std::collections::VecDeque<CoreLogRecord>,
     subscribers: Vec<Weak<LogSubscription>>,
 }
@@ -812,7 +818,12 @@ impl IpcStreamBroker {
         timestamp_unix_ms: u64,
         snapshot: StatusSnapshot,
     ) -> Result<Self, StreamBrokerError> {
-        Self::with_log_capacity(sequence, timestamp_unix_ms, snapshot, LOG_CAPACITY)
+        Self::with_log_capacity(
+            sequence,
+            timestamp_unix_ms,
+            snapshot,
+            LOG_BROKER_RECOVERY_CAPACITY,
+        )
     }
 
     pub fn with_log_capacity(
@@ -836,6 +847,9 @@ impl IpcStreamBroker {
             logs: Arc::new(Mutex::new(LogBrokerState {
                 capacity: log_capacity,
                 dropped_total: 0,
+                retained_bytes: 0,
+                gap_before_earliest: false,
+                sequence_horizon: None,
                 records: std::collections::VecDeque::with_capacity(log_capacity),
                 subscribers: Vec::new(),
             })),
@@ -888,8 +902,8 @@ impl IpcStreamBroker {
             .logs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(latest) = state.records.back().map(CoreLogRecord::sequence) {
-            let expected = latest
+        if let Some(horizon) = state.sequence_horizon {
+            let expected = horizon
                 .checked_add(1)
                 .ok_or(StreamBrokerError::SequenceExhausted)?;
             if record.sequence() != expected {
@@ -899,10 +913,19 @@ impl IpcStreamBroker {
                 });
             }
         }
-        if state.records.len() == state.capacity {
-            state.records.pop_front();
+        state.sequence_horizon = Some(record.sequence());
+        while state.records.len() == state.capacity
+            || state.retained_bytes.saturating_add(record.message().len())
+                > LOG_BROKER_RECOVERY_MAX_BYTES
+        {
+            let Some(dropped) = state.records.pop_front() else {
+                break;
+            };
+            state.retained_bytes = state.retained_bytes.saturating_sub(dropped.message().len());
             state.dropped_total = state.dropped_total.saturating_add(1);
+            state.gap_before_earliest = true;
         }
+        state.retained_bytes = state.retained_bytes.saturating_add(record.message().len());
         state.records.push_back(record.clone());
         state.subscribers.retain(|subscriber| {
             let Some(subscriber) = subscriber.upgrade() else {
@@ -920,6 +943,27 @@ impl IpcStreamBroker {
             .logs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if tail.records.is_empty()
+            && tail.latest_sequence == state.records.back().map(CoreLogRecord::sequence)
+        {
+            let previous_horizon = state.sequence_horizon;
+            state.sequence_horizon = max_sequence(state.sequence_horizon, tail.sequence_horizon);
+            if tail.gap
+                && let Some(sequence_horizon) = state.sequence_horizon
+                && previous_horizon.is_none_or(|previous| sequence_horizon > previous)
+            {
+                state.subscribers.retain(|subscriber| {
+                    let Some(subscriber) = subscriber.upgrade() else {
+                        return false;
+                    };
+                    subscriber.publish_gap(sequence_horizon);
+                    true
+                });
+            }
+            state.dropped_total = state.dropped_total.max(tail.dropped_total);
+            state.gap_before_earliest |= tail.gap;
+            return Ok(());
+        }
         state.subscribers.retain(|subscriber| {
             let Some(subscriber) = subscriber.upgrade() else {
                 return false;
@@ -929,15 +973,30 @@ impl IpcStreamBroker {
             }
             true
         });
-        let truncated = tail.records.len().saturating_sub(state.capacity);
-        state.records = tail
-            .records
-            .into_iter()
-            .skip(truncated)
-            .collect::<std::collections::VecDeque<_>>();
-        state.dropped_total = tail
+        let source_gap = tail.gap;
+        let sequence_horizon = tail.sequence_horizon;
+        let mut records = std::collections::VecDeque::with_capacity(state.capacity);
+        let mut retained_bytes = 0_usize;
+        let mut truncated = 0_usize;
+        for record in tail.records {
+            retained_bytes = retained_bytes.saturating_add(record.message().len());
+            records.push_back(record);
+            while records.len() > state.capacity || retained_bytes > LOG_BROKER_RECOVERY_MAX_BYTES {
+                let Some(dropped) = records.pop_front() else {
+                    break;
+                };
+                retained_bytes = retained_bytes.saturating_sub(dropped.message().len());
+                truncated = truncated.saturating_add(1);
+            }
+        }
+        state.records = records;
+        state.retained_bytes = retained_bytes;
+        state.sequence_horizon = sequence_horizon;
+        let synchronized_dropped = tail
             .dropped_total
             .saturating_add(u64::try_from(truncated).unwrap_or(u64::MAX));
+        state.dropped_total = state.dropped_total.max(synchronized_dropped);
+        state.gap_before_earliest = source_gap || truncated > 0;
         Ok(())
     }
 
@@ -975,10 +1034,27 @@ impl IpcStreamBroker {
         state
             .subscribers
             .retain(|subscriber| subscriber.strong_count() > 0);
-        let anchor = after_sequence.or_else(|| state.records.back().map(CoreLogRecord::sequence));
+        let anchor = after_sequence.or(state.sequence_horizon);
         let mut queue = LogSubscriber::new(LOG_SUBSCRIBER_CAPACITY, anchor)
             .expect("the log subscriber capacity is positive");
-        if after_sequence.is_some() {
+        let requires_resync = after_sequence.is_some_and(|after| {
+            sequence_has_gap(
+                after,
+                state
+                    .records
+                    .iter()
+                    .filter(move |record| record.sequence() > after)
+                    .map(CoreLogRecord::sequence),
+                state.sequence_horizon,
+            )
+        });
+        if requires_resync {
+            queue.mark_gap(
+                state
+                    .sequence_horizon
+                    .expect("a sequence gap has an observed horizon"),
+            );
+        } else if after_sequence.is_some() {
             for record in state
                 .records
                 .iter()
@@ -1002,31 +1078,37 @@ impl IpcStreamBroker {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let earliest_sequence = state.records.front().map(CoreLogRecord::sequence);
         let latest_sequence = state.records.back().map(CoreLogRecord::sequence);
-        let source_gap = after_sequence
-            .zip(earliest_sequence)
-            .is_some_and(|(after, earliest)| {
-                after.checked_add(1).is_some_and(|next| next < earliest)
-            });
-        let candidates = state
+        let sequence_horizon = state.sequence_horizon;
+        let mut records = Vec::with_capacity(LOG_TAIL_MAX_RECORDS);
+        let mut encoded_bytes = LOG_TAIL_ENVELOPE_MAX_BYTES;
+        let mut truncated = false;
+        for record in state
             .records
             .iter()
+            .rev()
             .filter(|record| after_sequence.is_none_or(|after| record.sequence() > after))
-            .collect::<Vec<_>>();
-        let mut records = Vec::new();
-        let mut encoded_bytes = 512_usize;
-        let payload_budget = IPC_FRAME_MAX_BYTES.saturating_sub(4_096);
-        for record in candidates.iter().rev() {
-            let projected = crate::ipc::LogRecordV1::from(*record);
+        {
+            let projected = crate::ipc::LogRecordV1::from(record);
             let record_bytes = serde_json::to_vec(&projected)
-                .map_or(payload_budget, |value| value.len().saturating_add(1));
-            if encoded_bytes.saturating_add(record_bytes) > payload_budget {
+                .map_or(LOG_TAIL_MAX_BYTES, |value| value.len().saturating_add(1));
+            if records.len() == LOG_TAIL_MAX_RECORDS
+                || encoded_bytes.saturating_add(record_bytes) > LOG_TAIL_MAX_BYTES
+            {
+                truncated = true;
                 break;
             }
             encoded_bytes = encoded_bytes.saturating_add(record_bytes);
             records.push(projected);
         }
         records.reverse();
-        let truncated = records.len() < candidates.len();
+        let source_gap = after_sequence.map_or_else(
+            || {
+                state.gap_before_earliest
+                    || wire_records_have_gap(&records)
+                    || sequence_horizon > latest_sequence
+            },
+            |after| wire_sequence_has_gap(after, &records, sequence_horizon),
+        );
         LogTailV1 {
             earliest_sequence: if truncated {
                 records.first().map(|record| record.sequence)
@@ -1034,6 +1116,7 @@ impl IpcStreamBroker {
                 earliest_sequence
             },
             latest_sequence,
+            sequence_horizon,
             records,
             dropped_total: state.dropped_total,
             gap: source_gap || truncated,
@@ -1070,7 +1153,7 @@ fn validate_log_tail(tail: &LogTail) -> Result<(), StreamBrokerError> {
             let expected = previous
                 .checked_add(1)
                 .ok_or(StreamBrokerError::SequenceExhausted)?;
-            if record.sequence() != expected {
+            if record.sequence() < expected || (record.sequence() != expected && !tail.gap) {
                 return Err(StreamBrokerError::LogSequence {
                     expected,
                     actual: record.sequence(),
@@ -1079,12 +1162,58 @@ fn validate_log_tail(tail: &LogTail) -> Result<(), StreamBrokerError> {
         }
         previous = Some(record.sequence());
     }
-    if let Some(last) = previous
-        && tail.latest_sequence != Some(last)
+    if previous.is_some_and(|last| tail.latest_sequence != Some(last))
+        || tail.latest_sequence > tail.sequence_horizon
+        || (tail.latest_sequence < tail.sequence_horizon && !tail.gap)
     {
         return Err(StreamBrokerError::Encoding);
     }
     Ok(())
+}
+
+fn wire_records_have_gap(records: &[crate::ipc::LogRecordV1]) -> bool {
+    records.windows(2).any(|window| {
+        window[0]
+            .sequence
+            .checked_add(1)
+            .is_none_or(|expected| window[1].sequence != expected)
+    })
+}
+
+fn wire_sequence_has_gap(
+    after: u64,
+    records: &[crate::ipc::LogRecordV1],
+    sequence_horizon: Option<u64>,
+) -> bool {
+    sequence_has_gap(
+        after,
+        records.iter().map(|record| record.sequence),
+        sequence_horizon,
+    )
+}
+
+fn sequence_has_gap(
+    after: u64,
+    sequences: impl IntoIterator<Item = u64>,
+    sequence_horizon: Option<u64>,
+) -> bool {
+    let Some(mut expected) = after.checked_add(1) else {
+        return false;
+    };
+    for sequence in sequences {
+        if sequence > expected {
+            return true;
+        }
+        expected = sequence.saturating_add(1);
+    }
+    sequence_horizon.is_some_and(|horizon| horizon >= expected)
+}
+
+fn max_sequence(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, right) => left.or(right),
+    }
 }
 
 impl fmt::Debug for IpcStreamBroker {
@@ -1117,6 +1246,14 @@ impl LogSubscription {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .publish(record);
+        self.ready.notify_one();
+    }
+
+    fn publish_gap(&self, latest_sequence: u64) {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mark_gap(latest_sequence);
         self.ready.notify_one();
     }
 
@@ -2078,12 +2215,77 @@ impl AcceptLoopMetrics {
     }
 }
 
+#[derive(Default)]
+struct ActiveConnections {
+    cancelled: AtomicBool,
+    next_id: AtomicU64,
+    streams: Mutex<BTreeMap<u64, UnixStream>>,
+}
+
+impl ActiveConnections {
+    fn request_id(&self) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if id == 0 {
+            self.next_id.fetch_add(1, Ordering::Relaxed)
+        } else {
+            id
+        }
+    }
+
+    fn cancel_all(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let mut streams = self
+            .streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for stream in streams.values() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        streams.clear();
+    }
+}
+
+struct ActiveConnection {
+    connections: Arc<ActiveConnections>,
+    id: u64,
+}
+
+impl ActiveConnection {
+    fn register(connections: &Arc<ActiveConnections>, stream: &UnixStream) -> io::Result<Self> {
+        let id = connections.request_id();
+        let cancellation_stream = stream.try_clone()?;
+        let mut streams = connections
+            .streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        streams.insert(id, cancellation_stream);
+        if connections.cancelled.load(Ordering::Acquire)
+            && let Some(stream) = streams.remove(&id)
+        {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        Ok(Self {
+            connections: Arc::clone(connections),
+            id,
+        })
+    }
+}
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        if let Ok(mut streams) = self.connections.streams.lock() {
+            streams.remove(&self.id);
+        }
+    }
+}
+
 pub struct IpcServer {
     socket_path: PathBuf,
     socket_identity: SocketIdentity,
     shutdown: Arc<AtomicBool>,
     waker: Arc<Waker>,
     streams: Option<Arc<IpcStreamBroker>>,
+    active_connections: Arc<ActiveConnections>,
     thread: Option<JoinHandle<io::Result<()>>>,
     #[cfg(test)]
     accept_metrics: AcceptLoopMetrics,
@@ -2152,6 +2354,8 @@ impl IpcServer {
         };
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
+        let active_connections = Arc::new(ActiveConnections::default());
+        let thread_connections = Arc::clone(&active_connections);
         let application: Arc<dyn ApplicationClient + Send + Sync> = application;
         let authorizer: Arc<dyn PeerAuthorizer> = authorizer;
         let thread_streams = streams.clone();
@@ -2169,6 +2373,7 @@ impl IpcServer {
                         streams: thread_streams,
                         config,
                         shutdown: thread_shutdown,
+                        active_connections: thread_connections,
                         accept_metrics: thread_accept_metrics,
                     },
                 )
@@ -2185,6 +2390,7 @@ impl IpcServer {
             shutdown,
             waker,
             streams,
+            active_connections,
             thread: Some(thread),
             #[cfg(test)]
             accept_metrics,
@@ -2192,7 +2398,16 @@ impl IpcServer {
     }
 
     pub fn shutdown(&mut self) -> io::Result<()> {
+        self.shutdown_inner(None)
+    }
+
+    pub fn shutdown_until(&mut self, deadline: Instant) -> io::Result<()> {
+        self.shutdown_inner(Some(deadline))
+    }
+
+    fn shutdown_inner(&mut self, deadline: Option<Instant>) -> io::Result<()> {
         self.shutdown.store(true, Ordering::Release);
+        self.active_connections.cancel_all();
         if let Some(streams) = &self.streams {
             streams.notify_all();
         }
@@ -2201,6 +2416,12 @@ impl IpcServer {
             Some(_) | None => Ok(()),
         };
         let thread_result = self.thread.take().map_or(Ok(()), |thread| {
+            if deadline.is_some_and(|deadline| !wait_until_finished(&thread, deadline)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "The IPC server exceeded the Supervisor shutdown deadline",
+                ));
+            }
             thread
                 .join()
                 .map_err(|_| io::Error::other("IPC server thread panicked"))?
@@ -2208,6 +2429,17 @@ impl IpcServer {
         let cleanup_result = cleanup_socket(&self.socket_path, self.socket_identity);
         wake_result.and(thread_result).and(cleanup_result)
     }
+}
+
+fn wait_until_finished<T>(thread: &JoinHandle<T>, deadline: Instant) -> bool {
+    while !thread.is_finished() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(1)));
+    }
+    true
 }
 
 impl fmt::Debug for IpcServer {
@@ -2255,6 +2487,7 @@ struct ServerRunContext {
     streams: Option<Arc<IpcStreamBroker>>,
     config: IpcServerConfig,
     shutdown: Arc<AtomicBool>,
+    active_connections: Arc<ActiveConnections>,
     accept_metrics: AcceptLoopMetrics,
 }
 
@@ -2269,6 +2502,7 @@ fn run_server(
         streams,
         config,
         shutdown,
+        active_connections,
         accept_metrics,
     } = context;
     let (sender, receiver) = mpsc::sync_channel(config.pending_connection_capacity);
@@ -2282,6 +2516,7 @@ fn run_server(
         stream_limit,
         io_timeout: config.io_timeout,
         shutdown: Arc::clone(&shutdown),
+        active_connections,
     };
     let workers = spawn_workers(config.worker_count, Arc::clone(&receiver), workers_context)?;
 
@@ -2312,6 +2547,7 @@ struct WorkerContext {
     stream_limit: usize,
     io_timeout: Duration,
     shutdown: Arc<AtomicBool>,
+    active_connections: Arc<ActiveConnections>,
 }
 
 fn spawn_workers(
@@ -2338,6 +2574,12 @@ fn worker_loop(receiver: Arc<Mutex<Receiver<UnixStream>>>, context: WorkerContex
             .recv();
         match received {
             Ok(stream) if !context.shutdown.load(Ordering::Acquire) => {
+                let Ok(_active_connection) =
+                    ActiveConnection::register(&context.active_connections, &stream)
+                else {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                };
                 handle_connection(
                     stream,
                     context.application.as_ref(),

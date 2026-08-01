@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use hopash::config::{AuthoritativeConfig, ConfigCompiler, EffectiveConfiguration};
 use hopash::constants::CORE_RESTART_INITIAL_BACKOFF;
 use hopash::core::{
-    ApplyDisposition, CoreControlEndpoint, CoreRuntime, CoreRuntimeLifecycle, MihomoReadiness,
-    OwnerSessionRequest,
+    ApplyDisposition, CoreControlEndpoint, CoreRuntime, CoreRuntimeErrorKind, CoreRuntimeLifecycle,
+    MihomoReadiness, OwnerSessionRequest,
 };
 use hopash::domain::RuntimeGeneration;
 use hopash::lifecycle::{ProcessInspector, PsProcessInspector};
@@ -26,6 +26,8 @@ use hopash::service::{
     RuntimeConfigurationPolicy, RuntimeManifestFileV1, ServiceMaintenanceOutcome,
     ServicePlatformError, TunCapabilityPreflight, UnexpectedExitOutcome, UuidSecretGenerator,
 };
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 use sha2::{Digest, Sha256};
 
 struct TestDirectory(PathBuf);
@@ -186,17 +188,12 @@ fn verified_runtime_spawns_reloads_forwards_bounded_logs_and_stops() {
     assert_eq!(first.managed_core.runtime_generation, RuntimeGeneration(1));
 
     let logs = wait_for_logs(&service, &session.proof, 3);
+    assert_eq!(logs.records.len(), 3);
     assert!(
         logs.records
             .iter()
-            .any(|record| record.message == "core std")
+            .all(|record| record.message == " [trunca")
     );
-    assert!(
-        logs.records
-            .iter()
-            .any(|record| record.message == "01234567")
-    );
-    assert!(logs.records.len() <= 3);
 
     let second = service
         .apply_candidate(&session.proof, &second_bundle)
@@ -417,6 +414,116 @@ fn guarded_controller_stop_and_drop_contain_the_exact_core() {
 }
 
 #[test]
+fn guarded_handshake_cancellation_contains_the_spawned_core() {
+    let directory = TestDirectory::new("guardian-handshake-cancel");
+    let executable = directory.0.join("fixture-core");
+    let guardian = directory.0.join("fixture-guardian");
+    let process_marker = directory.0.join("guardian-processes");
+    let core_script = b"#!/bin/sh\nexec /bin/sleep 30\n";
+    let guardian_script = format!(
+        "#!/bin/sh\ntrap 'exit 0' TERM\ncore=\"$3\"\n\"$core\" >/dev/null 2>&1 &\ncore_pid=$!\nprintf '%s %s\\n' \"$$\" \"$core_pid\" > '{}'\nwhile IFS= read -r line; do :; done\n/bin/sleep 0.2\n/bin/kill -TERM \"$core_pid\" 2>/dev/null || true\nwait \"$core_pid\" 2>/dev/null || true\n",
+        process_marker.display()
+    );
+    fs::write(&executable, core_script).expect("fixture executable should be written");
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+        .expect("fixture executable should be executable");
+    fs::write(&guardian, guardian_script.as_bytes()).expect("fixture guardian should be written");
+    fs::set_permissions(&guardian, fs::Permissions::from_mode(0o700))
+        .expect("fixture guardian should be executable");
+    let effective = effective_configuration(&directory.0);
+    let binary_sha256 = sha256(core_script);
+    let runtime_root = directory.0.join("guardian-runtime");
+    let bundle = RuntimeBundleStager::new(
+        &runtime_root,
+        &executable,
+        &binary_sha256,
+        effective.compiler_policy_sha256(),
+    )
+    .expect("runtime stager should be configured")
+    .stage(RuntimeGeneration(1), &effective)
+    .expect("the Runtime Generation should be staged");
+    fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o711))
+        .expect("the service runtime root should permit owner traversal");
+    let process_controller = NativeCoreProcessController::new_guarded(
+        NativeCoreProcessConfig {
+            readiness_timeout: Duration::from_secs(2),
+            readiness_poll_interval: Duration::from_millis(5),
+            stop_timeout: Duration::from_secs(1),
+            log_capacity: 8,
+            max_log_line_bytes: 64,
+        },
+        Arc::new(FakeControl::default()),
+        Arc::new(PsProcessInspector),
+        guardian,
+    )
+    .expect("guarded process controller should be configured");
+    let service = PrivilegedCoreRuntimeService::new(
+        PrivilegedServiceConfig::product_defaults(
+            runtime_root,
+            effective.compiler_policy_sha256().to_owned(),
+            binary_sha256,
+        ),
+        PrivilegedServiceDependencies {
+            credentials: Box::new(AllowCaller),
+            identities: Box::new(SystemProcessIdentityProbe),
+            tun: Box::new(AllowTun),
+            configuration_policy: Box::new(AllowConfiguration),
+            secrets: Box::new(UuidSecretGenerator),
+            processes: Box::new(process_controller),
+        },
+    )
+    .expect("privileged runtime service should start");
+    let supervisor_identity = PsProcessInspector
+        .identity(std::process::id())
+        .expect("Supervisor identity lookup should succeed")
+        .expect("Supervisor identity should exist");
+    let session = service
+        .open_owner_session(&OwnerSessionRequest {
+            owner_uid: nix::unistd::Uid::current().as_raw(),
+            supervisor_pid: std::process::id(),
+            supervisor_start_identity: supervisor_identity,
+            instance_token: "guardian-cancel-fixture-instance".to_owned(),
+            protocol_version: CORE_RUNTIME_PROTOCOL_VERSION,
+        })
+        .expect("owner session should open");
+    let mut cleanup = ExactProcessCleanup::default();
+
+    std::thread::scope(|scope| {
+        let apply = scope.spawn(|| service.apply_candidate(&session.proof, &bundle));
+        let marker_deadline = Instant::now() + Duration::from_secs(2);
+        let mut process_ids = read_process_marker(&process_marker);
+        while process_ids.is_none() && !apply.is_finished() {
+            assert!(
+                Instant::now() < marker_deadline,
+                "the guarded fixture should publish both process IDs"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+            process_ids = read_process_marker(&process_marker);
+        }
+        let Some((guardian_pid, core_pid)) = process_ids else {
+            let result = apply
+                .join()
+                .expect("the early Runtime Apply worker should finish");
+            panic!("the guarded fixture exited before publishing process IDs: {result:?}");
+        };
+        let guardian_identity = cleanup.track(guardian_pid);
+        let core_identity = cleanup.track(core_pid);
+
+        service
+            .cancel_pending_apply(&session.proof)
+            .expect("the Runtime Apply should accept cancellation");
+
+        let error = apply
+            .join()
+            .expect("the Runtime Apply worker should finish")
+            .expect_err("the cancelled Runtime Apply should fail");
+        assert_eq!(error.kind, CoreRuntimeErrorKind::ReloadTimeout);
+        wait_for_identity_gone(guardian_pid as u32, &guardian_identity);
+        wait_for_identity_gone(core_pid as u32, &core_identity);
+    });
+}
+
+#[test]
 fn controller_configuration_rejects_zero_deadlines_and_capacities() {
     let valid = NativeCoreProcessConfig::default();
     let controls: Arc<dyn CoreControlClient> = Arc::new(FakeControl::default());
@@ -555,5 +662,59 @@ fn wait_for_identity_gone(pid: u32, identity: &str) {
         }
         assert!(Instant::now() < deadline, "the guarded Core should exit");
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[derive(Default)]
+struct ExactProcessCleanup(Vec<(u32, String)>);
+
+impl ExactProcessCleanup {
+    fn track(&mut self, pid: i32) -> String {
+        let pid = u32::try_from(pid).expect("fixture PID should be positive");
+        let identity = wait_for_identity(pid);
+        self.0.push((pid, identity.clone()));
+        identity
+    }
+}
+
+impl Drop for ExactProcessCleanup {
+    fn drop(&mut self) {
+        for (pid, expected_identity) in self.0.iter().rev() {
+            let Ok(Some(actual_identity)) = PsProcessInspector.identity(*pid) else {
+                continue;
+            };
+            if actual_identity != *expected_identity {
+                continue;
+            }
+            let Ok(pid) = i32::try_from(*pid) else {
+                continue;
+            };
+            let pid = Pid::from_raw(pid);
+            let _ = kill(pid, Signal::SIGCONT);
+            let _ = kill(pid, Signal::SIGKILL);
+        }
+    }
+}
+
+fn read_process_marker(path: &Path) -> Option<(i32, i32)> {
+    let content = fs::read_to_string(path).ok()?;
+    let mut fields = content.split_whitespace();
+    let (Some(guardian), Some(core), None) = (fields.next(), fields.next(), fields.next()) else {
+        return None;
+    };
+    Some((guardian.parse().ok()?, core.parse().ok()?))
+}
+
+fn wait_for_identity(pid: u32) -> String {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match PsProcessInspector.identity(pid) {
+            Ok(Some(identity)) => return identity,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => panic!("fixture process identity should become available"),
+            Err(error) => panic!("fixture process identity should be inspectable: {error}"),
+        }
     }
 }

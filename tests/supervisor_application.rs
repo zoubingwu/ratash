@@ -9,6 +9,7 @@ use hopash::core::{
     ManagedCoreHandle, MihomoError, NodeSelection, NodeSource, ProviderState, ProxyGroup,
     ProxyMember, ProxyNode, ProxyView, ProxyViewOrderSource,
 };
+use hopash::diagnostics::{WrapperDiagnosticCategory, WrapperDiagnosticState};
 use hopash::domain::{
     ApplyState, CoreInstanceGeneration, NodeRecordId, ProxyGroupId, RuntimeApplyPhase,
     RuntimeGeneration, RuntimeRecoveryStatus, StreamState, SubscriptionUrl, SupervisorHealthReason,
@@ -89,6 +90,10 @@ impl MutableClock {
         Self {
             now: AtomicU64::new(now),
         }
+    }
+
+    fn set(&self, now: u64) {
+        self.now.store(now, Ordering::Relaxed);
     }
 }
 
@@ -1239,6 +1244,16 @@ fn startup_apply_exposes_pending_runtime_recovery_health() {
         [SupervisorHealthReason::RuntimeRecovery]
     );
     assert_eq!(status.runtime_apply.phase, RuntimeApplyPhase::Recovering);
+    let diagnostics = reopened
+        .wrapper_diagnostic_tail(None)
+        .expect("the startup diagnostic tail should remain available");
+    assert_eq!(diagnostics.records.len(), 1);
+    assert_eq!(
+        diagnostics.records[0].category,
+        WrapperDiagnosticCategory::RuntimeRecovery
+    );
+    assert_eq!(diagnostics.records[0].state, WrapperDiagnosticState::Raised);
+    assert_eq!(diagnostics.records[0].timestamp_unix_ms, 10_000);
 }
 
 #[test]
@@ -1614,6 +1629,128 @@ fn failed_runtime_recovery_marks_the_supervisor_degraded_and_retains_rules() {
         hopash::domain::SupervisorLifecycle::Ready
     );
     assert!(recovered_status.supervisor.health_reasons.is_empty());
+}
+
+#[test]
+fn wrapper_diagnostics_record_health_transitions_once_without_untrusted_strings() {
+    const SECRET_MARKER: &str = "private-subscription-token";
+
+    let harness = Harness::new("wrapper-diagnostic-transitions");
+    harness.queue_profile("Primary", "node-a");
+    let supervisor = harness.open();
+    add_profile(
+        &supervisor,
+        &format!("https://example.test/primary.yaml?token={SECRET_MARKER}"),
+    );
+
+    for timestamp in [11_000, 12_000] {
+        harness.clock.set(timestamp);
+        harness
+            .transactions
+            .fail_next_apply
+            .store(true, Ordering::Relaxed);
+        *harness
+            .transactions
+            .next_failure_recovery
+            .lock()
+            .expect("the failure recovery lock") = Some(TransactionRecoveryOutcome::Failed {
+            target: Some(RuntimeGeneration(1)),
+        });
+        supervisor
+            .execute(ApplicationOperation::RuleAdd {
+                rule: format!("DOMAIN,failed-{timestamp}.example,DIRECT"),
+                placement: hopash::application::RulePlacement::Prepend,
+            })
+            .expect_err("the injected Runtime Recovery failure should fail the mutation");
+    }
+
+    harness.clock.set(13_000);
+    supervisor
+        .execute(ApplicationOperation::RuleAdd {
+            rule: "DOMAIN,recovered.example,DIRECT".to_owned(),
+            placement: hopash::application::RulePlacement::Prepend,
+        })
+        .expect("the later Runtime Apply should clear recovery health");
+    harness.clock.set(14_000);
+    supervisor
+        .execute(ApplicationOperation::RuleAdd {
+            rule: "DOMAIN,still-healthy.example,DIRECT".to_owned(),
+            placement: hopash::application::RulePlacement::Prepend,
+        })
+        .expect("the healthy Runtime Apply should remain healthy");
+
+    let diagnostics = supervisor
+        .wrapper_diagnostic_tail(None)
+        .expect("the diagnostic tail should remain available");
+    assert_eq!(diagnostics.records.len(), 2);
+    assert_eq!(
+        diagnostics
+            .records
+            .iter()
+            .map(|record| (record.timestamp_unix_ms, record.category, record.state))
+            .collect::<Vec<_>>(),
+        [
+            (
+                11_000,
+                WrapperDiagnosticCategory::RuntimeRecovery,
+                WrapperDiagnosticState::Raised,
+            ),
+            (
+                13_000,
+                WrapperDiagnosticCategory::RuntimeRecovery,
+                WrapperDiagnosticState::Cleared,
+            ),
+        ]
+    );
+    assert!(!format!("{diagnostics:?}").contains(SECRET_MARKER));
+}
+
+#[test]
+fn supervisor_wrapper_diagnostics_retain_the_bounded_latest_tail_and_report_a_gap() {
+    let harness = Harness::new("bounded-wrapper-diagnostics");
+    harness.queue_profile("Primary", "node-a");
+    let supervisor = harness.open();
+    add_profile(&supervisor, "https://example.test/primary.yaml");
+
+    let transitions = hopash::constants::WRAPPER_DIAGNOSTIC_CAPACITY + 2;
+    for index in 0..(transitions / 2) {
+        harness
+            .transactions
+            .fail_next_apply
+            .store(true, Ordering::Relaxed);
+        *harness
+            .transactions
+            .next_failure_recovery
+            .lock()
+            .expect("the failure recovery lock") = Some(TransactionRecoveryOutcome::Failed {
+            target: Some(RuntimeGeneration(index as u64 + 1)),
+        });
+        let rule = format!("DOMAIN,diagnostic-{index}.example,DIRECT");
+        supervisor
+            .execute(ApplicationOperation::RuleAdd {
+                rule: rule.clone(),
+                placement: hopash::application::RulePlacement::Prepend,
+            })
+            .expect_err("the injected Runtime Recovery failure should raise health");
+        supervisor
+            .execute(ApplicationOperation::RuleAdd {
+                rule,
+                placement: hopash::application::RulePlacement::Prepend,
+            })
+            .expect("the succeeding Runtime Apply should clear health");
+    }
+
+    let diagnostics = supervisor
+        .wrapper_diagnostic_tail(Some(0))
+        .expect("the bounded diagnostic tail should remain available");
+    assert_eq!(
+        diagnostics.records.len(),
+        hopash::constants::WRAPPER_DIAGNOSTIC_CAPACITY
+    );
+    assert_eq!(diagnostics.evicted_total, 2);
+    assert!(diagnostics.gap);
+    assert_eq!(diagnostics.earliest_sequence, Some(3));
+    assert_eq!(diagnostics.latest_sequence, Some(transitions as u64));
 }
 
 #[test]

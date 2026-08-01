@@ -4,6 +4,7 @@ use std::io::{self, Read};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, chown};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -15,7 +16,8 @@ use nix::unistd::Pid;
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::constants::{
-    CORE_LOG_LINE_MAX_BYTES, CORE_PROCESS_STOP_TIMEOUT, CORE_READINESS_TIMEOUT, LOG_CAPACITY,
+    CORE_LOG_FORWARD_CAPACITY, CORE_LOG_FORWARD_MAX_BYTES, CORE_LOG_LINE_MAX_BYTES,
+    CORE_PROCESS_STOP_TIMEOUT, CORE_READINESS_TIMEOUT,
 };
 use crate::core::{CoreControlEndpoint, MihomoAdapter, MihomoReadiness, ProcessOutputSource};
 use crate::core_guardian::{CoreGuardianHandshake, CoreGuardianInvocation, read_handshake};
@@ -43,6 +45,10 @@ pub trait CoreControlClient: Send + Sync {
         endpoint: &CoreControlEndpoint,
         configuration_path: &Path,
     ) -> Result<(), ServicePlatformError>;
+
+    fn cancel_pending(&self, _owner_generation: u64) {}
+
+    fn reset_cancellation(&self, _owner_generation: u64) {}
 }
 
 #[derive(Clone, Debug, Default)]
@@ -76,6 +82,14 @@ impl CoreControlClient for UnixCoreControlClient {
             .reload_configuration(endpoint, configuration_path)
             .map_err(|_| platform_error(ServicePlatformErrorKind::Reload))
     }
+
+    fn cancel_pending(&self, owner_generation: u64) {
+        self.adapter.cancel_pending_for(owner_generation);
+    }
+
+    fn reset_cancellation(&self, owner_generation: u64) {
+        self.adapter.reset_cancellation_for(owner_generation);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,7 +107,7 @@ impl Default for NativeCoreProcessConfig {
             readiness_timeout: CORE_READINESS_TIMEOUT,
             readiness_poll_interval: Duration::from_millis(50),
             stop_timeout: CORE_PROCESS_STOP_TIMEOUT,
-            log_capacity: LOG_CAPACITY,
+            log_capacity: CORE_LOG_FORWARD_CAPACITY,
             max_log_line_bytes: CORE_LOG_LINE_MAX_BYTES,
         }
     }
@@ -154,9 +168,16 @@ struct ControllerState {
     child: Option<ManagedChild>,
 }
 
+#[derive(Default)]
+struct ApplyCancellationEpoch {
+    latest_generation: u64,
+    owner_generation: Option<u64>,
+}
+
 struct LogQueue {
     generation: Option<crate::domain::CoreInstanceGeneration>,
     capacity: usize,
+    retained_bytes: usize,
     records: VecDeque<CoreProcessLog>,
     dropped: u64,
 }
@@ -166,6 +187,7 @@ impl LogQueue {
         Self {
             generation: None,
             capacity,
+            retained_bytes: 0,
             records: VecDeque::with_capacity(capacity),
             dropped: 0,
         }
@@ -174,6 +196,7 @@ impl LogQueue {
     fn begin_generation(&mut self, generation: crate::domain::CoreInstanceGeneration) {
         self.generation = Some(generation);
         self.records.clear();
+        self.retained_bytes = 0;
         self.dropped = 0;
     }
 
@@ -192,10 +215,21 @@ impl LogQueue {
         if self.generation != Some(generation) {
             return;
         }
-        if self.records.len() == self.capacity {
-            self.records.pop_front();
+        let message = message.into_boxed_str().into_string();
+        if message.len() > CORE_LOG_FORWARD_MAX_BYTES {
+            self.dropped = self.dropped.saturating_add(1);
+            return;
+        }
+        while self.records.len() == self.capacity
+            || self.retained_bytes.saturating_add(message.len()) > CORE_LOG_FORWARD_MAX_BYTES
+        {
+            let Some(dropped) = self.records.pop_front() else {
+                break;
+            };
+            self.retained_bytes = self.retained_bytes.saturating_sub(dropped.message.len());
             self.dropped = self.dropped.saturating_add(1);
         }
+        self.retained_bytes = self.retained_bytes.saturating_add(message.len());
         self.records.push_back(CoreProcessLog {
             timestamp_unix_ms: now_unix_ms(),
             source,
@@ -213,13 +247,20 @@ impl LogQueue {
         let retain = limit.min(self.capacity);
         let excess = self.records.len().saturating_sub(retain);
         if excess > 0 {
-            self.records.drain(..excess);
+            let dropped_bytes = self
+                .records
+                .drain(..excess)
+                .map(|record| record.message.len())
+                .sum::<usize>();
+            self.retained_bytes = self.retained_bytes.saturating_sub(dropped_bytes);
             self.dropped = self
                 .dropped
                 .saturating_add(u64::try_from(excess).unwrap_or(u64::MAX));
         }
+        let records = self.records.drain(..).collect();
+        self.retained_bytes = 0;
         CoreProcessLogBatch {
-            records: self.records.drain(..).collect(),
+            records,
             dropped: std::mem::take(&mut self.dropped),
         }
     }
@@ -232,6 +273,8 @@ pub struct NativeCoreProcessController {
     launch_mode: CoreLaunchMode,
     state: Mutex<ControllerState>,
     logs: Arc<Mutex<LogQueue>>,
+    apply_cancelled: AtomicBool,
+    apply_cancellation_epoch: Mutex<ApplyCancellationEpoch>,
 }
 
 impl NativeCoreProcessController {
@@ -264,6 +307,8 @@ impl NativeCoreProcessController {
             launch_mode: CoreLaunchMode::Direct,
             state: Mutex::new(ControllerState::default()),
             logs: Arc::new(Mutex::new(LogQueue::new(config.log_capacity))),
+            apply_cancelled: AtomicBool::new(false),
+            apply_cancellation_epoch: Mutex::new(ApplyCancellationEpoch::default()),
         })
     }
 
@@ -302,6 +347,14 @@ impl NativeCoreProcessController {
         self.state
             .lock()
             .map_err(|_| platform_error(ServicePlatformErrorKind::ProcessInspection))
+    }
+
+    fn ensure_apply_active(&self) -> Result<(), ServicePlatformError> {
+        if self.apply_cancelled.load(Ordering::Acquire) {
+            Err(platform_error(ServicePlatformErrorKind::ApplyCancelled))
+        } else {
+            Ok(())
+        }
     }
 
     fn verify_managed<'a>(
@@ -343,6 +396,13 @@ impl NativeCoreProcessController {
                 return Ok(false);
             }
             managed.exited = true;
+        }
+        if matches!(managed.ownership, ChildOwnership::Guardian { .. }) {
+            contain_exact_process_after_guardian_exit(
+                self.inspector.as_ref(),
+                &managed.identity,
+                self.config.stop_timeout,
+            )?;
         }
         self.finish_managed_logs(managed)?;
         Ok(true)
@@ -487,15 +547,18 @@ impl NativeCoreProcessController {
                     return Err(platform_error(ServicePlatformErrorKind::Spawn));
                 }
             };
-        let (handshake, stdout) =
-            match read_guardian_handshake(stdout, self.config.readiness_timeout) {
-                Ok(result) => result,
-                Err(error) => {
-                    drop(control);
-                    stop_unidentified_guardian(&mut child, self.config.stop_timeout);
-                    return Err(error);
-                }
-            };
+        let (handshake, stdout) = match read_guardian_handshake(
+            stdout,
+            self.config.readiness_timeout,
+            &self.apply_cancelled,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                drop(control);
+                stop_unidentified_guardian(&mut child, self.config.stop_timeout);
+                return Err(error);
+            }
+        };
         let pid = handshake.pid();
         let claimed_identity = handshake.process_start_identity().to_owned();
         let process_start_identity = match self.discover_identity(pid) {
@@ -543,6 +606,7 @@ impl NativeCoreProcessController {
 fn read_guardian_handshake(
     mut stdout: ChildStdout,
     timeout: Duration,
+    cancellation: &AtomicBool,
 ) -> Result<(CoreGuardianHandshake, ChildStdout), ServicePlatformError> {
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::Builder::new()
@@ -552,11 +616,23 @@ fn read_guardian_handshake(
             let _ = sender.send((result, stdout));
         })
         .map_err(|_| platform_error(ServicePlatformErrorKind::Spawn))?;
-    match receiver.recv_timeout(timeout) {
-        Ok((Ok(handshake), stdout)) => Ok((handshake, stdout)),
-        Ok((Err(_), _))
-        | Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
-            Err(platform_error(ServicePlatformErrorKind::Spawn))
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| platform_error(ServicePlatformErrorKind::Spawn))?;
+    loop {
+        if cancellation.load(Ordering::Acquire) {
+            return Err(platform_error(ServicePlatformErrorKind::ApplyCancelled));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(platform_error(ServicePlatformErrorKind::Spawn));
+        }
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(50))) {
+            Ok((Ok(handshake), stdout)) => return Ok((handshake, stdout)),
+            Ok((Err(_), _)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(platform_error(ServicePlatformErrorKind::Spawn));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
 }
@@ -595,6 +671,7 @@ fn stop_managed_child(
     let deadline = started
         .checked_add(timeout)
         .ok_or_else(|| platform_error(ServicePlatformErrorKind::Stop))?;
+    let guardian = matches!(managed.ownership, ChildOwnership::Guardian { .. });
     match &mut managed.ownership {
         ChildOwnership::Direct => {
             managed
@@ -609,13 +686,21 @@ fn stop_managed_child(
                 .checked_add(fallback_delay.unwrap_or(timeout))
                 .ok_or_else(|| platform_error(ServicePlatformErrorKind::Stop))?;
             if wait_for_child_exit(&mut managed.child, fallback_deadline)? {
-                return Ok(());
+                return contain_exact_process_after_guardian_exit(
+                    inspector,
+                    &managed.identity,
+                    timeout,
+                );
             }
             terminate_exact_process(inspector, &managed.identity)?;
         }
     }
     if wait_for_child_exit(&mut managed.child, deadline)? {
-        return Ok(());
+        return if guardian {
+            contain_exact_process_after_guardian_exit(inspector, &managed.identity, timeout)
+        } else {
+            Ok(())
+        };
     }
     managed
         .child
@@ -625,7 +710,11 @@ fn stop_managed_child(
         .checked_add(timeout.min(Duration::from_millis(250)))
         .ok_or_else(|| platform_error(ServicePlatformErrorKind::Stop))?;
     if wait_for_child_exit(&mut managed.child, forced_deadline)? {
-        Ok(())
+        if guardian {
+            contain_exact_process_after_guardian_exit(inspector, &managed.identity, timeout)
+        } else {
+            Ok(())
+        }
     } else {
         Err(platform_error(ServicePlatformErrorKind::Stop))
     }
@@ -668,6 +757,40 @@ fn terminate_exact_process(
     }
 }
 
+fn contain_exact_process_after_guardian_exit(
+    inspector: &dyn ProcessInspector,
+    identity: &OwnedProcessIdentity,
+    timeout: Duration,
+) -> Result<(), ServicePlatformError> {
+    match inspector
+        .identity(identity.pid)
+        .map_err(|_| platform_error(ServicePlatformErrorKind::ProcessInspection))?
+    {
+        None => return Ok(()),
+        Some(actual) if actual != identity.process_start_identity => return Ok(()),
+        Some(_) => {}
+    }
+    terminate_exact_process(inspector, identity)?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| platform_error(ServicePlatformErrorKind::Stop))?;
+    loop {
+        match inspector
+            .identity(identity.pid)
+            .map_err(|_| platform_error(ServicePlatformErrorKind::ProcessInspection))?
+        {
+            None => return Ok(()),
+            Some(actual) if actual != identity.process_start_identity => return Ok(()),
+            Some(_) => {}
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(platform_error(ServicePlatformErrorKind::Stop));
+        }
+        thread::sleep(remaining.min(PROCESS_WAIT_POLL_INTERVAL));
+    }
+}
+
 impl CoreProcessController for NativeCoreProcessController {
     fn spawn(
         &self,
@@ -675,6 +798,7 @@ impl CoreProcessController for NativeCoreProcessController {
         endpoint: &CoreControlEndpoint,
         instance_generation: crate::domain::CoreInstanceGeneration,
     ) -> Result<SpawnedCoreProcess, ServicePlatformError> {
+        self.ensure_apply_active()?;
         let mut state = self.lock_state()?;
         if let Some(existing) = state.child.as_mut() {
             if !self.observe_exit(existing)? {
@@ -730,10 +854,14 @@ impl CoreProcessController for NativeCoreProcessController {
         process: &OwnedProcessIdentity,
         bundle: &VerifiedRuntimeBundle,
     ) -> Result<(), ServicePlatformError> {
+        self.ensure_apply_active()?;
         let mut state = self.lock_state()?;
         let managed = self.verify_managed(&mut state, process)?;
-        self.control
-            .reload(&managed.endpoint, bundle.configuration_path())
+        let result = self
+            .control
+            .reload(&managed.endpoint, bundle.configuration_path());
+        self.ensure_apply_active()?;
+        result
     }
 
     fn stop(&self, process: &OwnedProcessIdentity) -> Result<(), ServicePlatformError> {
@@ -750,6 +878,7 @@ impl CoreProcessController for NativeCoreProcessController {
         process: &OwnedProcessIdentity,
         endpoint: &CoreControlEndpoint,
     ) -> Result<(), ServicePlatformError> {
+        self.ensure_apply_active()?;
         let mut state = self.lock_state()?;
         let managed = self.verify_managed(&mut state, process)?;
         if managed.endpoint != *endpoint {
@@ -759,6 +888,7 @@ impl CoreProcessController for NativeCoreProcessController {
             .checked_add(self.config.readiness_timeout)
             .ok_or_else(|| platform_error(ServicePlatformErrorKind::ReadinessTimeout))?;
         loop {
+            self.ensure_apply_active()?;
             if self.observe_exit(managed)? {
                 return Err(platform_error(ServicePlatformErrorKind::Readiness));
             }
@@ -766,6 +896,7 @@ impl CoreProcessController for NativeCoreProcessController {
                 Ok(MihomoReadiness::Ready) => return Ok(()),
                 Ok(MihomoReadiness::Starting) | Err(_) => {}
             }
+            self.ensure_apply_active()?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(platform_error(ServicePlatformErrorKind::ReadinessTimeout));
@@ -857,6 +988,44 @@ impl CoreProcessController for NativeCoreProcessController {
             .map_err(|_| platform_error(ServicePlatformErrorKind::Logs))?;
         Ok(logs.take(limit))
     }
+
+    fn reset_apply_cancellation(&self, owner_generation: u64) {
+        let accepted = {
+            let mut epoch = self
+                .apply_cancellation_epoch
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if owner_generation <= epoch.latest_generation {
+                false
+            } else {
+                epoch.latest_generation = owner_generation;
+                epoch.owner_generation = Some(owner_generation);
+                self.apply_cancelled.store(false, Ordering::Release);
+                true
+            }
+        };
+        if accepted {
+            self.control.reset_cancellation(owner_generation);
+        }
+    }
+
+    fn cancel_pending_apply(&self, owner_generation: u64) {
+        let accepted = {
+            let epoch = self
+                .apply_cancellation_epoch
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if epoch.owner_generation == Some(owner_generation) {
+                self.apply_cancelled.store(true, Ordering::Release);
+                true
+            } else {
+                false
+            }
+        };
+        if accepted {
+            self.control.cancel_pending(owner_generation);
+        }
+    }
 }
 
 impl Drop for NativeCoreProcessController {
@@ -867,11 +1036,18 @@ impl Drop for NativeCoreProcessController {
         let Some(mut managed) = state.child.take() else {
             return;
         };
+        let guardian = matches!(managed.ownership, ChildOwnership::Guardian { .. });
         if managed.exited {
+            if guardian {
+                let _ = contain_exact_process_after_guardian_exit(
+                    self.inspector.as_ref(),
+                    &managed.identity,
+                    self.config.stop_timeout,
+                );
+            }
             let _ = self.finish_managed_logs(&mut managed);
             return;
         }
-        let guardian = matches!(managed.ownership, ChildOwnership::Guardian { .. });
         if stop_managed_child(
             &mut managed,
             self.inspector.as_ref(),
@@ -884,6 +1060,13 @@ impl Drop for NativeCoreProcessController {
             } else {
                 terminate_owned_child(&mut managed.child, self.config.stop_timeout);
             }
+        }
+        if guardian {
+            let _ = contain_exact_process_after_guardian_exit(
+                self.inspector.as_ref(),
+                &managed.identity,
+                self.config.stop_timeout,
+            );
         }
         managed.exited = true;
         let _ = self.finish_managed_logs(&mut managed);
@@ -1068,7 +1251,90 @@ fn platform_error(kind: ServicePlatformErrorKind) -> ServicePlatformError {
 mod tests {
     use super::*;
     use crate::domain::CoreInstanceGeneration;
-    use std::io::Cursor;
+    use std::io::{BufRead, BufReader, Cursor};
+    use std::sync::Condvar;
+
+    struct StartingControl;
+
+    struct GuardianExitFixture {
+        guardian: Option<Child>,
+        core_identity: OwnedProcessIdentity,
+    }
+
+    impl Drop for GuardianExitFixture {
+        fn drop(&mut self) {
+            if let Some(guardian) = self.guardian.as_mut() {
+                terminate_owned_child(guardian, Duration::from_millis(250));
+            }
+            let _ = terminate_exact_process(&PsProcessInspector, &self.core_identity);
+        }
+    }
+
+    impl CoreControlClient for StartingControl {
+        fn readiness(
+            &self,
+            _endpoint: &CoreControlEndpoint,
+        ) -> Result<MihomoReadiness, ServicePlatformError> {
+            Ok(MihomoReadiness::Starting)
+        }
+
+        fn reload(
+            &self,
+            _endpoint: &CoreControlEndpoint,
+            _configuration_path: &Path,
+        ) -> Result<(), ServicePlatformError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct DelayedCancellationControl {
+        state: Mutex<(bool, bool)>,
+        wake: Condvar,
+    }
+
+    impl DelayedCancellationControl {
+        fn wait_until_cancel_entered(&self) {
+            let state = self.state.lock().expect("cancellation fixture lock");
+            let _state = self
+                .wake
+                .wait_while(state, |(entered, _)| !*entered)
+                .expect("cancellation fixture lock");
+        }
+
+        fn release_cancel(&self) {
+            let mut state = self.state.lock().expect("cancellation fixture lock");
+            state.1 = true;
+            self.wake.notify_all();
+        }
+    }
+
+    impl CoreControlClient for DelayedCancellationControl {
+        fn readiness(
+            &self,
+            _endpoint: &CoreControlEndpoint,
+        ) -> Result<MihomoReadiness, ServicePlatformError> {
+            Ok(MihomoReadiness::Ready)
+        }
+
+        fn reload(
+            &self,
+            _endpoint: &CoreControlEndpoint,
+            _configuration_path: &Path,
+        ) -> Result<(), ServicePlatformError> {
+            Ok(())
+        }
+
+        fn cancel_pending(&self, _owner_generation: u64) {
+            let mut state = self.state.lock().expect("cancellation fixture lock");
+            state.0 = true;
+            self.wake.notify_all();
+            let _state = self
+                .wake
+                .wait_while(state, |(_, released)| !*released)
+                .expect("cancellation fixture lock");
+        }
+    }
 
     fn collect_fixture_logs(input: Vec<u8>, max_line_bytes: usize) -> CoreProcessLogBatch {
         let generation = CoreInstanceGeneration(11);
@@ -1083,8 +1349,7 @@ mod tests {
             Arc::clone(&logs),
             max_line_bytes,
         );
-        let batch = logs.lock().expect("fixture log queue").take(16);
-        batch
+        logs.lock().expect("fixture log queue").take(16)
     }
 
     #[test]
@@ -1112,6 +1377,31 @@ mod tests {
     }
 
     #[test]
+    fn high_volume_log_queue_evicts_by_aggregate_message_bytes() {
+        let generation = CoreInstanceGeneration(8);
+        let mut logs = LogQueue::new(CORE_LOG_FORWARD_CAPACITY);
+        logs.begin_generation(generation);
+        let message = "x".repeat(CORE_LOG_LINE_MAX_BYTES);
+        let retained_records = CORE_LOG_FORWARD_MAX_BYTES / CORE_LOG_LINE_MAX_BYTES;
+        for _ in 0..=retained_records {
+            logs.push(generation, ProcessOutputSource::Stdout, message.clone());
+        }
+
+        let batch = logs.take(usize::MAX);
+
+        assert_eq!(batch.records.len(), retained_records);
+        assert_eq!(batch.dropped, 1);
+        assert_eq!(
+            batch
+                .records
+                .iter()
+                .map(|record| record.message.len())
+                .sum::<usize>(),
+            CORE_LOG_FORWARD_MAX_BYTES
+        );
+    }
+
+    #[test]
     fn oversized_ascii_process_line_ends_with_the_stable_marker() {
         let max_line_bytes = 64;
         let mut input = vec![b'a'; max_line_bytes + 100];
@@ -1128,7 +1418,7 @@ mod tests {
     fn oversized_multibyte_process_line_keeps_valid_utf8_and_the_marker() {
         let max_line_bytes = 32;
         let mut input = "a".repeat(max_line_bytes - LOG_TRUNCATION_MARKER.len() - 1);
-        input.push('界');
+        input.push('\u{754c}');
         input.push_str(&"b".repeat(max_line_bytes));
         input.push('\n');
 
@@ -1187,5 +1477,250 @@ mod tests {
         assert_eq!(batch.records.len(), 1);
         assert_eq!(batch.records[0].message.len(), max_line_bytes);
         assert!(batch.records[0].message.ends_with(LOG_TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn delayed_old_epoch_cancellation_cannot_cancel_the_new_epoch() {
+        let control = Arc::new(DelayedCancellationControl::default());
+        let controller = Arc::new(
+            NativeCoreProcessController::new(
+                NativeCoreProcessConfig {
+                    readiness_timeout: Duration::from_secs(1),
+                    readiness_poll_interval: Duration::from_millis(10),
+                    stop_timeout: Duration::from_secs(1),
+                    log_capacity: 1,
+                    max_log_line_bytes: 64,
+                },
+                Arc::clone(&control) as Arc<dyn CoreControlClient>,
+                Arc::new(PsProcessInspector),
+            )
+            .expect("the cancellation fixture controller should initialize"),
+        );
+        controller.reset_apply_cancellation(1);
+
+        std::thread::scope(|scope| {
+            let cancelling_controller = Arc::clone(&controller);
+            let cancellation = scope.spawn(move || {
+                cancelling_controller.cancel_pending_apply(1);
+            });
+            control.wait_until_cancel_entered();
+
+            controller.reset_apply_cancellation(2);
+            control.release_cancel();
+            cancellation
+                .join()
+                .expect("the delayed cancellation should finish");
+        });
+
+        assert!(!controller.apply_cancelled.load(Ordering::Acquire));
+        controller.cancel_pending_apply(1);
+        assert!(!controller.apply_cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn readiness_poll_exits_promptly_after_apply_cancellation() {
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the readiness fixture child should start");
+        let pid = child.id();
+        let process_start_identity = PsProcessInspector
+            .identity(pid)
+            .expect("the readiness fixture identity should load")
+            .expect("the readiness fixture should be live");
+        let identity = OwnedProcessIdentity {
+            pid,
+            process_start_identity,
+            instance_generation: CoreInstanceGeneration(1),
+        };
+        let endpoint = CoreControlEndpoint::new(
+            PathBuf::from("/private/tmp/hopash-readiness-cancel-fixture.sock"),
+            "fixture-secret",
+        );
+        let controller = NativeCoreProcessController::new(
+            NativeCoreProcessConfig {
+                readiness_timeout: Duration::from_secs(30),
+                readiness_poll_interval: Duration::from_millis(50),
+                stop_timeout: Duration::from_secs(1),
+                log_capacity: 1,
+                max_log_line_bytes: 64,
+            },
+            Arc::new(StartingControl),
+            Arc::new(PsProcessInspector),
+        )
+        .expect("the readiness fixture controller should initialize");
+        controller
+            .state
+            .lock()
+            .expect("the controller state should lock")
+            .child = Some(ManagedChild {
+            child,
+            ownership: ChildOwnership::Direct,
+            identity: identity.clone(),
+            endpoint: endpoint.clone(),
+            exited: false,
+            log_readers: None,
+        });
+        let controller = Arc::new(controller);
+        controller.reset_apply_cancellation(1);
+
+        std::thread::scope(|scope| {
+            let worker_controller = Arc::clone(&controller);
+            let worker_identity = identity.clone();
+            let worker_endpoint = endpoint.clone();
+            let worker = scope
+                .spawn(move || worker_controller.readiness(&worker_identity, &worker_endpoint));
+            std::thread::sleep(Duration::from_millis(20));
+            let started = Instant::now();
+
+            controller.cancel_pending_apply(1);
+
+            let error = worker
+                .join()
+                .expect("the readiness fixture worker should finish")
+                .expect_err("cancelled readiness should return an error");
+            assert_eq!(error.kind, ServicePlatformErrorKind::ApplyCancelled);
+            assert!(started.elapsed() < Duration::from_millis(200));
+        });
+    }
+
+    #[test]
+    fn exited_guardian_contains_its_still_running_exact_core() {
+        let mut guardian = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                "nohup /bin/sleep 30 >/dev/null 2>&1 & core_pid=$!; printf '%s\\n' \"$core_pid\"; wait \"$core_pid\"",
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the guardian-exit fixture should start");
+        let guardian_pid = guardian.id();
+        let mut core_pid = String::new();
+        BufReader::new(
+            guardian
+                .stdout
+                .take()
+                .expect("the guardian-exit fixture should publish its Core PID"),
+        )
+        .read_line(&mut core_pid)
+        .expect("the guardian-exit Core PID should be readable");
+        let core_pid = core_pid
+            .trim()
+            .parse::<u32>()
+            .expect("the guardian-exit Core PID should parse");
+        let process_start_identity = PsProcessInspector
+            .identity(core_pid)
+            .expect("the guardian-exit Core identity should load")
+            .expect("the guardian-exit Core should be live");
+        let identity = OwnedProcessIdentity {
+            pid: core_pid,
+            process_start_identity,
+            instance_generation: CoreInstanceGeneration(1),
+        };
+        let mut fixture = GuardianExitFixture {
+            guardian: Some(guardian),
+            core_identity: identity.clone(),
+        };
+        let controller = NativeCoreProcessController::new(
+            NativeCoreProcessConfig {
+                stop_timeout: Duration::from_secs(1),
+                ..NativeCoreProcessConfig::default()
+            },
+            Arc::new(StartingControl),
+            Arc::new(PsProcessInspector),
+        )
+        .expect("the guardian-exit controller should initialize");
+        controller
+            .state
+            .lock()
+            .expect("the controller state should lock")
+            .child = Some(ManagedChild {
+            child: fixture
+                .guardian
+                .take()
+                .expect("the guardian-exit child should transfer to the controller"),
+            ownership: ChildOwnership::Guardian { control: None },
+            identity: identity.clone(),
+            endpoint: CoreControlEndpoint::new(
+                PathBuf::from("/private/tmp/hopash-guardian-exit-fixture.sock"),
+                "fixture-secret",
+            ),
+            exited: false,
+            log_readers: None,
+        });
+        kill(
+            Pid::from_raw(i32::try_from(guardian_pid).expect("guardian PID should fit i32")),
+            Signal::SIGKILL,
+        )
+        .expect("the guardian-exit fixture should kill only the guardian");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if controller
+                .reap_if_exited(&identity)
+                .expect("guardian exit inspection should succeed")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the guardian exit should become observable"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        while PsProcessInspector
+            .identity(core_pid)
+            .expect("the contained Core identity should remain inspectable")
+            .as_deref()
+            == Some(identity.process_start_identity.as_str())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the exited guardian's exact Core should be contained"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn guardian_handshake_wait_exits_promptly_after_apply_cancellation() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("the guardian handshake fixture child should start");
+        let stdout = child
+            .stdout
+            .take()
+            .expect("the guardian handshake fixture should expose stdout");
+        let cancellation = AtomicBool::new(false);
+
+        std::thread::scope(|scope| {
+            let worker = scope
+                .spawn(|| read_guardian_handshake(stdout, Duration::from_secs(30), &cancellation));
+            std::thread::sleep(Duration::from_millis(20));
+            let started = Instant::now();
+
+            cancellation.store(true, Ordering::Release);
+
+            let error = worker
+                .join()
+                .expect("the guardian handshake fixture worker should finish")
+                .expect_err("the cancelled guardian handshake should return an error");
+            assert_eq!(error.kind, ServicePlatformErrorKind::ApplyCancelled);
+            assert!(started.elapsed() < Duration::from_millis(200));
+        });
+
+        child
+            .kill()
+            .expect("the guardian handshake fixture child should stop");
+        child
+            .wait()
+            .expect("the guardian handshake fixture child should be reaped");
     }
 }

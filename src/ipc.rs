@@ -13,7 +13,8 @@ use crate::application::{
     ApplicationError, ApplicationOperation, RulePlacement as ApplicationRulePlacement,
 };
 use crate::constants::{
-    IPC_FRAME_MAX_BYTES, LOCAL_RULE_COUNT_MAX, MAX_ACTIVE_NODES, PROFILE_COUNT_MAX,
+    IPC_FRAME_MAX_BYTES, LOCAL_RULE_COUNT_MAX, LOG_SUBSCRIBER_MAX_BYTES, MAX_ACTIVE_NODES,
+    PROFILE_COUNT_MAX,
 };
 use crate::domain::{InvalidSubscriptionUrl, SubscriptionUrl};
 use crate::error::ErrorCode;
@@ -944,6 +945,7 @@ pub struct LogTailV1 {
     pub gap: bool,
     pub earliest_sequence: Option<u64>,
     pub latest_sequence: Option<u64>,
+    pub sequence_horizon: Option<u64>,
 }
 
 impl From<LogTail> for LogTailV1 {
@@ -954,6 +956,7 @@ impl From<LogTail> for LogTailV1 {
             gap: tail.gap,
             earliest_sequence: tail.earliest_sequence,
             latest_sequence: tail.latest_sequence,
+            sequence_horizon: tail.sequence_horizon,
         }
     }
 }
@@ -965,6 +968,7 @@ pub struct LogSubscriber {
     last_delivered_sequence: Option<u64>,
     awaiting_tail: bool,
     gap_count: u64,
+    queued_bytes: usize,
     queue: VecDeque<LogStreamItem>,
 }
 
@@ -979,6 +983,7 @@ impl LogSubscriber {
             last_delivered_sequence: after_sequence,
             awaiting_tail: false,
             gap_count: 0,
+            queued_bytes: 0,
             queue: VecDeque::with_capacity(capacity),
         })
     }
@@ -998,11 +1003,15 @@ impl LogSubscriber {
                 .checked_add(1)
                 .is_none_or(|expected| expected != sequence)
         });
-        if sequence_gap || self.queue.len() == self.capacity {
+        if sequence_gap
+            || self.queue.len() == self.capacity
+            || self.queued_bytes.saturating_add(record.message().len()) > LOG_SUBSCRIBER_MAX_BYTES
+        {
             self.require_tail(sequence);
             return SubscriberPublishStatus::ResyncRequired;
         }
         self.last_observed_sequence = Some(sequence);
+        self.queued_bytes = self.queued_bytes.saturating_add(record.message().len());
         self.queue.push_back(LogStreamItem::Record {
             record: record.into(),
         });
@@ -1013,15 +1022,25 @@ impl LogSubscriber {
         let item = self.queue.pop_front()?;
         if let LogStreamItem::Record { record } = &item {
             self.last_delivered_sequence = Some(record.sequence);
+            self.queued_bytes = self.queued_bytes.saturating_sub(record.message.len());
         }
         Some(item)
     }
 
     pub fn mark_tail_sent(&mut self, latest_sequence: Option<u64>) {
         self.queue.clear();
+        self.queued_bytes = 0;
         self.last_observed_sequence = latest_sequence;
         self.last_delivered_sequence = latest_sequence;
         self.awaiting_tail = false;
+    }
+
+    pub fn mark_gap(&mut self, latest_sequence: u64) {
+        if self.awaiting_tail {
+            self.update_gap_marker(latest_sequence);
+        } else {
+            self.require_tail(latest_sequence);
+        }
     }
 
     #[must_use]
@@ -1046,6 +1065,7 @@ impl LogSubscriber {
 
     fn require_tail(&mut self, latest_sequence: u64) {
         self.queue.clear();
+        self.queued_bytes = 0;
         self.last_observed_sequence = Some(latest_sequence);
         self.awaiting_tail = true;
         self.gap_count = self.gap_count.saturating_add(1);

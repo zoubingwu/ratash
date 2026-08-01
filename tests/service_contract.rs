@@ -1,4 +1,7 @@
-use hopash::constants::{CORE_RESTART_INITIAL_BACKOFF, CORE_RESTART_MAX_BACKOFF};
+use hopash::constants::{
+    CORE_LOG_FORWARD_BATCH_MAX_BYTES, CORE_LOG_FORWARD_MAX_BYTES, CORE_LOG_LINE_MAX_BYTES,
+    CORE_RESTART_INITIAL_BACKOFF, CORE_RESTART_MAX_BACKOFF,
+};
 use hopash::core::{
     ApplyDisposition, CoreControlEndpoint, CoreRuntime, CoreRuntimeDiagnosticCategory,
     CoreRuntimeError, CoreRuntimeErrorKind, CoreRuntimeLifecycle, CoreRuntimeTunReason,
@@ -24,8 +27,8 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -194,6 +197,15 @@ struct FakeProcessState {
     dropped_logs: u64,
     reload_error: Option<ServicePlatformErrorKind>,
     readiness_error: Option<ServicePlatformErrorKind>,
+    stop_error: Option<ServicePlatformErrorKind>,
+    bind_endpoint_on_readiness: bool,
+}
+
+#[derive(Default)]
+struct FakeApplyCancellation {
+    latest_generation: u64,
+    owner_generation: Option<u64>,
+    cancelled: bool,
 }
 
 #[derive(Clone)]
@@ -204,6 +216,52 @@ struct FakeProcesses {
     spawn_count: Arc<AtomicUsize>,
     reload_count: Arc<AtomicUsize>,
     stop_count: Arc<AtomicUsize>,
+    apply_cancellation: Arc<Mutex<FakeApplyCancellation>>,
+    block_readiness: Arc<AtomicBool>,
+    readiness_started: Arc<AtomicBool>,
+    readiness_wake: Arc<(Mutex<()>, Condvar)>,
+    cancellation_pause: Arc<CancellationPause>,
+}
+
+#[derive(Default)]
+struct CancellationPause {
+    armed: AtomicBool,
+    state: Mutex<(bool, bool)>,
+    ready: Condvar,
+}
+
+impl CancellationPause {
+    fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+        *self.state.lock().expect("cancellation pause lock") = (false, false);
+    }
+
+    fn wait_until_entered(&self) {
+        let state = self.state.lock().expect("cancellation pause lock");
+        let _state = self
+            .ready
+            .wait_while(state, |(entered, _)| !*entered)
+            .expect("cancellation pause lock");
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().expect("cancellation pause lock");
+        state.1 = true;
+        self.ready.notify_all();
+    }
+
+    fn pause_if_armed(&self) {
+        if !self.armed.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let mut state = self.state.lock().expect("cancellation pause lock");
+        state.0 = true;
+        self.ready.notify_all();
+        let _state = self
+            .ready
+            .wait_while(state, |(_, released)| !*released)
+            .expect("cancellation pause lock");
+    }
 }
 
 impl FakeProcesses {
@@ -215,6 +273,11 @@ impl FakeProcesses {
             spawn_count: Arc::new(AtomicUsize::new(0)),
             reload_count: Arc::new(AtomicUsize::new(0)),
             stop_count: Arc::new(AtomicUsize::new(0)),
+            apply_cancellation: Arc::new(Mutex::new(FakeApplyCancellation::default())),
+            block_readiness: Arc::new(AtomicBool::new(false)),
+            readiness_started: Arc::new(AtomicBool::new(false)),
+            readiness_wake: Arc::new((Mutex::new(()), Condvar::new())),
+            cancellation_pause: Arc::new(CancellationPause::default()),
         }
     }
 
@@ -234,6 +297,21 @@ impl FakeProcesses {
         self.state.lock().expect("process lock").readiness_error = Some(kind);
     }
 
+    fn bind_endpoint_during_next_readiness(&self) {
+        self.state
+            .lock()
+            .expect("process lock")
+            .bind_endpoint_on_readiness = true;
+    }
+
+    fn fail_next_stop(&self, kind: ServicePlatformErrorKind) {
+        self.state.lock().expect("process lock").stop_error = Some(kind);
+    }
+
+    fn live_process_count(&self) -> usize {
+        self.state.lock().expect("process lock").processes.len()
+    }
+
     fn push_logs(&self, logs: impl IntoIterator<Item = CoreProcessLog>) {
         self.state.lock().expect("process lock").logs.extend(logs);
     }
@@ -251,6 +329,48 @@ impl FakeProcesses {
             .remove(&pid);
         self.identities.remove(pid);
     }
+
+    fn block_readiness_until_cancelled(&self) {
+        self.readiness_started.store(false, Ordering::Release);
+        self.block_readiness.store(true, Ordering::Release);
+    }
+
+    fn wait_for_blocked_readiness(&self) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut guard = self.readiness_wake.0.lock().expect("readiness wait lock");
+        while !self.readiness_started.load(Ordering::Acquire) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                drop(guard);
+                let owner_generation = self
+                    .apply_cancellation
+                    .lock()
+                    .expect("apply cancellation lock")
+                    .owner_generation;
+                if let Some(owner_generation) = owner_generation {
+                    CoreProcessController::cancel_pending_apply(self, owner_generation);
+                }
+                panic!("the fixture readiness check should start");
+            }
+            let (next_guard, _) = self
+                .readiness_wake
+                .1
+                .wait_timeout(guard, remaining)
+                .expect("readiness wait lock");
+            guard = next_guard;
+        }
+    }
+
+    fn pause_next_cancellation(&self) {
+        self.cancellation_pause.arm();
+    }
+
+    fn apply_is_cancelled(&self) -> bool {
+        self.apply_cancellation
+            .lock()
+            .expect("apply cancellation lock")
+            .cancelled
+    }
 }
 
 impl CoreProcessController for FakeProcesses {
@@ -260,6 +380,11 @@ impl CoreProcessController for FakeProcesses {
         _endpoint: &CoreControlEndpoint,
         instance_generation: CoreInstanceGeneration,
     ) -> Result<SpawnedCoreProcess, ServicePlatformError> {
+        if self.apply_is_cancelled() {
+            return Err(ServicePlatformError::new(
+                ServicePlatformErrorKind::ApplyCancelled,
+            ));
+        }
         self.spawn_count.fetch_add(1, Ordering::Relaxed);
         let mut state = self.state.lock().expect("process lock");
         if state.scripts.pop_front() == Some(SpawnScript::Failure) {
@@ -294,6 +419,9 @@ impl CoreProcessController for FakeProcesses {
     fn stop(&self, process: &OwnedProcessIdentity) -> Result<(), ServicePlatformError> {
         self.stop_count.fetch_add(1, Ordering::Relaxed);
         let mut state = self.state.lock().expect("process lock");
+        if let Some(kind) = state.stop_error.take() {
+            return Err(ServicePlatformError::new(kind));
+        }
         match state.processes.get(&process.pid) {
             Some(identity) if identity == &process.process_start_identity => {
                 state.processes.remove(&process.pid);
@@ -307,8 +435,32 @@ impl CoreProcessController for FakeProcesses {
     fn readiness(
         &self,
         _process: &OwnedProcessIdentity,
-        _endpoint: &CoreControlEndpoint,
+        endpoint: &CoreControlEndpoint,
     ) -> Result<(), ServicePlatformError> {
+        if self.block_readiness.load(Ordering::Acquire) {
+            let guard = self.readiness_wake.0.lock().expect("readiness wait lock");
+            self.readiness_started.store(true, Ordering::Release);
+            self.readiness_wake.1.notify_all();
+            let _guard = self
+                .readiness_wake
+                .1
+                .wait_while(guard, |_| !self.apply_is_cancelled())
+                .expect("readiness wait lock");
+            return Err(ServicePlatformError::new(
+                ServicePlatformErrorKind::ApplyCancelled,
+            ));
+        }
+        #[cfg(unix)]
+        {
+            let should_bind = {
+                let mut state = self.state.lock().expect("process lock");
+                std::mem::take(&mut state.bind_endpoint_on_readiness)
+            };
+            if should_bind {
+                UnixListener::bind(&endpoint.socket_path)
+                    .map_err(|_| ServicePlatformError::new(ServicePlatformErrorKind::Readiness))?;
+            }
+        }
         let mut state = self.state.lock().expect("process lock");
         match state.readiness_error.take() {
             Some(kind) => Err(ServicePlatformError::new(kind)),
@@ -347,6 +499,37 @@ impl CoreProcessController for FakeProcesses {
             records: state.logs.drain(..take).collect(),
             dropped,
         })
+    }
+
+    fn reset_apply_cancellation(&self, owner_generation: u64) {
+        let mut cancellation = self
+            .apply_cancellation
+            .lock()
+            .expect("apply cancellation lock");
+        if owner_generation > cancellation.latest_generation {
+            cancellation.latest_generation = owner_generation;
+            cancellation.owner_generation = Some(owner_generation);
+            cancellation.cancelled = false;
+        }
+    }
+
+    fn cancel_pending_apply(&self, owner_generation: u64) {
+        self.cancellation_pause.pause_if_armed();
+        let accepted = {
+            let mut cancellation = self
+                .apply_cancellation
+                .lock()
+                .expect("apply cancellation lock");
+            if cancellation.owner_generation == Some(owner_generation) {
+                cancellation.cancelled = true;
+                true
+            } else {
+                false
+            }
+        };
+        if accepted {
+            self.readiness_wake.1.notify_all();
+        }
     }
 }
 
@@ -616,6 +799,55 @@ fn owner_and_core_generations_continue_after_service_reopen() {
         second_apply.managed_core.instance_generation,
         CoreInstanceGeneration(2)
     );
+}
+
+#[test]
+fn new_owner_starts_a_fresh_log_sequence_epoch() {
+    let harness = Harness::with_limits(3, 2, 64);
+    let first = harness.open();
+    harness
+        .service
+        .apply_candidate(&first.proof, &harness.bundle(1))
+        .expect("the first Core should spawn");
+    harness.processes.push_logs([
+        process_log(1, "old-1"),
+        process_log(2, "old-2"),
+        process_log(3, "old-3"),
+    ]);
+    let first_logs = harness
+        .service
+        .logs(&first.proof, None, usize::MAX)
+        .expect("the first owner logs should load");
+    assert_eq!(first_logs.next_sequence, Some(2));
+    harness
+        .service
+        .close_owner_session(&first.proof)
+        .expect("the first owner should close");
+
+    let second = harness
+        .service
+        .open_owner_session(&harness.request(200, "supervisor-200", "instance-200"))
+        .expect("the second owner should open");
+    harness
+        .service
+        .apply_candidate(&second.proof, &harness.bundle(2))
+        .expect("the second Core should spawn");
+    let empty = harness
+        .service
+        .logs(&second.proof, None, usize::MAX)
+        .expect("the second owner empty log page should load");
+    assert_eq!(empty.next_sequence, None);
+    assert_eq!(empty.dropped_before, 0);
+    assert_eq!(empty.dropped_since_after, 0);
+
+    harness.processes.push_logs([process_log(4, "new-1")]);
+    let fresh = harness
+        .service
+        .logs(&second.proof, None, usize::MAX)
+        .expect("the second owner fresh log page should load");
+    assert_eq!(fresh.records[0].sequence, 1);
+    assert_eq!(fresh.next_sequence, Some(1));
+    assert_eq!(fresh.dropped_since_after, 0);
 }
 
 #[test]
@@ -1079,6 +1311,14 @@ fn every_core_request_requires_the_exact_session_proof_and_revoke_cleans_up() {
             .kind,
         CoreRuntimeErrorKind::Authentication
     );
+    assert_eq!(
+        harness
+            .service
+            .cancel_pending_apply(&wrong)
+            .expect_err("Runtime Apply cancellation should authenticate")
+            .kind,
+        CoreRuntimeErrorKind::Authentication
+    );
 
     harness
         .service
@@ -1093,6 +1333,163 @@ fn every_core_request_requires_the_exact_session_proof_and_revoke_cleans_up() {
             .kind,
         CoreRuntimeErrorKind::Authentication
     );
+    assert_eq!(
+        harness
+            .service
+            .cancel_pending_apply(&session.proof)
+            .expect_err("the revoked proof must not retain cancellation authority")
+            .kind,
+        CoreRuntimeErrorKind::Authentication
+    );
+}
+
+#[test]
+fn runtime_apply_cancellation_is_terminal_for_one_owner_and_resets_for_the_next() {
+    let harness = Harness::new();
+    let first = harness.open();
+
+    harness
+        .service
+        .cancel_pending_apply(&first.proof)
+        .expect("the current owner should cancel Runtime Apply");
+    let cancelled = harness
+        .service
+        .apply_candidate(&first.proof, &harness.bundle(1))
+        .expect_err("the current owner cancellation should remain terminal");
+    assert_eq!(cancelled.kind, CoreRuntimeErrorKind::ReloadTimeout);
+    assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 0);
+
+    harness
+        .service
+        .close_owner_session(&first.proof)
+        .expect("the cancelled owner should close");
+    let second = harness
+        .service
+        .open_owner_session(&harness.request(200, "supervisor-200", "instance-200"))
+        .expect("the next owner should open with fresh cancellation state");
+    harness
+        .service
+        .apply_candidate(&second.proof, &harness.bundle(2))
+        .expect("the next owner should apply successfully");
+    assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn delayed_old_owner_cancellation_cannot_poison_the_next_owner() {
+    let harness = Harness::new();
+    let first = harness.open();
+    harness.processes.pause_next_cancellation();
+
+    std::thread::scope(|scope| {
+        let cancellation = scope.spawn(|| harness.service.cancel_pending_apply(&first.proof));
+        harness.processes.cancellation_pause.wait_until_entered();
+
+        harness
+            .service
+            .close_owner_session(&first.proof)
+            .expect("the first owner should close while its cancellation is delayed");
+        let second = harness
+            .service
+            .open_owner_session(&harness.request(200, "supervisor-200", "instance-200"))
+            .expect("the next owner should open with a fresh cancellation epoch");
+
+        harness.processes.cancellation_pause.release();
+        cancellation
+            .join()
+            .expect("the delayed cancellation worker should finish")
+            .expect("the old owner cancellation was authenticated before close");
+
+        harness
+            .service
+            .apply_candidate(&second.proof, &harness.bundle(1))
+            .expect("the old owner cancellation must not affect the next owner");
+    });
+}
+
+#[test]
+fn cancelling_blocked_service_readiness_releases_owner_cleanup_promptly() {
+    let harness = Harness::new();
+    let session = harness.open();
+    harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect("the initial Core should spawn");
+    harness.processes.block_readiness_until_cancelled();
+    let candidate = harness.bundle(2);
+
+    std::thread::scope(|scope| {
+        let apply = scope.spawn(|| harness.service.apply_candidate(&session.proof, &candidate));
+        harness.processes.wait_for_blocked_readiness();
+        let started = Instant::now();
+
+        harness
+            .service
+            .cancel_pending_apply(&session.proof)
+            .expect("the blocked Runtime Apply should accept cancellation");
+        let error = apply
+            .join()
+            .expect("the Runtime Apply worker should finish")
+            .expect_err("the blocked Runtime Apply should be indeterminate");
+        assert_eq!(error.kind, CoreRuntimeErrorKind::ReloadTimeout);
+        assert!(started.elapsed() < Duration::from_millis(200));
+
+        let retry = harness
+            .service
+            .apply_candidate(&session.proof, &harness.bundle(3))
+            .expect_err("the owner-scoped cancellation should remain terminal");
+        assert_eq!(retry.kind, CoreRuntimeErrorKind::ReloadTimeout);
+        assert_eq!(harness.processes.reload_count.load(Ordering::Relaxed), 1);
+
+        let close_started = Instant::now();
+        harness
+            .service
+            .close_owner_session(&session.proof)
+            .expect("owner cleanup should stop the Managed Core");
+        assert!(close_started.elapsed() < Duration::from_millis(200));
+    });
+
+    assert_eq!(harness.processes.stop_count.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn cancelled_initial_spawn_retains_cleanup_authority_after_a_stop_failure() {
+    let harness = Harness::new();
+    let session = harness.open();
+    harness.processes.block_readiness_until_cancelled();
+    harness
+        .processes
+        .fail_next_stop(ServicePlatformErrorKind::Stop);
+    let candidate = harness.bundle(1);
+
+    std::thread::scope(|scope| {
+        let apply = scope.spawn(|| harness.service.apply_candidate(&session.proof, &candidate));
+        harness.processes.wait_for_blocked_readiness();
+        harness
+            .service
+            .cancel_pending_apply(&session.proof)
+            .expect("the initial Runtime Apply should accept cancellation");
+
+        let error = apply
+            .join()
+            .expect("the cancelled Runtime Apply worker should finish")
+            .expect_err("the failed cleanup should fail the Runtime Apply");
+        assert_eq!(error.kind, CoreRuntimeErrorKind::Unavailable);
+    });
+
+    let status = harness
+        .service
+        .status(&session.proof)
+        .expect("cleanup-pending status should remain observable");
+    assert_eq!(status.lifecycle, CoreRuntimeLifecycle::Degraded);
+    assert_eq!(status.managed_core, None);
+    assert_eq!(harness.processes.live_process_count(), 1);
+
+    harness
+        .service
+        .close_owner_session(&session.proof)
+        .expect("owner cleanup should retry the exact uncommitted Core");
+    assert_eq!(harness.processes.stop_count.load(Ordering::Relaxed), 2);
+    assert_eq!(harness.processes.live_process_count(), 0);
 }
 
 #[test]
@@ -1603,6 +2000,87 @@ fn owner_cleanup_preserves_a_replacement_endpoint() {
     drop(replacement);
 }
 
+#[cfg(unix)]
+#[test]
+fn readiness_failure_removes_an_endpoint_bound_after_spawn() {
+    let harness = Harness::new();
+    let session = harness.open();
+    let endpoint = session.endpoint.socket_path.clone();
+    harness.processes.bind_endpoint_during_next_readiness();
+    harness
+        .processes
+        .fail_readiness(ServicePlatformErrorKind::Readiness);
+
+    harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect_err("readiness failure should reject the Core candidate");
+
+    assert!(!endpoint.exists());
+    assert_eq!(harness.processes.live_process_count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn pending_cleanup_preserves_a_replacement_for_a_late_bound_endpoint() {
+    let harness = Harness::new();
+    let session = harness.open();
+    let endpoint = session.endpoint.socket_path.clone();
+    harness.processes.bind_endpoint_during_next_readiness();
+    harness
+        .processes
+        .fail_readiness(ServicePlatformErrorKind::Readiness);
+    harness
+        .processes
+        .fail_next_stop(ServicePlatformErrorKind::Stop);
+
+    let error = harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect_err("failed candidate cleanup should remain pending");
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Unavailable);
+    assert!(endpoint.exists());
+
+    fs::remove_file(&endpoint).expect("the candidate endpoint should be removed");
+    let replacement = UnixListener::bind(&endpoint).expect("the replacement endpoint should bind");
+    harness
+        .service
+        .close_owner_session(&session.proof)
+        .expect("owner cleanup should stop the candidate and preserve the replacement");
+
+    assert!(endpoint.exists());
+    assert_eq!(harness.processes.live_process_count(), 0);
+    drop(replacement);
+}
+
+#[cfg(unix)]
+#[test]
+fn pending_cleanup_retry_removes_the_late_bound_candidate_endpoint() {
+    let harness = Harness::new();
+    let session = harness.open();
+    let endpoint = session.endpoint.socket_path.clone();
+    harness.processes.bind_endpoint_during_next_readiness();
+    harness
+        .processes
+        .fail_readiness(ServicePlatformErrorKind::Readiness);
+    harness
+        .processes
+        .fail_next_stop(ServicePlatformErrorKind::Stop);
+
+    harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect_err("failed candidate cleanup should remain pending");
+    assert!(endpoint.exists());
+    harness
+        .service
+        .close_owner_session(&session.proof)
+        .expect("owner cleanup should retry the exact candidate");
+
+    assert!(!endpoint.exists());
+    assert_eq!(harness.processes.live_process_count(), 0);
+}
+
 #[test]
 fn service_shutdown_is_idempotent_and_clears_the_owner() {
     let harness = Harness::new();
@@ -1905,6 +2383,7 @@ fn bounded_log_forwarding_evicts_old_records_and_truncates_utf8_safely() {
         .expect("the first log batch should load");
     assert_eq!(first.records.len(), 2);
     assert_eq!(first.records[1].message, "secon");
+    assert_eq!(first.dropped_since_after, 0);
 
     harness
         .processes
@@ -1920,7 +2399,105 @@ fn bounded_log_forwarding_evicts_old_records_and_truncates_utf8_safely() {
     assert_eq!(second.records[0].message, "éé");
     assert_eq!(second.records[1].message, "fourt");
     assert_eq!(second.dropped_before, 5);
+    assert_eq!(second.dropped_since_after, 5);
     assert_eq!(second.next_sequence, Some(7));
+}
+
+#[test]
+fn sustained_log_polling_reports_only_caller_relative_loss() {
+    let harness = Harness::with_limits(3, 2, 64);
+    let session = harness.open();
+    harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect("the Core should spawn");
+    harness
+        .processes
+        .push_logs([process_log(1, "first"), process_log(2, "second")]);
+
+    let first = harness
+        .service
+        .logs(&session.proof, None, usize::MAX)
+        .expect("the initial log page should load");
+    assert_eq!(first.next_sequence, Some(2));
+    assert_eq!(first.dropped_since_after, 0);
+
+    harness.processes.push_logs([process_log(3, "third")]);
+    let second = harness
+        .service
+        .logs(&session.proof, first.next_sequence, usize::MAX)
+        .expect("the sustained log page should load");
+    assert_eq!(second.dropped_before, 1);
+    assert_eq!(second.dropped_since_after, 0);
+    assert_eq!(second.next_sequence, Some(3));
+    assert_eq!(second.records[0].message, "third");
+
+    harness.processes.drop_logs(2);
+    let dropped_only = harness
+        .service
+        .logs(&session.proof, second.next_sequence, usize::MAX)
+        .expect("the dropped-only page should load");
+    assert!(dropped_only.records.is_empty());
+    assert_eq!(dropped_only.dropped_since_after, 2);
+    assert_eq!(dropped_only.next_sequence, Some(5));
+
+    let recovered = harness
+        .service
+        .logs(&session.proof, dropped_only.next_sequence, usize::MAX)
+        .expect("the recovered cursor should load");
+    assert_eq!(recovered.dropped_since_after, 0);
+    assert_eq!(recovered.next_sequence, Some(5));
+}
+
+#[test]
+fn bounded_log_forwarding_evicts_by_aggregate_message_bytes() {
+    let retained_records = CORE_LOG_FORWARD_MAX_BYTES / CORE_LOG_LINE_MAX_BYTES;
+    let harness = Harness::with_limits(3, retained_records + 1, CORE_LOG_LINE_MAX_BYTES);
+    let session = harness.open();
+    harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect("the Core should spawn");
+    let message = "x".repeat(CORE_LOG_LINE_MAX_BYTES);
+    harness.processes.push_logs(
+        (0..=retained_records)
+            .map(|index| process_log(index as u64, &message))
+            .collect::<Vec<_>>(),
+    );
+
+    let mut after_sequence = None;
+    let mut records = Vec::new();
+    let mut dropped_before = 0;
+    loop {
+        let batch = harness
+            .service
+            .logs(&session.proof, after_sequence, usize::MAX)
+            .expect("the byte-bounded log page should load");
+        assert!(
+            batch
+                .records
+                .iter()
+                .map(|record| record.message.len())
+                .sum::<usize>()
+                <= CORE_LOG_FORWARD_BATCH_MAX_BYTES
+        );
+        dropped_before = dropped_before.max(batch.dropped_before);
+        if batch.records.is_empty() {
+            break;
+        }
+        after_sequence = batch.next_sequence;
+        records.extend(batch.records);
+    }
+
+    assert_eq!(records.len(), retained_records);
+    assert_eq!(dropped_before, 1);
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.message.len())
+            .sum::<usize>(),
+        CORE_LOG_FORWARD_MAX_BYTES
+    );
 }
 
 #[test]

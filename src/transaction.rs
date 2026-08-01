@@ -13,6 +13,7 @@ use crate::profile::{ActiveProfileRevision, ProfileRevision};
 use crate::runtime_bundle::{RuntimeGenerationPruneResult, RuntimeGenerationRetention};
 use std::fmt;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,6 +109,8 @@ pub trait RuntimeApplyPort: Send + Sync {
     fn status(&self, owner: &OwnerSessionProof) -> Result<CoreRuntimeStatus, CoreRuntimeError>;
 
     fn stop(&self, owner: &OwnerSessionProof) -> Result<(), CoreRuntimeError>;
+
+    fn cancel_pending_apply(&self) {}
 }
 
 pub type ApplyFailureClassifier = fn(&CoreRuntimeError) -> RuntimeApplyFailure;
@@ -141,6 +144,10 @@ impl RuntimeApplyPort for CoreRuntimeApplyAdapter {
 
     fn stop(&self, owner: &OwnerSessionProof) -> Result<(), CoreRuntimeError> {
         self.runtime.stop(owner).map(|_| ())
+    }
+
+    fn cancel_pending_apply(&self) {
+        self.runtime.cancel_pending_requests();
     }
 }
 
@@ -213,6 +220,7 @@ pub enum ConfigTransactionErrorKind {
     Commit,
     Cleanup,
     Recovery,
+    Shutdown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -279,6 +287,9 @@ impl fmt::Display for ConfigTransactionError {
                 "configuration transaction journal cleanup failed"
             }
             ConfigTransactionErrorKind::Recovery => "committed Runtime Generation recovery failed",
+            ConfigTransactionErrorKind::Shutdown => {
+                "configuration transaction was interrupted by Supervisor shutdown"
+            }
         })
     }
 }
@@ -318,6 +329,7 @@ pub struct ConfigTransactionCoordinator {
     revisions: Arc<dyn CandidateRevisionSource>,
     bundles: Arc<dyn RuntimeBundleResolver>,
     owner: OwnerSessionProof,
+    shutdown_requested: AtomicBool,
 }
 
 pub(crate) struct RuleConfigTransactionReservation<'a> {
@@ -354,7 +366,38 @@ impl ConfigTransactionCoordinator {
             revisions: dependencies.revisions,
             bundles: dependencies.bundles,
             owner,
+            shutdown_requested: AtomicBool::new(false),
         }
+    }
+
+    pub fn request_shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::Release);
+        self.validator.cancel_pending();
+        self.runtime.cancel_pending_apply();
+    }
+
+    fn shutdown_is_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Acquire)
+    }
+
+    fn shutdown_error(
+        &self,
+        candidate_generation: RuntimeGeneration,
+        committed_generation: Option<RuntimeGeneration>,
+        prepared: bool,
+    ) -> ConfigTransactionError {
+        ConfigTransactionError::new(
+            ConfigTransactionErrorKind::Shutdown,
+            Some(candidate_generation),
+            committed_generation,
+            if prepared {
+                RecoveryOutcome::Pending {
+                    target: committed_generation,
+                }
+            } else {
+                RecoveryOutcome::NotRequired
+            },
+        )
     }
 
     pub fn execute(
@@ -549,6 +592,9 @@ impl ConfigTransactionCoordinator {
         candidate: &ConfigTransactionCandidate,
         failure_recovery_mode: FailureRecoveryMode,
     ) -> Result<ConfigTransactionSuccess, ConfigTransactionError> {
+        if self.shutdown_is_requested() {
+            return Err(self.shutdown_error(candidate.runtime.generation, None, false));
+        }
         let mut initial_state = self.store.recover().map_err(|_| {
             ConfigTransactionError::new(
                 ConfigTransactionErrorKind::Recovery,
@@ -567,6 +613,13 @@ impl ConfigTransactionCoordinator {
                     RecoveryOutcome::Failed { target: None },
                 )
             })?;
+        if self.shutdown_is_requested() {
+            return Err(self.shutdown_error(
+                candidate.runtime.generation,
+                committed_generation,
+                false,
+            ));
+        }
         if let Some(prepared) = initial_state.prepared.as_ref()
             && initial_state
                 .committed
@@ -642,11 +695,25 @@ impl ConfigTransactionCoordinator {
             }
         };
 
-        if self
+        if self.shutdown_is_requested() {
+            return Err(self.shutdown_error(
+                candidate.runtime.generation,
+                committed_generation,
+                true,
+            ));
+        }
+
+        let validation = self
             .validator
-            .validate(&candidate.configuration, &candidate.runtime.generation_root)
-            .is_err()
-        {
+            .validate(&candidate.configuration, &candidate.runtime.generation_root);
+        if self.shutdown_is_requested() {
+            return Err(self.shutdown_error(
+                candidate.runtime.generation,
+                committed_generation,
+                true,
+            ));
+        }
+        if validation.is_err() {
             let recovery = self.clear_prepared_unapplied(&prepared, committed_generation);
             return Err(ConfigTransactionError::new(
                 ConfigTransactionErrorKind::Validation,
@@ -677,10 +744,25 @@ impl ConfigTransactionCoordinator {
             )
         })?;
 
-        let (applied, apply_path) = match self
+        if self.shutdown_is_requested() {
+            return Err(self.shutdown_error(
+                candidate.runtime.generation,
+                committed_generation,
+                true,
+            ));
+        }
+
+        let apply_result = self
             .runtime
-            .apply_candidate(&self.owner, &candidate.runtime)
-        {
+            .apply_candidate(&self.owner, &candidate.runtime);
+        if self.shutdown_is_requested() {
+            return Err(self.shutdown_error(
+                candidate.runtime.generation,
+                committed_generation,
+                true,
+            ));
+        }
+        let (applied, apply_path) = match apply_result {
             Ok(applied) => (applied, ApplyPath::Direct),
             Err(RuntimeApplyFailure::Definite) => {
                 let recovery = self.recover_failed_candidate(
@@ -741,21 +823,35 @@ impl ConfigTransactionCoordinator {
             }
         };
 
-        if apply_path == ApplyPath::Direct
-            && self
-                .confirm(&applied, candidate.runtime.generation)
-                .is_err()
-        {
-            let recovery = self.recover_failed_candidate(
-                &prepared,
+        if apply_path == ApplyPath::Direct {
+            let confirmation = self.confirm(&applied, candidate.runtime.generation);
+            if self.shutdown_is_requested() {
+                return Err(self.shutdown_error(
+                    candidate.runtime.generation,
+                    committed_generation,
+                    true,
+                ));
+            }
+            if confirmation.is_err() {
+                let recovery = self.recover_failed_candidate(
+                    &prepared,
+                    committed_generation,
+                    failure_recovery_mode,
+                );
+                return Err(ConfigTransactionError::new(
+                    ConfigTransactionErrorKind::Health,
+                    Some(candidate.runtime.generation),
+                    committed_generation,
+                    recovery,
+                ));
+            }
+        }
+
+        if self.shutdown_is_requested() {
+            return Err(self.shutdown_error(
+                candidate.runtime.generation,
                 committed_generation,
-                failure_recovery_mode,
-            );
-            return Err(ConfigTransactionError::new(
-                ConfigTransactionErrorKind::Health,
-                Some(candidate.runtime.generation),
-                committed_generation,
-                recovery,
+                true,
             ));
         }
 

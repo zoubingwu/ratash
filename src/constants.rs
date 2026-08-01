@@ -46,9 +46,18 @@ pub const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 pub const LOG_CAPACITY: usize = 10_000;
+pub const LOG_RETENTION_MAX_BYTES: usize = 32 * 1024 * 1024;
+pub const CORE_LOG_FORWARD_CAPACITY: usize = 256;
+pub const CORE_LOG_FORWARD_MAX_BYTES: usize = 4 * 1024 * 1024;
+pub const CORE_LOG_FORWARD_BATCH_MAX_BYTES: usize = 512 * 1024;
+pub const LOG_BROKER_RECOVERY_CAPACITY: usize = 256;
+pub const LOG_BROKER_RECOVERY_MAX_BYTES: usize = 4 * 1024 * 1024;
+pub const LOG_TAIL_MAX_RECORDS: usize = 256;
 pub const LOG_SUBSCRIBER_CAPACITY: usize = 256;
+pub const LOG_SUBSCRIBER_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const WRAPPER_DIAGNOSTIC_CAPACITY: usize = 256;
 pub const STATUS_SUBSCRIBER_CAPACITY: usize = 64;
+pub const IPC_STREAM_CAPACITY: usize = 3;
 pub const TRAFFIC_SERIES_CAPACITY: usize = 300;
 
 pub const PROFILE_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -57,6 +66,7 @@ pub const RULE_STRING_MAX_BYTES: usize = 16 * 1024;
 pub const LOCAL_RULE_SET_MAX_BYTES: usize = 32 * 1024 * 1024;
 pub const LOCAL_RULE_COUNT_MAX: usize = 20_000;
 pub const CORE_LOG_LINE_MAX_BYTES: usize = 64 * 1024;
+pub const LOG_TAIL_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const JSON_OUTPUT_MAX_BYTES: usize = 128 * 1024 * 1024;
 pub const IPC_FRAME_MAX_BYTES: usize = JSON_OUTPUT_MAX_BYTES + 4 * 1024 * 1024;
 pub const IPC_REQUEST_FRAME_MAX_BYTES: usize = 256 * 1024;
@@ -92,4 +102,14 @@ const _: () = {
         DAEMON_SHUTDOWN_TIMEOUT.as_millis()
             >= CORE_PROCESS_STOP_TIMEOUT.as_millis() + IPC_DEADLINE_LAYER_MARGIN.as_millis()
     );
+    assert!(LOG_BROKER_RECOVERY_CAPACITY < LOG_CAPACITY);
+    assert!(CORE_LOG_FORWARD_CAPACITY < LOG_CAPACITY);
+    assert!(LOG_TAIL_MAX_RECORDS <= LOG_BROKER_RECOVERY_CAPACITY);
+    assert!(CORE_LOG_LINE_MAX_BYTES <= CORE_LOG_FORWARD_MAX_BYTES);
+    assert!(CORE_LOG_LINE_MAX_BYTES <= CORE_LOG_FORWARD_BATCH_MAX_BYTES);
+    assert!(CORE_LOG_FORWARD_BATCH_MAX_BYTES <= CORE_LOG_FORWARD_MAX_BYTES);
+    assert!(CORE_LOG_FORWARD_MAX_BYTES <= LOG_RETENTION_MAX_BYTES);
+    assert!(LOG_BROKER_RECOVERY_MAX_BYTES <= LOG_RETENTION_MAX_BYTES);
+    assert!(LOG_TAIL_MAX_BYTES < IPC_FRAME_MAX_BYTES);
+    assert!(LOG_SUBSCRIBER_MAX_BYTES <= LOG_RETENTION_MAX_BYTES);
 };

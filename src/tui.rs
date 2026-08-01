@@ -22,8 +22,9 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Sparkli
 
 use crate::application::{LatencyFreshness, LatencyProbeStatus};
 use crate::constants::{
-    LOG_CAPACITY, MAX_ACTIVE_NODES, MINIMUM_TERMINAL_HEIGHT, MINIMUM_TERMINAL_WIDTH,
-    TRAFFIC_SERIES_CAPACITY, TUI_SEARCH_MAX_BYTES, TUI_SEARCH_MAX_CHARACTERS,
+    LOG_CAPACITY, LOG_RETENTION_MAX_BYTES, MAX_ACTIVE_NODES, MINIMUM_TERMINAL_HEIGHT,
+    MINIMUM_TERMINAL_WIDTH, TRAFFIC_SERIES_CAPACITY, TUI_SEARCH_MAX_BYTES,
+    TUI_SEARCH_MAX_CHARACTERS,
 };
 use crate::domain::{
     CoreDiagnosticCategory, NodeRecordId, ProfileId, ProxyGroupId, RuntimeApplyPhase,
@@ -304,6 +305,7 @@ pub struct LogsState {
     pub gap: bool,
     pub dropped_total: u64,
     pub evicted_total: u64,
+    pub retained_bytes: usize,
 }
 
 impl Default for LogsState {
@@ -321,6 +323,7 @@ impl Default for LogsState {
             gap: false,
             dropped_total: 0,
             evicted_total: 0,
+            retained_bytes: 0,
         }
     }
 }
@@ -509,16 +512,12 @@ impl AppState {
             .take(PROFILE_VIEW_CAPACITY)
             .collect();
         self.logs.records.clear();
-        let log_count = snapshot.logs.len();
-        self.logs.records.extend(
-            snapshot
-                .logs
-                .into_iter()
-                .skip(log_count.saturating_sub(LOG_CAPACITY)),
-        );
-        self.logs.dropped_total = snapshot.dropped_logs;
-        self.logs.evicted_total = 0;
+        self.logs.retained_bytes = 0;
+        self.logs.dropped_total = self.logs.dropped_total.max(snapshot.dropped_logs);
         self.logs.gap = false;
+        for record in snapshot.logs {
+            push_view_log(&mut self.logs, record);
+        }
         self.status = Some(snapshot.status);
         self.proxies.selected_group = self.proxies.rows.first().map(|row| row.group.clone());
         self.proxies.group_cursor = self
@@ -921,14 +920,10 @@ pub fn update(state: &mut AppState, event: UiEvent) -> Vec<Command> {
         } => {
             if connection_generation == state.connection.generation && !state.logs.paused {
                 for record in records {
-                    if state.logs.records.len() == LOG_CAPACITY {
-                        state.logs.records.pop_front();
-                        state.logs.evicted_total = state.logs.evicted_total.saturating_add(1);
-                    }
-                    state.logs.records.push_back(record);
+                    push_view_log(&mut state.logs, record);
                 }
                 state.logs.gap |= gap;
-                state.logs.dropped_total = dropped_total;
+                state.logs.dropped_total = state.logs.dropped_total.max(dropped_total);
                 if state.logs.follow {
                     state.logs.scroll = 0;
                 }
@@ -1459,6 +1454,26 @@ fn moved_index(index: usize, length: usize, delta: isize) -> usize {
     } else {
         index.saturating_add(delta as usize).min(length - 1)
     }
+}
+
+fn push_view_log(logs: &mut LogsState, mut record: ViewLogRecord) {
+    record.message = record.message.into_boxed_str().into_string();
+    while logs.records.len() == LOG_CAPACITY
+        || logs.retained_bytes.saturating_add(record.message.len()) > LOG_RETENTION_MAX_BYTES
+    {
+        let Some(evicted) = logs.records.pop_front() else {
+            break;
+        };
+        logs.retained_bytes = logs.retained_bytes.saturating_sub(evicted.message.len());
+        logs.evicted_total = logs.evicted_total.saturating_add(1);
+    }
+    if logs.retained_bytes.saturating_add(record.message.len()) > LOG_RETENTION_MAX_BYTES {
+        logs.evicted_total = logs.evicted_total.saturating_add(1);
+        logs.gap = true;
+        return;
+    }
+    logs.retained_bytes = logs.retained_bytes.saturating_add(record.message.len());
+    logs.records.push_back(record);
 }
 
 fn push_bounded(values: &mut VecDeque<u64>, value: u64, capacity: usize) {

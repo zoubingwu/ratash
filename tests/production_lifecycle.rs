@@ -160,6 +160,7 @@ impl CoreRuntime for LifecycleRuntime {
             records: Vec::new(),
             next_sequence: None,
             dropped_before: 0,
+            dropped_since_after: 0,
         })
     }
 

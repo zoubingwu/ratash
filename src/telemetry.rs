@@ -1,7 +1,11 @@
 use std::collections::VecDeque;
 use std::fmt;
 
+use crate::constants::{LOG_RETENTION_MAX_BYTES, LOG_TAIL_MAX_BYTES, LOG_TAIL_MAX_RECORDS};
 use crate::domain::{CoreInstanceGeneration, TrafficSample};
+
+const LOG_TAIL_ENVELOPE_MAX_BYTES: usize = 512;
+const LOG_RECORD_FIXED_MAX_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogLevel {
@@ -24,7 +28,7 @@ pub struct CoreLogRecord {
     timestamp_unix_ms: u64,
     level: LogLevel,
     source: LogSource,
-    message: String,
+    message: Box<str>,
 }
 
 impl CoreLogRecord {
@@ -41,7 +45,7 @@ impl CoreLogRecord {
             timestamp_unix_ms,
             level,
             source,
-            message: message.into(),
+            message: message.into().into_boxed_str(),
         }
     }
 
@@ -99,6 +103,7 @@ pub struct LogTail {
     pub gap: bool,
     pub earliest_sequence: Option<u64>,
     pub latest_sequence: Option<u64>,
+    pub sequence_horizon: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -128,6 +133,7 @@ pub struct LogBuffer {
     max_line_bytes: usize,
     next_sequence: u64,
     dropped_total: u64,
+    retained_bytes: usize,
     records: VecDeque<CoreLogRecord>,
 }
 
@@ -141,6 +147,7 @@ impl LogBuffer {
             max_line_bytes,
             next_sequence: 1,
             dropped_total: 0,
+            retained_bytes: 0,
             records: VecDeque::with_capacity(capacity),
         })
     }
@@ -158,15 +165,26 @@ impl LogBuffer {
                 limit: self.max_line_bytes,
             });
         }
+        if message.len() > LOG_RETENTION_MAX_BYTES {
+            return Err(TelemetryError::LogLineTooLarge {
+                limit: LOG_RETENTION_MAX_BYTES,
+            });
+        }
         let sequence = self.next_sequence;
         self.next_sequence = self
             .next_sequence
             .checked_add(1)
             .ok_or(TelemetryError::SequenceExhausted)?;
-        if self.records.len() == self.capacity {
-            self.records.pop_front();
+        while self.records.len() == self.capacity
+            || self.retained_bytes.saturating_add(message.len()) > LOG_RETENTION_MAX_BYTES
+        {
+            let Some(dropped) = self.records.pop_front() else {
+                break;
+            };
+            self.retained_bytes = self.retained_bytes.saturating_sub(dropped.message().len());
             self.dropped_total = self.dropped_total.saturating_add(1);
         }
+        self.retained_bytes = self.retained_bytes.saturating_add(message.len());
         self.records.push_back(CoreLogRecord::new(
             sequence,
             timestamp_unix_ms,
@@ -210,28 +228,60 @@ impl LogBuffer {
     }
 
     #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    #[must_use]
     pub fn records(&self) -> Vec<CoreLogRecord> {
         self.records.iter().cloned().collect()
     }
 
     #[must_use]
     pub fn tail_after(&self, after_sequence: Option<u64>) -> LogTail {
-        let earliest_sequence = self.records.front().map(CoreLogRecord::sequence);
+        let retained_earliest_sequence = self.records.front().map(CoreLogRecord::sequence);
         let latest_sequence = self.records.back().map(CoreLogRecord::sequence);
-        let records = self
+        let sequence_horizon = (self.next_sequence > 1).then(|| self.next_sequence - 1);
+        let mut records = Vec::with_capacity(LOG_TAIL_MAX_RECORDS.min(self.records.len()));
+        let mut delivery_bytes = LOG_TAIL_ENVELOPE_MAX_BYTES;
+        let mut truncated = false;
+        for record in self
             .records
             .iter()
+            .rev()
             .filter(|record| after_sequence.is_none_or(|after| record.sequence() > after))
-            .cloned()
-            .collect::<Vec<_>>();
-        let gap = after_sequence
-            .is_some_and(|after| sequence_has_gap(after, &records, self.next_sequence));
+        {
+            let record_bytes = encoded_record_upper_bound(record);
+            if records.len() == LOG_TAIL_MAX_RECORDS
+                || delivery_bytes.saturating_add(record_bytes) > LOG_TAIL_MAX_BYTES
+            {
+                truncated = true;
+                break;
+            }
+            delivery_bytes = delivery_bytes.saturating_add(record_bytes);
+            records.push(record.clone());
+        }
+        records.reverse();
+        let gap = truncated
+            || after_sequence.map_or_else(
+                || self.dropped_total > 0 || records_have_gap(&records),
+                |after| sequence_has_gap(after, &records, self.next_sequence),
+            );
+        let earliest_sequence = if truncated {
+            records
+                .first()
+                .map(CoreLogRecord::sequence)
+                .or(retained_earliest_sequence)
+        } else {
+            retained_earliest_sequence
+        };
         LogTail {
             records,
             dropped_total: self.dropped_total,
             gap,
             earliest_sequence,
             latest_sequence,
+            sequence_horizon,
         }
     }
 
@@ -368,6 +418,29 @@ impl TelemetryStore {
     pub fn connection_count(&self) -> Option<u64> {
         self.connection_count
     }
+}
+
+fn encoded_record_upper_bound(record: &CoreLogRecord) -> usize {
+    LOG_RECORD_FIXED_MAX_BYTES.saturating_add(encoded_json_string_bytes(record.message()))
+}
+
+fn encoded_json_string_bytes(value: &str) -> usize {
+    value.bytes().fold(2_usize, |encoded, byte| {
+        encoded.saturating_add(match byte {
+            b'"' | b'\\' | b'\x08' | b'\t' | b'\n' | b'\x0c' | b'\r' => 2,
+            0x00..=0x1f => 6,
+            _ => 1,
+        })
+    })
+}
+
+fn records_have_gap(records: &[CoreLogRecord]) -> bool {
+    records.windows(2).any(|window| {
+        window[0]
+            .sequence()
+            .checked_add(1)
+            .is_none_or(|expected| window[1].sequence() != expected)
+    })
 }
 
 fn sequence_has_gap(after: u64, records: &[CoreLogRecord], next_sequence: u64) -> bool {

@@ -9,6 +9,10 @@ use std::time::{Duration, Instant};
 use hopash::application::{
     ApplicationClient, ApplicationOperation, ApplicationOutput, ApplicationService,
 };
+use hopash::constants::{
+    CORE_LOG_LINE_MAX_BYTES, LOG_BROKER_RECOVERY_CAPACITY, LOG_BROKER_RECOVERY_MAX_BYTES,
+    LOG_CAPACITY, LOG_TAIL_MAX_BYTES, LOG_TAIL_MAX_RECORDS,
+};
 use hopash::error::ErrorCode;
 use hopash::ipc::{
     IpcRequest, IpcStreamFrame, IpcStreamPayload, LogStreamItem, RequestId, bind_private_listener,
@@ -89,6 +93,48 @@ fn log_record(sequence: u64, message: &str) -> CoreLogRecord {
         LogSource::CoreApi,
         message,
     )
+}
+
+#[test]
+fn default_broker_bounds_recovery_storage_and_encoded_tails_at_release_scale() {
+    let socket = TempSocket::new("bounded-log-tail");
+    let streams = Arc::new(
+        IpcStreamBroker::new(10, 100, ApplicationService::new().status())
+            .expect("fixture stream broker should be valid"),
+    );
+    let message = "x".repeat(CORE_LOG_LINE_MAX_BYTES);
+    for sequence in 1..=u64::try_from(LOG_CAPACITY).expect("release capacity should fit") {
+        streams
+            .publish_log(log_record(sequence, &message))
+            .expect("maximum-size fixture log should publish");
+    }
+    let mut server = start_server(&socket, streams);
+    let client = IpcClient::new(socket.path());
+
+    let tail = client
+        .log_tail(None)
+        .expect("bounded recovery tail should load");
+    let encoded = serde_json::to_vec(&tail).expect("bounded recovery tail should encode");
+
+    assert!(tail.gap);
+    assert!(tail.records.len() <= LOG_TAIL_MAX_RECORDS);
+    assert!(tail.records.len() <= LOG_BROKER_RECOVERY_CAPACITY);
+    assert!(encoded.len() <= LOG_TAIL_MAX_BYTES);
+    assert_eq!(
+        tail.latest_sequence,
+        Some(u64::try_from(LOG_CAPACITY).expect("release capacity should fit"))
+    );
+    assert_eq!(
+        tail.dropped_total,
+        u64::try_from(
+            LOG_CAPACITY
+                - (LOG_BROKER_RECOVERY_MAX_BYTES / CORE_LOG_LINE_MAX_BYTES)
+                    .min(LOG_BROKER_RECOVERY_CAPACITY)
+        )
+        .expect("drop count should fit")
+    );
+
+    server.shutdown().expect("server should stop cleanly");
 }
 
 #[test]
@@ -323,6 +369,7 @@ fn authoritative_log_tail_resynchronizes_broker_history_and_followers() {
             gap: true,
             earliest_sequence: Some(10),
             latest_sequence: Some(11),
+            sequence_horizon: Some(11),
         })
         .expect("the authoritative tail should replace broker history");
 
@@ -351,6 +398,214 @@ fn authoritative_log_tail_resynchronizes_broker_history_and_followers() {
     );
 
     drop(follower);
+    server.shutdown().expect("server should stop cleanly");
+}
+
+#[test]
+fn source_drop_without_a_new_record_preserves_broker_history_and_reports_the_gap() {
+    let socket = TempSocket::new("source-drop-without-record");
+    let streams = broker(8);
+    streams
+        .publish_log(log_record(1, "retained"))
+        .expect("the retained log should publish");
+    let mut server = start_server(&socket, Arc::clone(&streams));
+    let client = IpcClient::new(socket.path());
+    let mut follower = client
+        .follow_logs(Some(0), 19)
+        .expect("the live follower should connect");
+    assert!(matches!(
+        follower
+            .next_item()
+            .expect("the retained frame should be valid")
+            .expect("the retained frame should exist")
+            .item,
+        LogStreamItem::Record { record } if record.sequence == 1
+    ));
+    streams
+        .synchronize_log_tail(LogTail {
+            records: Vec::new(),
+            dropped_total: 3,
+            gap: true,
+            earliest_sequence: Some(1),
+            latest_sequence: Some(1),
+            sequence_horizon: Some(4),
+        })
+        .expect("the source gap should synchronize");
+
+    assert_eq!(
+        follower
+            .next_item()
+            .expect("the dropped-only gap frame should be valid")
+            .expect("the dropped-only gap frame should exist")
+            .item,
+        LogStreamItem::Gap {
+            after_sequence: Some(1),
+            latest_sequence: 4,
+        }
+    );
+
+    let tail = client
+        .log_tail(Some(1))
+        .expect("the retained tail should load");
+
+    assert!(tail.gap);
+    assert_eq!(tail.dropped_total, 3);
+    assert_eq!(tail.latest_sequence, Some(1));
+    assert_eq!(tail.sequence_horizon, Some(4));
+    assert!(tail.records.is_empty());
+
+    let mut late_follower = client
+        .follow_logs(Some(1), 20)
+        .expect("a late follower should connect at the stale cursor");
+    assert_eq!(
+        late_follower
+            .next_item()
+            .expect("the late dropped-only gap should be valid")
+            .expect("the late dropped-only gap should exist")
+            .item,
+        LogStreamItem::Gap {
+            after_sequence: Some(1),
+            latest_sequence: 4,
+        }
+    );
+
+    streams
+        .publish_log(log_record(5, "after-gap"))
+        .expect("the next record should follow the dropped horizon");
+    let mut recovered = client
+        .follow_logs(tail.sequence_horizon, 21)
+        .expect("the recovered follower should connect");
+    assert_eq!(
+        recovered
+            .next_item()
+            .expect("the recovered frame should be valid")
+            .expect("the recovered frame should exist")
+            .item,
+        LogStreamItem::Record {
+            record: (&log_record(5, "after-gap")).into(),
+        }
+    );
+    drop(follower);
+    drop(late_follower);
+    drop(recovered);
+    server.shutdown().expect("server should stop cleanly");
+}
+
+#[test]
+fn fresh_empty_log_tail_synchronizes_and_round_trips_without_a_horizon() {
+    let socket = TempSocket::new("fresh-empty-log-tail");
+    let streams = broker(8);
+    streams
+        .synchronize_log_tail(LogTail {
+            records: Vec::new(),
+            dropped_total: 0,
+            gap: false,
+            earliest_sequence: None,
+            latest_sequence: None,
+            sequence_horizon: None,
+        })
+        .expect("the fresh empty tail should synchronize");
+    let mut server = start_server(&socket, streams);
+    let client = IpcClient::new(socket.path());
+
+    let tail = client
+        .log_tail(None)
+        .expect("the fresh empty tail should round trip");
+
+    assert!(tail.records.is_empty());
+    assert_eq!(tail.latest_sequence, None);
+    assert_eq!(tail.sequence_horizon, None);
+    assert!(!tail.gap);
+    server.shutdown().expect("server should stop cleanly");
+}
+
+#[test]
+fn authoritative_synchronization_keeps_the_drop_counter_monotonic() {
+    let socket = TempSocket::new("monotonic-drop-counter");
+    let streams = broker(2);
+    for sequence in 1..=4 {
+        streams
+            .publish_log(log_record(sequence, "locally-retained"))
+            .expect("fixture logs should publish");
+    }
+    let mut server = start_server(&socket, Arc::clone(&streams));
+    let client = IpcClient::new(socket.path());
+    assert_eq!(
+        client
+            .log_tail(None)
+            .expect("the initial tail should load")
+            .dropped_total,
+        2
+    );
+
+    streams
+        .synchronize_log_tail(LogTail {
+            records: vec![log_record(4, "authoritative")],
+            dropped_total: 1,
+            gap: true,
+            earliest_sequence: Some(4),
+            latest_sequence: Some(4),
+            sequence_horizon: Some(4),
+        })
+        .expect("the authoritative tail should synchronize");
+    assert_eq!(
+        client
+            .log_tail(None)
+            .expect("the synchronized tail should load")
+            .dropped_total,
+        2
+    );
+
+    streams
+        .synchronize_log_tail(LogTail {
+            records: Vec::new(),
+            dropped_total: 0,
+            gap: true,
+            earliest_sequence: Some(4),
+            latest_sequence: Some(4),
+            sequence_horizon: Some(4),
+        })
+        .expect("an empty authoritative update should synchronize");
+    assert_eq!(
+        client
+            .log_tail(None)
+            .expect("the empty synchronized tail should load")
+            .dropped_total,
+        2
+    );
+    server.shutdown().expect("server should stop cleanly");
+}
+
+#[test]
+fn source_sequence_gaps_remain_visible_in_a_recovery_tail() {
+    let socket = TempSocket::new("source-sequence-gap");
+    let streams = broker(8);
+    streams
+        .synchronize_log_tail(LogTail {
+            records: vec![log_record(1, "before"), log_record(5, "after")],
+            dropped_total: 3,
+            gap: true,
+            earliest_sequence: Some(1),
+            latest_sequence: Some(5),
+            sequence_horizon: Some(5),
+        })
+        .expect("the discontinuous source tail should synchronize");
+    let mut server = start_server(&socket, streams);
+    let client = IpcClient::new(socket.path());
+
+    let tail = client
+        .log_tail(None)
+        .expect("the recovery tail should load");
+
+    assert!(tail.gap);
+    assert_eq!(tail.dropped_total, 3);
+    assert_eq!(
+        tail.records
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>(),
+        [1, 5]
+    );
     server.shutdown().expect("server should stop cleanly");
 }
 

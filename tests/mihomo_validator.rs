@@ -1,8 +1,9 @@
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hopash::config::{AuthoritativeConfig, ConfigCompiler, CoreConfigValidator};
 use hopash::profile::{ProfileSnapshot, SnapshotLimits};
@@ -120,6 +121,48 @@ fn validator_enforces_the_process_deadline_and_removes_sensitive_config() {
             .is_none(),
         "timed-out validation should remove temporary files"
     );
+}
+
+#[test]
+fn cancellation_terminates_a_stalled_validator_and_removes_sensitive_config() {
+    let directory = TestDirectory::new("cancel");
+    let binary = fixture_binary(
+        &directory.path,
+        "validator",
+        "#!/bin/sh\n: > \"$3/started\"\nexec /bin/sleep 30\n",
+    );
+    let staging = directory.path.join("staging");
+    fs::create_dir(&staging).expect("staging directory should be created");
+    let effective = effective_configuration(&staging, "DOMAIN,secret.example,DIRECT");
+    let validator = Arc::new(validator(&binary, Duration::from_secs(30)));
+    let worker_validator = Arc::clone(&validator);
+    let worker_staging = staging.clone();
+    let worker =
+        std::thread::spawn(move || worker_validator.validate_detailed(&effective, &worker_staging));
+    let started_marker = staging.join("started");
+    let startup_deadline = Instant::now() + Duration::from_secs(1);
+    while !started_marker.exists() {
+        assert!(
+            Instant::now() < startup_deadline,
+            "the fixture validator should start"
+        );
+        std::thread::yield_now();
+    }
+    let started = Instant::now();
+
+    CoreConfigValidator::cancel_pending(validator.as_ref());
+
+    let error = worker
+        .join()
+        .expect("the validator worker should finish")
+        .expect_err("the stalled validator should be cancelled");
+    assert_eq!(error.kind(), MihomoValidationErrorKind::Cancelled);
+    assert!(started.elapsed() < Duration::from_millis(200));
+    let entries = fs::read_dir(&staging)
+        .expect("staging directory should read")
+        .map(|entry| entry.expect("staging entry should load").file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(entries, ["started"]);
 }
 
 #[test]

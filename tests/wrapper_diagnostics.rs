@@ -2,7 +2,37 @@ use hopash::diagnostics::{
     WrapperDiagnosticCategory, WrapperDiagnosticContext, WrapperDiagnosticError,
     WrapperDiagnosticRing, WrapperDiagnosticState,
 };
-use hopash::domain::{CoreInstanceGeneration, RuntimeGeneration};
+use hopash::domain::{CoreInstanceGeneration, RuntimeGeneration, SupervisorHealthReason};
+
+#[test]
+fn supervisor_health_reasons_map_to_cause_scoped_categories() {
+    let cases = [
+        (
+            SupervisorHealthReason::RuntimeRecovery,
+            WrapperDiagnosticCategory::RuntimeRecovery,
+        ),
+        (
+            SupervisorHealthReason::SelectionCompensation,
+            WrapperDiagnosticCategory::SelectionCompensation,
+        ),
+        (
+            SupervisorHealthReason::ConfigurationProjection,
+            WrapperDiagnosticCategory::ConfigurationProjection,
+        ),
+        (
+            SupervisorHealthReason::ProbeScheduler,
+            WrapperDiagnosticCategory::ProbeScheduler,
+        ),
+        (
+            SupervisorHealthReason::SelectionRestoration,
+            WrapperDiagnosticCategory::SelectionRestoration,
+        ),
+    ];
+
+    for (reason, category) in cases {
+        assert_eq!(WrapperDiagnosticCategory::from(reason), category);
+    }
+}
 
 #[test]
 fn diagnostic_ring_evicts_oldest_records_and_reports_a_resync_gap() {

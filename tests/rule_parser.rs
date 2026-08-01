@@ -46,7 +46,7 @@ fn rule_string_preserves_the_complete_original_with_an_explicit_size_limit() {
 
 #[test]
 fn rule_string_size_limit_counts_utf8_bytes_at_the_exact_boundary() {
-    let original = "DOMAIN,例子.test,DIRECT";
+    let original = "DOMAIN,\u{4f8b}\u{5b50}.test,DIRECT";
 
     assert!(RuleString::new(original, original.len()).is_ok());
     assert_eq!(
@@ -632,7 +632,7 @@ fn rules_yaml_enforces_document_rule_count_and_per_rule_byte_limits() {
         })
     );
 
-    let unicode_rule = "DOMAIN,例子.test,DIRECT";
+    let unicode_rule = "DOMAIN,\u{4f8b}\u{5b50}.test,DIRECT";
     let unicode_yaml = format!("rules:\n- {unicode_rule}\n");
     let rule_limit = RuleSetLimits {
         max_rule_bytes: unicode_rule.len() - 1,

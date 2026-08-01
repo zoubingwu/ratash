@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 
-use crate::domain::{CoreInstanceGeneration, RuntimeGeneration};
+use crate::domain::{CoreInstanceGeneration, RuntimeGeneration, SupervisorHealthReason};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum WrapperDiagnosticCategory {
@@ -14,6 +14,18 @@ pub enum WrapperDiagnosticCategory {
     SelectionRestoration,
     TelemetryStream,
     CoreLifecycle,
+}
+
+impl From<SupervisorHealthReason> for WrapperDiagnosticCategory {
+    fn from(reason: SupervisorHealthReason) -> Self {
+        match reason {
+            SupervisorHealthReason::RuntimeRecovery => Self::RuntimeRecovery,
+            SupervisorHealthReason::SelectionCompensation => Self::SelectionCompensation,
+            SupervisorHealthReason::ConfigurationProjection => Self::ConfigurationProjection,
+            SupervisorHealthReason::ProbeScheduler => Self::ProbeScheduler,
+            SupervisorHealthReason::SelectionRestoration => Self::SelectionRestoration,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,6 +120,7 @@ impl WrapperDiagnosticRing {
             state,
             context,
         });
+        emit_structured_event(sequence, timestamp_unix_ms, category, state, context);
         self.next_sequence = following;
         Ok(sequence)
     }
@@ -174,5 +187,40 @@ impl WrapperDiagnosticRing {
     #[must_use]
     pub fn evicted_total(&self) -> u64 {
         self.evicted_total
+    }
+}
+
+fn emit_structured_event(
+    sequence: u64,
+    timestamp_unix_ms: u64,
+    category: WrapperDiagnosticCategory,
+    state: WrapperDiagnosticState,
+    context: WrapperDiagnosticContext,
+) {
+    let runtime_generation = context.runtime_generation.map(|generation| generation.0);
+    let core_generation = context.core_generation.map(|generation| generation.0);
+    match state {
+        WrapperDiagnosticState::Raised => tracing::warn!(
+            target: "hopash::wrapper",
+            sequence,
+            timestamp_unix_ms,
+            category = ?category,
+            state = ?state,
+            runtime_generation,
+            core_generation,
+            revision = context.revision,
+            "Wrapper diagnostic state changed"
+        ),
+        WrapperDiagnosticState::Cleared => tracing::info!(
+            target: "hopash::wrapper",
+            sequence,
+            timestamp_unix_ms,
+            category = ?category,
+            state = ?state,
+            runtime_generation,
+            core_generation,
+            revision = context.revision,
+            "Wrapper diagnostic state changed"
+        ),
     }
 }

@@ -1,7 +1,8 @@
 use crate::constants::{
+    CORE_LOG_FORWARD_BATCH_MAX_BYTES, CORE_LOG_FORWARD_CAPACITY, CORE_LOG_FORWARD_MAX_BYTES,
     CORE_LOG_LINE_MAX_BYTES, CORE_RESTART_INITIAL_BACKOFF, CORE_RESTART_LIMIT,
     CORE_RESTART_MAX_BACKOFF, CORE_SERVICE_LIVENESS_INTERVAL, EFFECTIVE_CONFIGURATION_MAX_BYTES,
-    LOG_CAPACITY, MIHOMO_BINARY_MAX_BYTES, PROFILE_RESPONSE_MAX_BYTES,
+    MIHOMO_BINARY_MAX_BYTES, PROFILE_RESPONSE_MAX_BYTES,
 };
 use crate::core::{
     ApplyCandidateResult, ApplyDisposition, CoreControlEndpoint, CoreRuntime,
@@ -110,6 +111,7 @@ pub enum ServicePlatformErrorKind {
     Spawn,
     Reload,
     ReloadTimeout,
+    ApplyCancelled,
     Stop,
     Readiness,
     ReadinessTimeout,
@@ -272,6 +274,12 @@ pub trait CoreProcessController: Send + Sync {
         process: &OwnedProcessIdentity,
         limit: usize,
     ) -> Result<CoreProcessLogBatch, ServicePlatformError>;
+
+    /// Replaces the in-memory cancellation epoch without waiting for process I/O.
+    fn reset_apply_cancellation(&self, _owner_generation: u64) {}
+
+    /// Cancels matching in-memory work without joining or waiting for process I/O.
+    fn cancel_pending_apply(&self, _owner_generation: u64) {}
 }
 
 pub struct PrivilegedServiceConfig {
@@ -297,7 +305,7 @@ impl PrivilegedServiceConfig {
             compiler_policy_sha256,
             mihomo_binary_sha256,
             restart_limit: CORE_RESTART_LIMIT,
-            log_capacity: LOG_CAPACITY,
+            log_capacity: CORE_LOG_FORWARD_CAPACITY,
             max_log_line_bytes: CORE_LOG_LINE_MAX_BYTES,
         }
     }
@@ -402,6 +410,37 @@ struct ManagedCoreRecord {
 }
 
 #[derive(Clone)]
+enum OwnedCoreState {
+    Active(ManagedCoreRecord),
+    CleanupPending(ManagedCoreRecord),
+}
+
+impl OwnedCoreState {
+    fn active(&self) -> Option<&ManagedCoreRecord> {
+        match self {
+            Self::Active(record) => Some(record),
+            Self::CleanupPending(_) => None,
+        }
+    }
+
+    fn record(&self) -> &ManagedCoreRecord {
+        match self {
+            Self::Active(record) | Self::CleanupPending(record) => record,
+        }
+    }
+
+    fn record_mut(&mut self) -> &mut ManagedCoreRecord {
+        match self {
+            Self::Active(record) | Self::CleanupPending(record) => record,
+        }
+    }
+
+    fn is_cleanup_pending(&self) -> bool {
+        matches!(self, Self::CleanupPending(_))
+    }
+}
+
+#[derive(Clone)]
 struct OwnedEndpointIdentity {
     device: u64,
     inode: u64,
@@ -411,7 +450,7 @@ struct ServiceState {
     owner_generation: u64,
     owner: Option<ServiceOwner>,
     core_instance_generation: u64,
-    managed_core: Option<ManagedCoreRecord>,
+    managed_core: Option<OwnedCoreState>,
     last_bundle: Option<RuntimeBundle>,
     degraded: bool,
     consecutive_restart_failures: usize,
@@ -420,8 +459,15 @@ struct ServiceState {
     restart_backoff: Option<Duration>,
     next_liveness_at: Option<Duration>,
     logs: VecDeque<ForwardedCoreLog>,
+    log_bytes: usize,
     next_log_sequence: u64,
     dropped_log_sequence: u64,
+}
+
+struct ApplyCancellationState {
+    owner: Option<OwnerSessionProof>,
+    owner_generation: Option<u64>,
+    requested: bool,
 }
 
 /// Implements the privileged side of the CoreRuntime boundary.
@@ -440,6 +486,7 @@ pub struct PrivilegedCoreRuntimeService {
     max_log_line_bytes: usize,
     dependencies: PrivilegedServiceDependencies,
     generation_state_commit_fault: Mutex<Option<ServiceGenerationStateCommitFault>>,
+    apply_cancellation: Mutex<ApplyCancellationState>,
     state: Mutex<ServiceState>,
 }
 
@@ -478,6 +525,11 @@ impl PrivilegedCoreRuntimeService {
             max_log_line_bytes: config.max_log_line_bytes,
             dependencies,
             generation_state_commit_fault: Mutex::new(None),
+            apply_cancellation: Mutex::new(ApplyCancellationState {
+                owner: None,
+                owner_generation: None,
+                requested: false,
+            }),
             state: Mutex::new(ServiceState {
                 owner_generation: generation_state.owner_generation,
                 owner: None,
@@ -491,6 +543,7 @@ impl PrivilegedCoreRuntimeService {
                 restart_backoff: None,
                 next_liveness_at: None,
                 logs: VecDeque::with_capacity(config.log_capacity),
+                log_bytes: 0,
                 next_log_sequence: 1,
                 dropped_log_sequence: 0,
             }),
@@ -524,6 +577,7 @@ impl PrivilegedCoreRuntimeService {
             managed_core: state
                 .managed_core
                 .as_ref()
+                .and_then(OwnedCoreState::active)
                 .map(|record| record.handle.clone()),
             consecutive_restart_failures: state.consecutive_restart_failures,
             diagnostic: state.diagnostic,
@@ -582,6 +636,15 @@ impl PrivilegedCoreRuntimeService {
             state.next_liveness_at = Some(deadline_after(now, CORE_SERVICE_LIVENESS_INTERVAL));
         }
 
+        if (restart_is_due || liveness_is_due)
+            && state
+                .managed_core
+                .as_ref()
+                .is_some_and(OwnedCoreState::is_cleanup_pending)
+        {
+            self.cleanup_pending_core(&mut state)?;
+        }
+
         if restart_is_due && !state.degraded {
             let outcome = self.attempt_owned_core_restart(&mut state, &owner, now)?;
             return Ok(maintenance_result(
@@ -592,7 +655,7 @@ impl PrivilegedCoreRuntimeService {
 
         if liveness_is_due
             && !state.degraded
-            && let Some(record) = state.managed_core.clone()
+            && let Some(OwnedCoreState::Active(record)) = state.managed_core.clone()
             && !self.owned_process_is_live(&record.owned_identity)?
         {
             self.drain_logs(&mut state, &record)?;
@@ -638,12 +701,21 @@ impl PrivilegedCoreRuntimeService {
     ) -> Result<UnexpectedExitOutcome, CoreRuntimeError> {
         let mut state = self.lock_state()?;
         authenticated_owner(&state, proof)?;
-        let record = state.managed_core.clone().ok_or_else(|| {
-            service_error(
-                CoreRuntimeErrorKind::ProcessIdentityMismatch,
-                "unexpected exit has no owned Core",
-            )
-        })?;
+        let record = match state.managed_core.clone() {
+            Some(OwnedCoreState::Active(record)) => record,
+            Some(OwnedCoreState::CleanupPending(_)) => {
+                return Err(service_error(
+                    CoreRuntimeErrorKind::Unavailable,
+                    "uncommitted Core cleanup is pending",
+                ));
+            }
+            None => {
+                return Err(service_error(
+                    CoreRuntimeErrorKind::ProcessIdentityMismatch,
+                    "unexpected exit has no owned Core",
+                ));
+            }
+        };
         if record.owned_identity.pid != exited.pid
             || record.owned_identity.process_start_identity != exited.process_start_identity
             || record.owned_identity.instance_generation != exited.instance_generation
@@ -672,6 +744,78 @@ impl PrivilegedCoreRuntimeService {
                 "service state lock unavailable",
             )
         })
+    }
+
+    fn reset_apply_cancellation(
+        &self,
+        owner: &OwnerSessionProof,
+        owner_generation: u64,
+    ) -> Result<(), CoreRuntimeError> {
+        let mut cancellation = self.apply_cancellation.lock().map_err(|_| {
+            service_error(
+                CoreRuntimeErrorKind::Unavailable,
+                "Runtime Apply cancellation state is unavailable",
+            )
+        })?;
+        cancellation.owner = Some(owner.clone());
+        cancellation.owner_generation = Some(owner_generation);
+        cancellation.requested = false;
+        drop(cancellation);
+        self.dependencies
+            .processes
+            .reset_apply_cancellation(owner_generation);
+        Ok(())
+    }
+
+    fn clear_apply_cancellation(&self, owner: &ServiceOwner) -> Result<(), CoreRuntimeError> {
+        let mut cancellation = self.apply_cancellation.lock().map_err(|_| {
+            service_error(
+                CoreRuntimeErrorKind::Unavailable,
+                "Runtime Apply cancellation state is unavailable",
+            )
+        })?;
+        if cancellation.owner.as_ref() != Some(&owner.proof)
+            || cancellation.owner_generation != Some(owner.generation)
+        {
+            return Err(service_error(
+                CoreRuntimeErrorKind::Authentication,
+                "Runtime Apply cancellation owner mismatch",
+            ));
+        }
+        cancellation.owner = None;
+        cancellation.owner_generation = None;
+        cancellation.requested = true;
+        Ok(())
+    }
+
+    fn ensure_apply_active(&self, owner: &OwnerSessionProof) -> Result<(), CoreRuntimeError> {
+        self.active_apply_guard(owner).map(drop)
+    }
+
+    fn active_apply_guard(
+        &self,
+        owner: &OwnerSessionProof,
+    ) -> Result<std::sync::MutexGuard<'_, ApplyCancellationState>, CoreRuntimeError> {
+        let cancellation = self.apply_cancellation.lock().map_err(|_| {
+            service_error(
+                CoreRuntimeErrorKind::Unavailable,
+                "Runtime Apply cancellation state is unavailable",
+            )
+        })?;
+        if cancellation.owner.as_ref() != Some(owner) {
+            return Err(service_error(
+                CoreRuntimeErrorKind::Authentication,
+                "Runtime Apply cancellation owner mismatch",
+            ));
+        }
+        if cancellation.requested {
+            Err(service_error(
+                CoreRuntimeErrorKind::ReloadTimeout,
+                "Runtime Apply was cancelled during Supervisor shutdown",
+            ))
+        } else {
+            Ok(cancellation)
+        }
     }
 
     fn reserve_owner_generation(&self, state: &mut ServiceState) -> Result<u64, CoreRuntimeError> {
@@ -761,15 +905,11 @@ impl PrivilegedCoreRuntimeService {
     }
 
     fn cleanup_owner(&self, state: &mut ServiceState) -> Result<(), CoreRuntimeError> {
-        if let Some(record) = state.managed_core.clone() {
-            if self.owned_process_is_live(&record.owned_identity)? {
-                self.dependencies
-                    .processes
-                    .stop(&record.owned_identity)
-                    .map_err(map_stop_error)?;
-            }
-            self.drain_logs(state, &record)?;
-            self.remove_owned_endpoint(&record)?;
+        if let Some(core) = state.managed_core.clone() {
+            self.stop_owned_record(state, core.record().clone())?;
+        }
+        if let Some(owner) = state.owner.as_ref() {
+            self.clear_apply_cancellation(owner)?;
         }
         state.managed_core = None;
         state.owner = None;
@@ -777,8 +917,59 @@ impl PrivilegedCoreRuntimeService {
         reset_restart_state(state);
         state.next_liveness_at = None;
         state.logs.clear();
-        state.dropped_log_sequence = state.next_log_sequence.saturating_sub(1);
+        state.log_bytes = 0;
+        state.next_log_sequence = 1;
+        state.dropped_log_sequence = 0;
         Ok(())
+    }
+
+    fn stop_owned_record(
+        &self,
+        state: &mut ServiceState,
+        mut record: ManagedCoreRecord,
+    ) -> Result<(), CoreRuntimeError> {
+        if record.endpoint_identity.is_none() {
+            record.endpoint_identity =
+                capture_endpoint_identity(&record.handle.endpoint.socket_path);
+            if let Some(retained) = state.managed_core.as_mut()
+                && retained.record().owned_identity == record.owned_identity
+            {
+                retained.record_mut().endpoint_identity = record.endpoint_identity.clone();
+            }
+        }
+        if self.owned_process_is_live(&record.owned_identity)? {
+            self.dependencies
+                .processes
+                .stop(&record.owned_identity)
+                .map_err(map_stop_error)?;
+        }
+        self.drain_logs(state, &record)?;
+        self.remove_owned_endpoint(&record)
+    }
+
+    fn cleanup_pending_core(&self, state: &mut ServiceState) -> Result<(), CoreRuntimeError> {
+        let Some(OwnedCoreState::CleanupPending(record)) = state.managed_core.clone() else {
+            return Ok(());
+        };
+        self.stop_owned_record(state, record)?;
+        state.managed_core = None;
+        Ok(())
+    }
+
+    fn fail_after_uncommitted_spawn(
+        &self,
+        state: &mut ServiceState,
+        record: ManagedCoreRecord,
+        primary: CoreRuntimeError,
+    ) -> CoreRuntimeError {
+        state.managed_core = Some(OwnedCoreState::CleanupPending(record));
+        match self.cleanup_pending_core(state) {
+            Ok(()) => primary,
+            Err(_) => service_error(
+                CoreRuntimeErrorKind::Unavailable,
+                "uncommitted Core cleanup is pending",
+            ),
+        }
     }
 
     fn attempt_owned_core_restart(
@@ -806,13 +997,17 @@ impl PrivilegedCoreRuntimeService {
                 self.spawn_verified(state, owner, &verified)
             });
         if let Err(error) = &restarted
-            && error.kind == CoreRuntimeErrorKind::InvalidBundle
+            && (error.kind == CoreRuntimeErrorKind::InvalidBundle
+                || state
+                    .managed_core
+                    .as_ref()
+                    .is_some_and(OwnedCoreState::is_cleanup_pending))
         {
             return Err(error.clone());
         }
         if let Ok(record) = restarted {
             let managed_core = record.handle.clone();
-            state.managed_core = Some(record);
+            state.managed_core = Some(OwnedCoreState::Active(record));
             reset_restart_state(state);
             state.next_liveness_at = Some(deadline_after(now, CORE_SERVICE_LIVENESS_INTERVAL));
             return Ok(UnexpectedExitOutcome::Restarted {
@@ -984,45 +1179,7 @@ impl PrivilegedCoreRuntimeService {
             process_start_identity: spawned.process_start_identity.clone(),
             instance_generation,
         };
-        if !self.owned_process_is_live(&owned_identity)? {
-            return Err(service_error(
-                CoreRuntimeErrorKind::ProcessIdentityMismatch,
-                "spawned Core identity could not be confirmed",
-            ));
-        }
-        if let Err(error) = self
-            .dependencies
-            .processes
-            .readiness(&owned_identity, &owner.endpoint)
-        {
-            let endpoint_identity = capture_endpoint_identity(&owner.endpoint.socket_path);
-            if self.dependencies.processes.stop(&owned_identity).is_ok() {
-                let _ = remove_matching_endpoint(
-                    &owner.endpoint.socket_path,
-                    endpoint_identity.as_ref(),
-                );
-            }
-            return Err(map_readiness_error(error));
-        }
-        if self
-            .dependencies
-            .processes
-            .grant_endpoint_access(&owner.endpoint, owner.owner_uid)
-            .is_err()
-        {
-            let endpoint_identity = capture_endpoint_identity(&owner.endpoint.socket_path);
-            if self.dependencies.processes.stop(&owned_identity).is_ok() {
-                let _ = remove_matching_endpoint(
-                    &owner.endpoint.socket_path,
-                    endpoint_identity.as_ref(),
-                );
-            }
-            return Err(service_error(
-                CoreRuntimeErrorKind::Apply,
-                "Core control endpoint access setup failed",
-            ));
-        }
-        Ok(ManagedCoreRecord {
+        let mut record = ManagedCoreRecord {
             handle: ManagedCoreHandle {
                 pid: spawned.pid,
                 process_start_identity: spawned.process_start_identity,
@@ -1031,8 +1188,54 @@ impl PrivilegedCoreRuntimeService {
                 runtime_generation: bundle.bundle.generation,
             },
             owned_identity,
-            endpoint_identity: capture_endpoint_identity(&owner.endpoint.socket_path),
-        })
+            endpoint_identity: None,
+        };
+        if let Err(error) = self.ensure_apply_active(&owner.proof) {
+            return Err(self.fail_after_uncommitted_spawn(state, record, error));
+        }
+        match self.owned_process_is_live(&record.owned_identity) {
+            Ok(true) => {}
+            Ok(false) => {
+                let error = service_error(
+                    CoreRuntimeErrorKind::ProcessIdentityMismatch,
+                    "spawned Core identity could not be confirmed",
+                );
+                return Err(self.fail_after_uncommitted_spawn(state, record, error));
+            }
+            Err(error) => {
+                return Err(self.fail_after_uncommitted_spawn(state, record, error));
+            }
+        }
+        let readiness = self
+            .dependencies
+            .processes
+            .readiness(&record.owned_identity, &owner.endpoint);
+        record.endpoint_identity = capture_endpoint_identity(&owner.endpoint.socket_path);
+        if let Err(error) = readiness {
+            let error = map_readiness_error(error);
+            return Err(self.fail_after_uncommitted_spawn(state, record, error));
+        }
+        if let Err(error) = self.ensure_apply_active(&owner.proof) {
+            return Err(self.fail_after_uncommitted_spawn(state, record, error));
+        }
+        let endpoint_access = self
+            .dependencies
+            .processes
+            .grant_endpoint_access(&owner.endpoint, owner.owner_uid);
+        if record.endpoint_identity.is_none() {
+            record.endpoint_identity = capture_endpoint_identity(&owner.endpoint.socket_path);
+        }
+        if endpoint_access.is_err() {
+            let error = service_error(
+                CoreRuntimeErrorKind::Apply,
+                "Core control endpoint access setup failed",
+            );
+            return Err(self.fail_after_uncommitted_spawn(state, record, error));
+        }
+        if let Err(error) = self.ensure_apply_active(&owner.proof) {
+            return Err(self.fail_after_uncommitted_spawn(state, record, error));
+        }
+        Ok(record)
     }
 
     fn drain_logs(
@@ -1061,12 +1264,20 @@ impl PrivilegedCoreRuntimeService {
             let Some(sequence) = next_sequence(&mut state.next_log_sequence) else {
                 break;
             };
-            let message = truncate_utf8(log.message, self.max_log_line_bytes);
-            if state.logs.len() == self.log_capacity
-                && let Some(dropped) = state.logs.pop_front()
+            let message = truncate_utf8(
+                log.message,
+                self.max_log_line_bytes.min(CORE_LOG_FORWARD_MAX_BYTES),
+            );
+            while state.logs.len() == self.log_capacity
+                || state.log_bytes.saturating_add(message.len()) > CORE_LOG_FORWARD_MAX_BYTES
             {
+                let Some(dropped) = state.logs.pop_front() else {
+                    break;
+                };
+                state.log_bytes = state.log_bytes.saturating_sub(dropped.message.len());
                 state.dropped_log_sequence = state.dropped_log_sequence.max(dropped.sequence);
             }
+            state.log_bytes = state.log_bytes.saturating_add(message.len());
             state.logs.push_back(ForwardedCoreLog {
                 sequence,
                 timestamp_unix_ms: log.timestamp_unix_ms,
@@ -1123,9 +1334,18 @@ fn deadline_after(now: Duration, delay: Duration) -> Duration {
 }
 
 fn service_lifecycle(state: &ServiceState) -> PrivilegedServiceLifecycle {
-    if state.degraded {
+    if state.degraded
+        || state
+            .managed_core
+            .as_ref()
+            .is_some_and(OwnedCoreState::is_cleanup_pending)
+    {
         PrivilegedServiceLifecycle::Degraded
-    } else if state.managed_core.is_some() {
+    } else if state
+        .managed_core
+        .as_ref()
+        .is_some_and(|core| core.active().is_some())
+    {
         PrivilegedServiceLifecycle::Running
     } else if state.owner.is_some() {
         PrivilegedServiceLifecycle::Owned
@@ -1289,6 +1509,7 @@ impl CoreRuntime for PrivilegedCoreRuntimeService {
                 .join(format!("owner-{owner_generation}.sock")),
             endpoint_secret,
         );
+        self.reset_apply_cancellation(&proof, owner_generation)?;
         state.owner = Some(ServiceOwner {
             owner_uid: request.owner_uid,
             supervisor_pid: request.supervisor_pid,
@@ -1316,13 +1537,17 @@ impl CoreRuntime for PrivilegedCoreRuntimeService {
     ) -> Result<ApplyCandidateResult, CoreRuntimeError> {
         let mut state = self.lock_state()?;
         let authenticated = authenticated_owner(&state, owner)?.clone();
+        self.cleanup_pending_core(&mut state)?;
+        self.ensure_apply_active(owner)?;
         let verified = self.verify_bundle(bundle, &authenticated.endpoint)?;
+        self.ensure_apply_active(owner)?;
         self.dependencies
             .tun
             .check(authenticated.owner_uid)
             .map_err(map_tun_preflight_error)?;
+        self.ensure_apply_active(owner)?;
 
-        if let Some(mut record) = state.managed_core.clone() {
+        if let Some(OwnedCoreState::Active(mut record)) = state.managed_core.clone() {
             self.require_owned_process(&record)?;
             let reload = self
                 .dependencies
@@ -1331,6 +1556,7 @@ impl CoreRuntime for PrivilegedCoreRuntimeService {
             if let Err(error) = reload {
                 return Err(map_reload_error(error));
             }
+            self.ensure_apply_active(owner)?;
             if let Err(error) = self
                 .dependencies
                 .processes
@@ -1338,9 +1564,10 @@ impl CoreRuntime for PrivilegedCoreRuntimeService {
             {
                 return Err(map_readiness_error(error));
             }
+            let _active_apply = self.active_apply_guard(owner)?;
             record.handle.runtime_generation = bundle.generation;
             let handle = record.handle.clone();
-            state.managed_core = Some(record);
+            state.managed_core = Some(OwnedCoreState::Active(record));
             state.last_bundle = Some(bundle.clone());
             reset_restart_state(&mut state);
             state.next_liveness_at = None;
@@ -1351,8 +1578,14 @@ impl CoreRuntime for PrivilegedCoreRuntimeService {
         }
 
         let record = self.spawn_verified(&mut state, &authenticated, &verified)?;
+        let _active_apply = match self.active_apply_guard(owner) {
+            Ok(active) => active,
+            Err(error) => {
+                return Err(self.fail_after_uncommitted_spawn(&mut state, record, error));
+            }
+        };
         let handle = record.handle.clone();
-        state.managed_core = Some(record);
+        state.managed_core = Some(OwnedCoreState::Active(record));
         state.last_bundle = Some(bundle.clone());
         reset_restart_state(&mut state);
         state.next_liveness_at = None;
@@ -1365,11 +1598,18 @@ impl CoreRuntime for PrivilegedCoreRuntimeService {
     fn status(&self, owner: &OwnerSessionProof) -> Result<CoreRuntimeStatus, CoreRuntimeError> {
         let state = self.lock_state()?;
         let authenticated = authenticated_owner(&state, owner)?;
+        let cleanup_pending = state
+            .managed_core
+            .as_ref()
+            .is_some_and(OwnedCoreState::is_cleanup_pending);
         let (managed_core, observed_exit) = match state.managed_core.as_ref() {
-            Some(record) if self.owned_process_is_live(&record.owned_identity)? => {
+            Some(OwnedCoreState::Active(record))
+                if self.owned_process_is_live(&record.owned_identity)? =>
+            {
                 (Some(record.handle.clone()), false)
             }
-            Some(_) => (None, true),
+            Some(OwnedCoreState::Active(_)) => (None, true),
+            Some(OwnedCoreState::CleanupPending(_)) => (None, false),
             None => (None, false),
         };
         let tun = match self.dependencies.tun.check(authenticated.owner_uid) {
@@ -1394,7 +1634,7 @@ impl CoreRuntime for PrivilegedCoreRuntimeService {
         let core_is_running = managed_core.is_some();
         Ok(CoreRuntimeStatus {
             managed_core,
-            lifecycle: if state.degraded {
+            lifecycle: if state.degraded || cleanup_pending {
                 CoreRuntimeLifecycle::Degraded
             } else if state.restart_due_at.is_some() || observed_exit {
                 CoreRuntimeLifecycle::RestartPending
@@ -1404,7 +1644,9 @@ impl CoreRuntime for PrivilegedCoreRuntimeService {
                 CoreRuntimeLifecycle::Owned
             },
             restart: CoreRuntimeRestartStatus {
-                pending: (state.restart_due_at.is_some() || observed_exit) && !state.degraded,
+                pending: (state.restart_due_at.is_some() || observed_exit)
+                    && !state.degraded
+                    && !cleanup_pending,
                 attempts: state.consecutive_restart_failures,
                 backoff: state.restart_backoff.or_else(|| {
                     (observed_exit && !state.degraded).then_some(CORE_RESTART_INITIAL_BACKOFF)
@@ -1423,46 +1665,71 @@ impl CoreRuntime for PrivilegedCoreRuntimeService {
     ) -> Result<ForwardedCoreLogBatch, CoreRuntimeError> {
         let mut state = self.lock_state()?;
         authenticated_owner(&state, owner)?;
-        if let Some(record) = state.managed_core.clone() {
+        if let Some(OwnedCoreState::Active(record)) = state.managed_core.clone() {
             self.require_owned_process(&record)?;
             self.drain_logs(&mut state, &record)?;
         }
         let limit = limit.min(self.log_capacity);
-        let records = state
+        let mut records = Vec::with_capacity(limit);
+        let mut message_bytes = 0_usize;
+        for record in state
             .logs
             .iter()
             .filter(|record| after_sequence.is_none_or(|after| record.sequence > after))
             .take(limit)
-            .cloned()
-            .collect::<Vec<_>>();
-        let next_sequence = records
+        {
+            if message_bytes.saturating_add(record.message.len()) > CORE_LOG_FORWARD_BATCH_MAX_BYTES
+            {
+                break;
+            }
+            message_bytes = message_bytes.saturating_add(record.message.len());
+            records.push(record.clone());
+        }
+        let page_cursor = records
             .last()
             .map(|record| record.sequence)
             .or(after_sequence);
+        let has_more_records = state
+            .logs
+            .iter()
+            .any(|record| page_cursor.is_none_or(|cursor| record.sequence > cursor));
+        let sequence_horizon = (state.next_log_sequence > 1).then(|| state.next_log_sequence - 1);
+        let next_sequence = if has_more_records {
+            page_cursor
+        } else {
+            match (page_cursor, sequence_horizon) {
+                (Some(cursor), Some(horizon)) => Some(cursor.max(horizon)),
+                (cursor, horizon) => cursor.or(horizon),
+            }
+        };
+        let delivered = u64::try_from(records.len()).unwrap_or(u64::MAX);
+        let dropped_since_after = next_sequence
+            .unwrap_or(0)
+            .saturating_sub(after_sequence.unwrap_or(0))
+            .saturating_sub(delivered);
         Ok(ForwardedCoreLogBatch {
             records,
             next_sequence,
             dropped_before: state.dropped_log_sequence,
+            dropped_since_after,
         })
     }
 
     fn stop(&self, owner: &OwnerSessionProof) -> Result<StopCoreResult, CoreRuntimeError> {
         let mut state = self.lock_state()?;
         authenticated_owner(&state, owner)?;
-        let Some(record) = state.managed_core.clone() else {
+        let Some(core) = state.managed_core.clone() else {
             return Ok(StopCoreResult {
                 stopped: false,
                 instance_generation: None,
             });
         };
-        self.require_owned_process(&record)?;
-        self.dependencies
-            .processes
-            .stop(&record.owned_identity)
-            .map_err(map_stop_error)?;
-        self.drain_logs(&mut state, &record)?;
-        self.remove_owned_endpoint(&record)?;
+        let record = core.record().clone();
+        if matches!(core, OwnedCoreState::Active(_)) {
+            self.require_owned_process(&record)?;
+        }
         let instance_generation = record.owned_identity.instance_generation;
+        self.stop_owned_record(&mut state, record)?;
         state.managed_core = None;
         state.last_bundle = None;
         reset_restart_state(&mut state);
@@ -1477,6 +1744,33 @@ impl CoreRuntime for PrivilegedCoreRuntimeService {
         let mut state = self.lock_state()?;
         authenticated_owner(&state, owner)?;
         self.cleanup_owner(&mut state)
+    }
+
+    fn cancel_pending_apply(&self, owner: &OwnerSessionProof) -> Result<(), CoreRuntimeError> {
+        let mut cancellation = self.apply_cancellation.lock().map_err(|_| {
+            service_error(
+                CoreRuntimeErrorKind::Unavailable,
+                "Runtime Apply cancellation state is unavailable",
+            )
+        })?;
+        if cancellation.owner.as_ref() != Some(owner) {
+            return Err(service_error(
+                CoreRuntimeErrorKind::Authentication,
+                "Runtime Apply cancellation owner mismatch",
+            ));
+        }
+        let owner_generation = cancellation.owner_generation.ok_or_else(|| {
+            service_error(
+                CoreRuntimeErrorKind::Authentication,
+                "Runtime Apply cancellation owner generation is unavailable",
+            )
+        })?;
+        cancellation.requested = true;
+        drop(cancellation);
+        self.dependencies
+            .processes
+            .cancel_pending_apply(owner_generation);
+        Ok(())
     }
 }
 
@@ -2328,14 +2622,14 @@ fn read_bounded_executable(
 
 fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
-        return value;
+        return value.into_boxed_str().into_string();
     }
     let mut boundary = max_bytes;
     while !value.is_char_boundary(boundary) {
         boundary -= 1;
     }
     value.truncate(boundary);
-    value
+    value.into_boxed_str().into_string()
 }
 
 fn next_sequence(sequence: &mut u64) -> Option<u64> {
@@ -2355,24 +2649,38 @@ fn invalid_bundle(message: &'static str) -> CoreRuntimeError {
     service_error(CoreRuntimeErrorKind::InvalidBundle, message)
 }
 
-fn map_spawn_error(_error: ServicePlatformError) -> CoreRuntimeError {
-    service_error(CoreRuntimeErrorKind::Apply, "Core spawn failed")
+fn map_spawn_error(error: ServicePlatformError) -> CoreRuntimeError {
+    if error.kind == ServicePlatformErrorKind::ApplyCancelled {
+        service_error(
+            CoreRuntimeErrorKind::ReloadTimeout,
+            "Core spawn was cancelled during Supervisor shutdown",
+        )
+    } else {
+        service_error(CoreRuntimeErrorKind::Apply, "Core spawn failed")
+    }
 }
 
 fn map_reload_error(error: ServicePlatformError) -> CoreRuntimeError {
     match error.kind {
-        ServicePlatformErrorKind::ReloadTimeout => {
+        ServicePlatformErrorKind::ReloadTimeout | ServicePlatformErrorKind::ApplyCancelled => {
             service_error(CoreRuntimeErrorKind::ReloadTimeout, "Core reload timed out")
         }
         _ => service_error(CoreRuntimeErrorKind::Apply, "Core reload failed"),
     }
 }
 
-fn map_readiness_error(_error: ServicePlatformError) -> CoreRuntimeError {
-    service_error(
-        CoreRuntimeErrorKind::Readiness,
-        "Core readiness confirmation failed",
-    )
+fn map_readiness_error(error: ServicePlatformError) -> CoreRuntimeError {
+    if error.kind == ServicePlatformErrorKind::ApplyCancelled {
+        service_error(
+            CoreRuntimeErrorKind::ReloadTimeout,
+            "Core readiness was cancelled during Supervisor shutdown",
+        )
+    } else {
+        service_error(
+            CoreRuntimeErrorKind::Readiness,
+            "Core readiness confirmation failed",
+        )
+    }
 }
 
 fn map_stop_error(_error: ServicePlatformError) -> CoreRuntimeError {

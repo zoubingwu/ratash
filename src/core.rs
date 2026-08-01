@@ -271,6 +271,7 @@ pub struct ForwardedCoreLogBatch {
     pub records: Vec<ForwardedCoreLog>,
     pub next_sequence: Option<u64>,
     pub dropped_before: u64,
+    pub dropped_since_after: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -361,7 +362,39 @@ pub trait CoreRuntime: Send + Sync {
 
     fn stop(&self, owner: &OwnerSessionProof) -> Result<StopCoreResult, CoreRuntimeError>;
 
+    fn stop_with_timeout(
+        &self,
+        owner: &OwnerSessionProof,
+        _timeout: std::time::Duration,
+    ) -> Result<StopCoreResult, CoreRuntimeError> {
+        self.stop(owner)
+    }
+
     fn close_owner_session(&self, owner: &OwnerSessionProof) -> Result<(), CoreRuntimeError>;
+
+    /// Interrupts local client waits during terminal Supervisor shutdown.
+    fn cancel_pending_requests(&self) {}
+
+    /// Requests authenticated cancellation of an in-flight Runtime Apply.
+    fn cancel_pending_apply(&self, _owner: &OwnerSessionProof) -> Result<(), CoreRuntimeError> {
+        Ok(())
+    }
+
+    fn cancel_pending_apply_with_timeout(
+        &self,
+        owner: &OwnerSessionProof,
+        _timeout: std::time::Duration,
+    ) -> Result<(), CoreRuntimeError> {
+        self.cancel_pending_apply(owner)
+    }
+
+    fn close_owner_session_with_timeout(
+        &self,
+        owner: &OwnerSessionProof,
+        _timeout: std::time::Duration,
+    ) -> Result<(), CoreRuntimeError> {
+        self.close_owner_session(owner)
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1273,6 +1306,8 @@ pub trait MihomoAdapter: Send + Sync {
     /// Cancels active operations during terminal owner shutdown.
     /// Implementations may reject every later operation on the same instance.
     fn cancel_pending(&self) {}
+
+    fn reset_cancellation(&self) {}
 
     fn version(&self, endpoint: &CoreControlEndpoint) -> Result<MihomoVersion, MihomoError>;
 

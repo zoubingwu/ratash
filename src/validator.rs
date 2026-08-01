@@ -4,6 +4,8 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,6 +20,7 @@ pub struct MihomoCommandValidator {
     binary: PathBuf,
     expected_sha256: String,
     timeout: Duration,
+    cancellation: Arc<AtomicBool>,
 }
 
 impl MihomoCommandValidator {
@@ -37,6 +40,7 @@ impl MihomoCommandValidator {
             binary,
             expected_sha256,
             timeout,
+            cancellation: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -52,6 +56,11 @@ impl MihomoCommandValidator {
         configuration: &EffectiveConfiguration,
         staging_root: &Path,
     ) -> Result<(), MihomoValidationError> {
+        if self.cancellation.load(Ordering::Acquire) {
+            return Err(MihomoValidationError::new(
+                MihomoValidationErrorKind::Cancelled,
+            ));
+        }
         if configuration.yaml().len() > EFFECTIVE_CONFIGURATION_MAX_BYTES {
             return Err(MihomoValidationError::new(
                 MihomoValidationErrorKind::ConfigurationTooLarge,
@@ -76,6 +85,13 @@ impl MihomoCommandValidator {
 
         let deadline = Instant::now() + self.timeout;
         let status = loop {
+            if self.cancellation.load(Ordering::Acquire) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(MihomoValidationError::new(
+                    MihomoValidationErrorKind::Cancelled,
+                ));
+            }
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if Instant::now() < deadline => {
@@ -158,6 +174,10 @@ impl CoreConfigValidator for MihomoCommandValidator {
     ) -> Result<(), CoreValidationError> {
         self.validate_detailed(configuration, staging_root)
             .map_err(|error| CoreValidationError::new(error.to_string()))
+    }
+
+    fn cancel_pending(&self) {
+        self.cancellation.store(true, Ordering::Release);
     }
 }
 
@@ -327,6 +347,7 @@ pub enum MihomoValidationErrorKind {
     SpawnFailed,
     WaitFailed,
     TimedOut,
+    Cancelled,
     OutputTooLarge,
     ConfigurationRejected,
     CleanupFailed,
@@ -380,6 +401,9 @@ impl fmt::Display for MihomoValidationError {
                 "the Mihomo validation process could not be observed"
             }
             MihomoValidationErrorKind::TimedOut => "Mihomo configuration validation timed out",
+            MihomoValidationErrorKind::Cancelled => {
+                "Mihomo validation was cancelled during Supervisor shutdown"
+            }
             MihomoValidationErrorKind::OutputTooLarge => {
                 "Mihomo validation output exceeded its size limit"
             }

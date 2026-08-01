@@ -1,6 +1,6 @@
 //! Privileged CoreRuntime IPC client and server adapters.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -43,7 +43,7 @@ use crate::runtime_bundle::{
     RuntimeGenerationRetention, inspect_runtime_generations_with_reserved,
     prune_runtime_generations_with_reserved,
 };
-use crate::unix_io::DeadlineUnixStream;
+use crate::unix_io::{DeadlineUnixStream, deadline_after, remaining_until};
 
 pub const CORE_SERVICE_IPC_PROTOCOL_VERSION: u16 = 1;
 
@@ -66,6 +66,8 @@ pub struct CoreServiceClient {
     connect_timeout: Duration,
     timeout_policy: CoreServiceTimeoutPolicy,
     next_request_id: AtomicU64,
+    apply_cancellation_requested: AtomicBool,
+    active_request_streams: Mutex<BTreeMap<u64, UnixStream>>,
 }
 
 #[derive(Clone, Copy)]
@@ -105,6 +107,8 @@ impl CoreServiceClient {
             connect_timeout: CORE_SERVICE_REQUEST_TIMEOUT,
             timeout_policy: CoreServiceTimeoutPolicy::Product,
             next_request_id: AtomicU64::new(1),
+            apply_cancellation_requested: AtomicBool::new(false),
+            active_request_streams: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -121,6 +125,8 @@ impl CoreServiceClient {
             connect_timeout,
             timeout_policy: CoreServiceTimeoutPolicy::Fixed(io_timeout),
             next_request_id: AtomicU64::new(1),
+            apply_cancellation_requested: AtomicBool::new(false),
+            active_request_streams: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -141,6 +147,8 @@ impl CoreServiceClient {
                 mutation: mutation_timeout,
             },
             next_request_id: AtomicU64::new(1),
+            apply_cancellation_requested: AtomicBool::new(false),
+            active_request_streams: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -153,8 +161,9 @@ impl CoreServiceClient {
         }
     }
 
-    fn connect(&self) -> io::Result<UnixStream> {
-        if self.connect_timeout.is_zero() || !self.timeout_policy.is_valid() {
+    fn connect(&self, timeout: Duration) -> io::Result<UnixStream> {
+        let connect_timeout = self.connect_timeout.min(timeout);
+        if connect_timeout.is_zero() || !self.timeout_policy.is_valid() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Core service IPC deadlines must be positive",
@@ -162,7 +171,7 @@ impl CoreServiceClient {
         }
         let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
         let address = SockAddr::unix(&self.socket_path)?;
-        socket.connect_timeout(&address, self.connect_timeout)?;
+        socket.connect_timeout(&address, connect_timeout)?;
         let stream = UnixStream::from(socket);
         let actual_uid = peer_identity(&stream).map_err(io::Error::other)?.uid;
         if actual_uid != self.expected_service_uid {
@@ -176,19 +185,72 @@ impl CoreServiceClient {
 
     fn request(&self, operation: WireOperation) -> Result<WireSuccess, CoreRuntimeError> {
         let response_timeout = self.timeout_policy.response_timeout(&operation);
+        self.request_with_timeout(operation, response_timeout)
+    }
+
+    fn request_with_timeout(
+        &self,
+        operation: WireOperation,
+        response_timeout: Duration,
+    ) -> Result<WireSuccess, CoreRuntimeError> {
+        let is_runtime_apply = matches!(&operation, WireOperation::ApplyCandidate(_));
+        if is_runtime_apply && self.apply_cancellation_requested.load(Ordering::Acquire) {
+            return Err(cancelled_apply_error());
+        }
+        if response_timeout.is_zero() {
+            return Err(transport_unavailable(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Core service IPC deadline must be positive",
+            )));
+        }
+        let deadline = deadline_after(response_timeout).map_err(transport_unavailable)?;
+        let track_request = !matches!(
+            &operation,
+            WireOperation::Stop(_)
+                | WireOperation::CancelPendingApply(_)
+                | WireOperation::CloseOwnerSession(_)
+        );
         let request_id = self.request_id();
         let request = WireRequest {
             protocol_version: CORE_SERVICE_IPC_PROTOCOL_VERSION,
             request_id,
             operation,
         };
-        let stream = self.connect().map_err(transport_unavailable)?;
-        let mut stream =
-            DeadlineUnixStream::new(stream, response_timeout).map_err(transport_unavailable)?;
-        stream.begin_write().map_err(transport_unavailable)?;
-        write_frame(&mut stream, &request).map_err(map_write_error)?;
-        stream.begin_read().map_err(transport_unavailable)?;
-        let response: WireResponse = read_frame(&mut stream).map_err(map_read_error)?;
+        let stream = self
+            .connect(remaining_until(deadline).map_err(transport_unavailable)?)
+            .map_err(transport_unavailable)?;
+        let _active_request = if track_request {
+            Some(ActiveRequest::register(self, request_id, &stream)?)
+        } else {
+            None
+        };
+        let mut stream = DeadlineUnixStream::new(
+            stream,
+            remaining_until(deadline).map_err(transport_unavailable)?,
+        )
+        .map_err(transport_unavailable)?;
+        stream
+            .begin_write_until(deadline)
+            .map_err(transport_unavailable)?;
+        if let Err(error) = write_frame(&mut stream, &request) {
+            if is_runtime_apply && self.apply_cancellation_requested.load(Ordering::Acquire) {
+                return Err(cancelled_apply_error());
+            }
+            return Err(map_write_error(error));
+        }
+        stream
+            .begin_read_until(deadline)
+            .map_err(transport_unavailable)?;
+        let response: WireResponse = match read_frame(&mut stream) {
+            Ok(response) => response,
+            Err(_)
+                if is_runtime_apply
+                    && self.apply_cancellation_requested.load(Ordering::Acquire) =>
+            {
+                return Err(cancelled_apply_error());
+            }
+            Err(error) => return Err(map_read_error(error)),
+        };
         if response.protocol_version != CORE_SERVICE_IPC_PROTOCOL_VERSION
             || response.request_id != request_id
         {
@@ -199,6 +261,41 @@ impl CoreServiceClient {
         match response.outcome {
             WireOutcome::Success(success) => Ok(success),
             WireOutcome::Failure(error) => Err(error.into_core()),
+        }
+    }
+}
+
+struct ActiveRequest<'a> {
+    client: &'a CoreServiceClient,
+    request_id: u64,
+}
+
+impl<'a> ActiveRequest<'a> {
+    fn register(
+        client: &'a CoreServiceClient,
+        request_id: u64,
+        stream: &UnixStream,
+    ) -> Result<Self, CoreRuntimeError> {
+        let cancellation_stream = stream.try_clone().map_err(transport_unavailable)?;
+        let mut active = client.active_request_streams.lock().map_err(|_| {
+            transport_unavailable(io::Error::other(
+                "Core service request cancellation state is unavailable",
+            ))
+        })?;
+        active.insert(request_id, cancellation_stream);
+        if client.apply_cancellation_requested.load(Ordering::Acquire)
+            && let Some(stream) = active.remove(&request_id)
+        {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        Ok(Self { client, request_id })
+    }
+}
+
+impl Drop for ActiveRequest<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.client.active_request_streams.lock() {
+            active.remove(&self.request_id);
         }
     }
 }
@@ -236,6 +333,7 @@ impl CoreServiceTimeoutPolicy {
     fn response_timeout(self, operation: &WireOperation) -> Duration {
         match operation {
             WireOperation::Status(_) | WireOperation::Logs(_) => self.request_timeout(),
+            WireOperation::CancelPendingApply(_) => self.request_timeout(),
             WireOperation::OpenOwnerSession(_)
             | WireOperation::ApplyCandidate(_)
             | WireOperation::Stop(_)
@@ -307,10 +405,76 @@ impl CoreRuntime for CoreServiceClient {
         }
     }
 
+    fn stop_with_timeout(
+        &self,
+        owner: &OwnerSessionProof,
+        timeout: Duration,
+    ) -> Result<StopCoreResult, CoreRuntimeError> {
+        match self.request_with_timeout(
+            WireOperation::Stop(WireProofRequest {
+                owner: owner.into(),
+            }),
+            timeout,
+        )? {
+            WireSuccess::Stop(result) => Ok(result.into_core()),
+            _ => Err(unexpected_response()),
+        }
+    }
+
     fn close_owner_session(&self, owner: &OwnerSessionProof) -> Result<(), CoreRuntimeError> {
         match self.request(WireOperation::CloseOwnerSession(WireProofRequest {
             owner: owner.into(),
         }))? {
+            WireSuccess::CloseOwnerSession(WireEmpty {}) => Ok(()),
+            _ => Err(unexpected_response()),
+        }
+    }
+
+    fn cancel_pending_requests(&self) {
+        self.apply_cancellation_requested
+            .store(true, Ordering::Release);
+        let mut active = self
+            .active_request_streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for stream in active.values() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        active.clear();
+    }
+
+    fn cancel_pending_apply(&self, owner: &OwnerSessionProof) -> Result<(), CoreRuntimeError> {
+        self.cancel_pending_apply_with_timeout(owner, self.timeout_policy.request_timeout())
+    }
+
+    fn cancel_pending_apply_with_timeout(
+        &self,
+        owner: &OwnerSessionProof,
+        timeout: Duration,
+    ) -> Result<(), CoreRuntimeError> {
+        self.cancel_pending_requests();
+        match self.request_with_timeout(
+            WireOperation::CancelPendingApply(WireProofRequest {
+                owner: owner.into(),
+            }),
+            timeout,
+        )? {
+            WireSuccess::CancelPendingApply(WireEmpty {}) => Ok(()),
+            _ => Err(unexpected_response()),
+        }
+    }
+
+    fn close_owner_session_with_timeout(
+        &self,
+        owner: &OwnerSessionProof,
+        timeout: Duration,
+    ) -> Result<(), CoreRuntimeError> {
+        match self.request_with_timeout(
+            WireOperation::CloseOwnerSession(WireProofRequest {
+                owner: owner.into(),
+            }),
+            timeout,
+        )? {
             WireSuccess::CloseOwnerSession(WireEmpty {}) => Ok(()),
             _ => Err(unexpected_response()),
         }
@@ -880,10 +1044,6 @@ fn dispatch(
     peer: &CoreServicePeerIdentity,
     operation: WireOperation,
 ) -> Result<WireSuccess, CoreRuntimeError> {
-    let mut binding = context
-        .session
-        .lock()
-        .map_err(|_| unavailable_error("Core service session state is unavailable"))?;
     match operation {
         WireOperation::OpenOwnerSession(request) => {
             let request = request.into_core();
@@ -892,6 +1052,10 @@ fn dispatch(
                     "Core service peer process identity mismatch",
                 ));
             }
+            let mut binding = context
+                .session
+                .lock()
+                .map_err(|_| unavailable_error("Core service session state is unavailable"))?;
             let session = context.runtime.open_owner_session(&request)?;
             if session.proof.session_id().is_empty()
                 || session.proof.session_token().is_empty()
@@ -909,7 +1073,7 @@ fn dispatch(
         }
         WireOperation::ApplyCandidate(request) => {
             let owner = request.owner.into_core();
-            authorize_bound_session(binding.as_ref(), peer, &owner)?;
+            authorize_context_session(context, peer, &owner)?;
             let bundle = request.bundle.into_core();
             let mut retention = context.runtime_retention.lock().map_err(|_| {
                 unavailable_error("Core service Runtime Generation state is unavailable")
@@ -945,7 +1109,7 @@ fn dispatch(
         }
         WireOperation::Status(request) => {
             let owner = request.owner.into_core();
-            authorize_bound_session(binding.as_ref(), peer, &owner)?;
+            authorize_context_session(context, peer, &owner)?;
             context
                 .runtime
                 .status(&owner)
@@ -953,7 +1117,7 @@ fn dispatch(
         }
         WireOperation::Logs(request) => {
             let owner = request.owner.into_core();
-            authorize_bound_session(binding.as_ref(), peer, &owner)?;
+            authorize_context_session(context, peer, &owner)?;
             let limit = usize::try_from(request.limit)
                 .map_err(|_| protocol_error("Core service log limit is invalid"))?;
             let limit = limit.min(CORE_SERVICE_LOG_BATCH_MAX);
@@ -974,7 +1138,7 @@ fn dispatch(
         }
         WireOperation::Stop(request) => {
             let owner = request.owner.into_core();
-            authorize_bound_session(binding.as_ref(), peer, &owner)?;
+            authorize_context_session(context, peer, &owner)?;
             context
                 .runtime
                 .stop(&owner)
@@ -982,12 +1146,35 @@ fn dispatch(
         }
         WireOperation::CloseOwnerSession(request) => {
             let owner = request.owner.into_core();
-            authorize_bound_session(binding.as_ref(), peer, &owner)?;
+            authorize_context_session(context, peer, &owner)?;
             context.runtime.close_owner_session(&owner)?;
+            let mut binding = context
+                .session
+                .lock()
+                .map_err(|_| unavailable_error("Core service session state is unavailable"))?;
+            authorize_bound_session(binding.as_ref(), peer, &owner)?;
             *binding = None;
             Ok(WireSuccess::CloseOwnerSession(WireEmpty {}))
         }
+        WireOperation::CancelPendingApply(request) => {
+            let owner = request.owner.into_core();
+            authorize_context_session(context, peer, &owner)?;
+            context.runtime.cancel_pending_apply(&owner)?;
+            Ok(WireSuccess::CancelPendingApply(WireEmpty {}))
+        }
     }
+}
+
+fn authorize_context_session(
+    context: &ServerContext,
+    peer: &CoreServicePeerIdentity,
+    proof: &OwnerSessionProof,
+) -> Result<(), CoreRuntimeError> {
+    let binding = context
+        .session
+        .lock()
+        .map_err(|_| unavailable_error("Core service session state is unavailable"))?;
+    authorize_bound_session(binding.as_ref(), peer, proof)
 }
 
 fn authorize_bound_session(
@@ -1038,6 +1225,7 @@ enum WireOperation {
     Logs(WireLogsRequest),
     Stop(WireProofRequest),
     CloseOwnerSession(WireProofRequest),
+    CancelPendingApply(WireProofRequest),
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1097,6 +1285,7 @@ enum WireSuccess {
     Logs(WireForwardedCoreLogBatch),
     Stop(WireStopCoreResult),
     CloseOwnerSession(WireEmpty),
+    CancelPendingApply(WireEmpty),
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1585,6 +1774,7 @@ struct WireForwardedCoreLogBatch {
     records: Vec<WireForwardedCoreLog>,
     next_sequence: Option<u64>,
     dropped_before: u64,
+    dropped_since_after: u64,
 }
 
 impl From<&ForwardedCoreLogBatch> for WireForwardedCoreLogBatch {
@@ -1593,6 +1783,7 @@ impl From<&ForwardedCoreLogBatch> for WireForwardedCoreLogBatch {
             records: batch.records.iter().map(Into::into).collect(),
             next_sequence: batch.next_sequence,
             dropped_before: batch.dropped_before,
+            dropped_since_after: batch.dropped_since_after,
         }
     }
 }
@@ -1607,6 +1798,7 @@ impl WireForwardedCoreLogBatch {
                 .collect(),
             next_sequence: self.next_sequence,
             dropped_before: self.dropped_before,
+            dropped_since_after: self.dropped_since_after,
         }
     }
 }
@@ -2464,6 +2656,13 @@ fn transport_unavailable(_error: io::Error) -> CoreRuntimeError {
     unavailable_error("Core service IPC endpoint is unavailable")
 }
 
+fn cancelled_apply_error() -> CoreRuntimeError {
+    CoreRuntimeError::new(
+        CoreRuntimeErrorKind::ReloadTimeout,
+        "Core service Runtime Apply wait was cancelled during Supervisor shutdown",
+    )
+}
+
 fn map_write_error(error: FrameError) -> CoreRuntimeError {
     match error {
         FrameError::Io(error) if is_timeout(&error) => {
@@ -2528,6 +2727,67 @@ fn safe_io_error(error: io::Error, message: &'static str) -> io::Error {
 #[cfg(test)]
 mod accept_loop_tests {
     use super::*;
+    use crate::service::CORE_RUNTIME_PROTOCOL_VERSION;
+
+    #[test]
+    fn client_timeout_is_shared_across_request_write_and_response_read() {
+        let root = Path::new("/private/tmp").join(format!(
+            "hcs-deadline-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).expect("the deadline fixture root should be created");
+        let socket_path = root.join("core.sock");
+        let listener =
+            UnixListener::bind(&socket_path).expect("the deadline fixture listener should bind");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("the deadline fixture should accept the client");
+            thread::sleep(Duration::from_millis(140));
+            let request: WireRequest =
+                read_frame(&mut stream).expect("the deadline fixture should read the request");
+            thread::sleep(Duration::from_millis(140));
+            let session = OwnerSession {
+                proof: OwnerSessionProof::new("fixture-session", "fixture-token"),
+                protocol_version: CORE_RUNTIME_PROTOCOL_VERSION,
+                owner_generation: 1,
+                endpoint: CoreControlEndpoint::new(
+                    PathBuf::from("/private/tmp/hopash-deadline-core.sock"),
+                    "fixture-secret",
+                ),
+            };
+            let response = WireResponse::success(
+                request.request_id,
+                WireSuccess::OwnerSession((&session).into()),
+            );
+            let _ = write_frame(&mut stream, &response);
+        });
+        let timeout = Duration::from_millis(220);
+        let client = CoreServiceClient::with_service_uid_and_timeouts(
+            &socket_path,
+            nix::unistd::geteuid().as_raw(),
+            timeout,
+            timeout,
+        );
+        let request = OwnerSessionRequest {
+            owner_uid: nix::unistd::geteuid().as_raw(),
+            supervisor_pid: std::process::id(),
+            supervisor_start_identity: "fixture-process".to_owned(),
+            instance_token: "x".repeat(512 * 1024),
+            protocol_version: CORE_RUNTIME_PROTOCOL_VERSION,
+        };
+
+        let error = client
+            .open_owner_session(&request)
+            .expect_err("one absolute deadline should expire across write and read");
+
+        assert_eq!(error.kind, CoreRuntimeErrorKind::Unavailable);
+        server
+            .join()
+            .expect("the deadline fixture server should finish");
+        fs::remove_dir_all(root).expect("the deadline fixture root should be removed");
+    }
 
     #[test]
     fn idle_poll_blocks_without_periodic_wakes_and_shutdown_bypasses_the_worker_queue() {

@@ -1,4 +1,7 @@
 use hopash::constants::*;
+use hopash::process_controller::NativeCoreProcessConfig;
+use hopash::service::PrivilegedServiceConfig;
+use std::path::PathBuf;
 
 #[test]
 fn observable_product_limits_are_frozen_for_the_release_contract() {
@@ -23,6 +26,16 @@ fn observable_product_limits_are_frozen_for_the_release_contract() {
     assert_eq!(LATENCY_FRESHNESS.as_secs(), 600);
     assert_eq!(STATUS_SAMPLE_INTERVAL.as_secs(), 1);
     assert_eq!(LOG_CAPACITY, 10_000);
+    assert_eq!(LOG_RETENTION_MAX_BYTES, 32 * 1_024 * 1_024);
+    assert_eq!(CORE_LOG_FORWARD_CAPACITY, 256);
+    assert_eq!(CORE_LOG_FORWARD_MAX_BYTES, 4 * 1_024 * 1_024);
+    assert_eq!(CORE_LOG_FORWARD_BATCH_MAX_BYTES, 512 * 1_024);
+    assert_eq!(LOG_BROKER_RECOVERY_CAPACITY, 256);
+    assert_eq!(LOG_BROKER_RECOVERY_MAX_BYTES, 4 * 1_024 * 1_024);
+    assert_eq!(LOG_TAIL_MAX_RECORDS, 256);
+    assert_eq!(LOG_TAIL_MAX_BYTES, 4 * 1_024 * 1_024);
+    assert_eq!(LOG_SUBSCRIBER_MAX_BYTES, 4 * 1_024 * 1_024);
+    assert_eq!(IPC_STREAM_CAPACITY, 3);
     assert_eq!(TRAFFIC_SERIES_CAPACITY, 300);
     assert_eq!(MINIMUM_TERMINAL_WIDTH, 80);
     assert_eq!(MINIMUM_TERMINAL_HEIGHT, 24);
@@ -56,6 +69,12 @@ fn every_input_and_transport_boundary_has_a_positive_limit() {
         IPC_FRAME_MAX_BYTES,
         IPC_REQUEST_FRAME_MAX_BYTES,
         CORE_LOG_LINE_MAX_BYTES,
+        LOG_RETENTION_MAX_BYTES,
+        CORE_LOG_FORWARD_MAX_BYTES,
+        CORE_LOG_FORWARD_BATCH_MAX_BYTES,
+        LOG_BROKER_RECOVERY_MAX_BYTES,
+        LOG_TAIL_MAX_BYTES,
+        LOG_SUBSCRIBER_MAX_BYTES,
         JSON_OUTPUT_MAX_BYTES,
         TUI_SEARCH_MAX_BYTES,
     ] {
@@ -65,6 +84,58 @@ fn every_input_and_transport_boundary_has_a_positive_limit() {
         assert!(JSON_OUTPUT_MAX_BYTES >= LOCAL_RULE_SET_MAX_BYTES * 4);
         assert!(IPC_FRAME_MAX_BYTES > JSON_OUTPUT_MAX_BYTES);
         assert!(IPC_REQUEST_FRAME_MAX_BYTES < IPC_FRAME_MAX_BYTES);
+        assert!(LOG_BROKER_RECOVERY_CAPACITY < LOG_CAPACITY);
+        assert!(CORE_LOG_FORWARD_CAPACITY < LOG_CAPACITY);
+        assert!(LOG_TAIL_MAX_RECORDS <= LOG_BROKER_RECOVERY_CAPACITY);
+        assert!(CORE_LOG_LINE_MAX_BYTES <= CORE_LOG_FORWARD_MAX_BYTES);
+        assert!(CORE_LOG_LINE_MAX_BYTES <= CORE_LOG_FORWARD_BATCH_MAX_BYTES);
+        assert!(CORE_LOG_FORWARD_BATCH_MAX_BYTES <= CORE_LOG_FORWARD_MAX_BYTES);
+        assert!(CORE_LOG_FORWARD_MAX_BYTES <= LOG_RETENTION_MAX_BYTES);
+        assert!(LOG_BROKER_RECOVERY_MAX_BYTES <= LOG_RETENTION_MAX_BYTES);
+        assert!(LOG_TAIL_MAX_BYTES < IPC_FRAME_MAX_BYTES);
+        assert!(LOG_SUBSCRIBER_MAX_BYTES <= LOG_RETENTION_MAX_BYTES);
         assert!(IPC_LIST_PAGE_SIZE < LOCAL_RULE_COUNT_MAX);
     }
+}
+
+#[test]
+fn per_process_log_payload_envelopes_are_explicit() {
+    const JSON_ESCAPE_EXPANSION: usize = 6;
+    const RECORD_ENVELOPE_MAX_BYTES: usize = 256;
+    const FORWARDED_BATCH_ENCODED_MAX_BYTES: usize = CORE_LOG_FORWARD_BATCH_MAX_BYTES
+        * JSON_ESCAPE_EXPANSION
+        + CORE_LOG_FORWARD_CAPACITY * RECORD_ENVELOPE_MAX_BYTES;
+    const PRIVILEGED_SERVICE_MAX_BYTES: usize = CORE_LOG_FORWARD_MAX_BYTES * 2
+        + CORE_LOG_FORWARD_BATCH_MAX_BYTES
+        + FORWARDED_BATCH_ENCODED_MAX_BYTES;
+    const SUPERVISOR_MAX_BYTES: usize = LOG_RETENTION_MAX_BYTES
+        + LOG_BROKER_RECOVERY_MAX_BYTES
+        + IPC_STREAM_CAPACITY * LOG_SUBSCRIBER_MAX_BYTES
+        + 2 * LOG_TAIL_MAX_BYTES
+        + CORE_LOG_FORWARD_BATCH_MAX_BYTES
+        + FORWARDED_BATCH_ENCODED_MAX_BYTES;
+    const STATUS_INTERFACE_MAX_BYTES: usize =
+        LOG_RETENTION_MAX_BYTES + LOG_SUBSCRIBER_MAX_BYTES + 2 * LOG_TAIL_MAX_BYTES;
+
+    const {
+        assert!(FORWARDED_BATCH_ENCODED_MAX_BYTES < LOG_TAIL_MAX_BYTES);
+    }
+    assert_eq!(PRIVILEGED_SERVICE_MAX_BYTES, 12_124_160);
+    assert_eq!(SUPERVISOR_MAX_BYTES, 62_455_808);
+    assert_eq!(STATUS_INTERFACE_MAX_BYTES, 44 * 1_024 * 1_024);
+}
+
+#[test]
+fn privileged_log_forwarders_use_the_release_capacity() {
+    assert_eq!(
+        NativeCoreProcessConfig::default().log_capacity,
+        CORE_LOG_FORWARD_CAPACITY
+    );
+    let service = PrivilegedServiceConfig::product_defaults(
+        PathBuf::from("/fixture/service-root"),
+        "a".repeat(64),
+        "b".repeat(64),
+    );
+    assert_eq!(service.log_capacity, CORE_LOG_FORWARD_CAPACITY);
+    assert_eq!(service.max_log_line_bytes, CORE_LOG_LINE_MAX_BYTES);
 }

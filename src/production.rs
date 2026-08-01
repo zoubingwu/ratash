@@ -7,10 +7,10 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 use core_foundation::base::TCFType;
@@ -36,8 +36,8 @@ use crate::config::{
     AuthoritativeConfig, BUNDLED_CORE_VERSION, ConfigCompiler, CoreConfigValidator,
 };
 use crate::constants::{
-    CORE_SERVICE_LIVENESS_INTERVAL, IPC_REQUEST_TIMEOUT, MIHOMO_BINARY_MAX_BYTES,
-    STATUS_SAMPLE_INTERVAL,
+    CORE_SERVICE_LIVENESS_INTERVAL, DAEMON_SHUTDOWN_TIMEOUT, IPC_REQUEST_TIMEOUT,
+    MIHOMO_BINARY_MAX_BYTES, STATUS_SAMPLE_INTERVAL,
 };
 use crate::core::{
     CoreRuntime, MihomoAdapter, OwnerSessionProof, OwnerSessionRequest, ProcessOutputSource,
@@ -1084,6 +1084,10 @@ fn run_owned_supervisor(
             .map_err(|_| startup_internal("The IPC stream broker could not start"))?,
     );
     let drain = Arc::new(DrainController::default());
+    let shutdown_supervisor = Arc::clone(&supervisor);
+    drain.install_cancellation(Arc::new(move || {
+        shutdown_supervisor.cancel_pending_mutations();
+    }));
     let application = Arc::new(SupervisorApplication {
         supervisor: Arc::clone(&supervisor),
         drain: Arc::clone(&drain),
@@ -1149,26 +1153,41 @@ fn run_owned_supervisor(
         &shutdown_waker,
         shutdown_waker.clone(),
     );
+    let shutdown_deadline = Instant::now()
+        .checked_add(DAEMON_SHUTDOWN_TIMEOUT)
+        .ok_or_else(|| startup_internal("The Supervisor shutdown deadline is unavailable"))?;
+    let cancel_result = remaining_shutdown_budget(shutdown_deadline).and_then(|remaining| {
+        core_runtime
+            .cancel_pending_apply_with_timeout(&owner, remaining)
+            .map_err(|_| io::Error::other("the pending Runtime Apply could not be cancelled"))
+    });
 
     run_shutdown_sequence(
-        || background.shutdown().map_err(io::Error::other),
-        || observer.shutdown(),
+        || background.shutdown_until(shutdown_deadline),
+        || observer.shutdown_until(shutdown_deadline),
         || {
-            drain.wait_for_mutations();
-            let runtime_result = lifecycle_lock
-                .lock()
-                .map_err(|_| io::Error::other("the Core lifecycle lock is unavailable"))
-                .and_then(|_guard| {
-                    core_runtime
-                        .stop(&owner)
-                        .map(|_| ())
-                        .map_err(|_| io::Error::other("the Managed Core could not stop"))
-                });
-            let close_result = owner_guard.close();
-            runtime_result.and(close_result)
+            let remaining = remaining_shutdown_budget(shutdown_deadline)?;
+            let drain_result = run_after_mutation_drain(drain.as_ref(), remaining, || {
+                let stop_result = lock_lifecycle_until(&lifecycle_lock, shutdown_deadline)
+                    .and_then(|_guard| {
+                        let remaining = remaining_shutdown_budget(shutdown_deadline)?;
+                        core_runtime
+                            .stop_with_timeout(&owner, remaining)
+                            .map(|_| ())
+                            .map_err(|_| io::Error::other("the Managed Core could not stop"))
+                    });
+                let remaining = remaining_shutdown_budget(shutdown_deadline)?;
+                let close_result = owner_guard.close_with_timeout(remaining);
+                stop_result.and(close_result)
+            });
+            let result = cancel_result.and(drain_result);
+            if result.is_err() {
+                owner_guard.defer_cleanup_to_service();
+            }
+            result
         },
-        || ipc_server.shutdown(),
-        || shutdown_server.shutdown(),
+        || ipc_server.shutdown_until(shutdown_deadline),
+        || shutdown_server.shutdown_until(shutdown_deadline),
     )
     .map_err(|_| {
         StartupError::new(
@@ -1202,7 +1221,15 @@ fn wait_for_supervisor_shutdown(
 struct OwnerSessionGuard {
     runtime: Arc<dyn CoreRuntime>,
     owner: OwnerSessionProof,
-    closed: AtomicBool,
+    cleanup_state: AtomicU8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum OwnerCleanupState {
+    Active = 0,
+    Closed = 1,
+    Deferred = 2,
 }
 
 impl OwnerSessionGuard {
@@ -1210,25 +1237,86 @@ impl OwnerSessionGuard {
         Self {
             runtime,
             owner,
-            closed: AtomicBool::new(false),
+            cleanup_state: AtomicU8::new(OwnerCleanupState::Active as u8),
         }
     }
 
-    fn close(&self) -> io::Result<()> {
-        if self.closed.swap(true, Ordering::AcqRel) {
+    fn close_with_timeout(&self, timeout: Duration) -> io::Result<()> {
+        if self.cleanup_state.load(Ordering::Acquire) != OwnerCleanupState::Active as u8 {
             return Ok(());
         }
-        self.runtime
-            .close_owner_session(&self.owner)
-            .map_err(|_| io::Error::other("the Core owner session could not close"))
+        let result = self
+            .runtime
+            .close_owner_session_with_timeout(&self.owner, timeout)
+            .map_err(|_| io::Error::other("the Core owner session could not close"));
+        self.cleanup_state.store(
+            if result.is_ok() {
+                OwnerCleanupState::Closed
+            } else {
+                OwnerCleanupState::Deferred
+            } as u8,
+            Ordering::Release,
+        );
+        result
+    }
+
+    fn defer_cleanup_to_service(&self) {
+        let _ = self.cleanup_state.compare_exchange(
+            OwnerCleanupState::Active as u8,
+            OwnerCleanupState::Deferred as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 }
 
 impl Drop for OwnerSessionGuard {
     fn drop(&mut self) {
-        if !self.closed.swap(true, Ordering::AcqRel) {
-            let _ = self.runtime.stop(&self.owner);
-            let _ = self.runtime.close_owner_session(&self.owner);
+        if self
+            .cleanup_state
+            .compare_exchange(
+                OwnerCleanupState::Active as u8,
+                OwnerCleanupState::Deferred as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let closed = self.runtime.close_owner_session(&self.owner).is_ok();
+            if closed {
+                self.cleanup_state
+                    .store(OwnerCleanupState::Closed as u8, Ordering::Release);
+            }
+        }
+    }
+}
+
+fn remaining_shutdown_budget(deadline: Instant) -> io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "The Supervisor shutdown deadline expired",
+        ))
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn lock_lifecycle_until(
+    lifecycle_lock: &Mutex<()>,
+    deadline: Instant,
+) -> io::Result<std::sync::MutexGuard<'_, ()>> {
+    loop {
+        match lifecycle_lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(io::Error::other("the Core lifecycle lock is unavailable"));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let remaining = remaining_shutdown_budget(deadline)?;
+                thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
         }
     }
 }
@@ -1259,17 +1347,45 @@ where
         .and(control_ipc_result)
 }
 
+fn run_after_mutation_drain<T>(
+    drain: &DrainController,
+    timeout: Duration,
+    teardown: T,
+) -> io::Result<()>
+where
+    T: FnOnce() -> io::Result<()>,
+{
+    if !drain.wait_for_mutations(timeout) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "The Supervisor mutation drain deadline expired",
+        ));
+    }
+    teardown()
+}
+
 #[derive(Default)]
 struct DrainState {
     requested: bool,
     active_mutations: usize,
 }
 
-#[derive(Default)]
 struct DrainController {
     state: Mutex<DrainState>,
     ready: Condvar,
     waker: Mutex<Option<RuntimeWaker>>,
+    cancellation: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl Default for DrainController {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(DrainState::default()),
+            ready: Condvar::new(),
+            waker: Mutex::new(None),
+            cancellation: Mutex::new(None),
+        }
+    }
 }
 
 impl DrainController {
@@ -1278,9 +1394,19 @@ impl DrainController {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first_request = !state.requested;
         state.requested = true;
         self.ready.notify_all();
         drop(state);
+        if first_request
+            && let Some(cancellation) = self
+                .cancellation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        {
+            cancellation();
+        }
         if let Some(waker) = self
             .waker
             .lock()
@@ -1298,6 +1424,16 @@ impl DrainController {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(waker.clone());
         if self.is_requested() {
             waker.wake();
+        }
+    }
+
+    fn install_cancellation(&self, cancellation: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&cancellation));
+        if self.is_requested() {
+            cancellation();
         }
     }
 
@@ -1322,15 +1458,29 @@ impl DrainController {
         })
     }
 
-    fn wait_for_mutations(&self) {
-        let state = self
+    fn wait_for_mutations(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
+        let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _guard = self
-            .ready
-            .wait_while(state, |state| state.active_mutations > 0)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.active_mutations > 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, timed_out) = self
+                .ready
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+            if timed_out.timed_out() && state.active_mutations > 0 {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -1505,12 +1655,29 @@ impl SupervisorObserver {
     }
 
     fn shutdown(&mut self) -> io::Result<()> {
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
         self.shutdown.request();
-        self.thread.take().map_or(Ok(()), |thread| {
-            thread
-                .join()
-                .map_err(|_| io::Error::other("the Supervisor observer panicked"))
-        })
+        thread
+            .join()
+            .map_err(|_| io::Error::other("the Supervisor observer panicked"))
+    }
+
+    fn shutdown_until(&mut self, deadline: Instant) -> io::Result<()> {
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        self.shutdown.request();
+        if !wait_until_thread_finished(&thread, deadline) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "The Supervisor observer exceeded the shutdown deadline",
+            ));
+        }
+        thread
+            .join()
+            .map_err(|_| io::Error::other("the Supervisor observer panicked"))
     }
 }
 
@@ -1520,13 +1687,23 @@ impl Drop for SupervisorObserver {
     }
 }
 
+fn wait_until_thread_finished<T>(thread: &JoinHandle<T>, deadline: Instant) -> bool {
+    while !thread.is_finished() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(1)));
+    }
+    true
+}
+
 fn observer_loop(dependencies: ObserverDependencies, shutdown: Arc<WakeSignal>) {
     let mut status_sequence = 0_u64;
     let mut previous_status = None;
     let mut supervisor_log_sequence = None;
     let mut broker_logs_seeded = false;
     let mut service_log_sequence = None;
-    let mut service_dropped_before = 0_u64;
     let mut pending_service_drops = 0_u64;
 
     while !shutdown.is_requested() {
@@ -1545,10 +1722,7 @@ fn observer_loop(dependencies: ObserverDependencies, shutdown: Arc<WakeSignal>) 
                     .supervisor
                     .execute(ApplicationOperation::GetStatus);
             }
-            pending_service_drops = pending_service_drops.saturating_add(dropped_sequence_delta(
-                &mut service_dropped_before,
-                batch.dropped_before,
-            ));
+            pending_service_drops = pending_service_drops.saturating_add(batch.dropped_since_after);
             if pending_service_drops > 0
                 && let Some(core) = &current_core
                 && dependencies
@@ -1606,13 +1780,13 @@ fn observer_loop(dependencies: ObserverDependencies, shutdown: Arc<WakeSignal>) 
             .core_log_tail(supervisor_log_sequence)
         {
             if !broker_logs_seeded || tail.gap {
-                let latest_sequence = tail.latest_sequence;
+                let sequence_horizon = tail.sequence_horizon;
                 if dependencies.broker.synchronize_log_tail(tail).is_ok() {
                     broker_logs_seeded = true;
-                    supervisor_log_sequence = latest_sequence.or(supervisor_log_sequence);
+                    supervisor_log_sequence = sequence_horizon.or(supervisor_log_sequence);
                 }
             } else {
-                let latest_sequence = tail.latest_sequence;
+                let sequence_horizon = tail.sequence_horizon;
                 let mut synchronized = true;
                 for record in tail.records {
                     let sequence = record.sequence();
@@ -1625,7 +1799,7 @@ fn observer_loop(dependencies: ObserverDependencies, shutdown: Arc<WakeSignal>) 
                     }
                 }
                 if synchronized {
-                    supervisor_log_sequence = latest_sequence.or(supervisor_log_sequence);
+                    supervisor_log_sequence = sequence_horizon.or(supervisor_log_sequence);
                 }
             }
         }
@@ -1650,12 +1824,6 @@ fn observer_loop(dependencies: ObserverDependencies, shutdown: Arc<WakeSignal>) 
         }
         shutdown.wait(STATUS_SAMPLE_INTERVAL);
     }
-}
-
-fn dropped_sequence_delta(previous: &mut u64, current: u64) -> u64 {
-    let delta = current.saturating_sub(*previous);
-    *previous = current;
-    delta
 }
 
 fn update_instance_record(
@@ -1914,17 +2082,6 @@ fn run_log_signal_worker(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
-
-    #[test]
-    fn forwarded_log_drop_sequence_reports_only_new_loss() {
-        let mut previous = 0;
-
-        assert_eq!(dropped_sequence_delta(&mut previous, 7), 7);
-        assert_eq!(dropped_sequence_delta(&mut previous, 7), 0);
-        assert_eq!(dropped_sequence_delta(&mut previous, 11), 4);
-        assert_eq!(dropped_sequence_delta(&mut previous, 3), 0);
-        assert_eq!(previous, 3);
-    }
 
     #[derive(Default)]
     struct TestShutdownSignal {
@@ -2424,9 +2581,9 @@ mod tests {
         let (finished_sender, finished_receiver) = mpsc::sync_channel(1);
         let waiting_drain = Arc::clone(&drain);
         let waiter = thread::spawn(move || {
-            waiting_drain.wait_for_mutations();
+            let drained = waiting_drain.wait_for_mutations(Duration::from_secs(1));
             finished_sender
-                .send(())
+                .send(drained)
                 .expect("the fixture completion should send");
         });
         assert!(
@@ -2444,5 +2601,92 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("drain should finish after the active mutation");
         waiter.join().expect("the drain waiter should finish");
+    }
+
+    #[test]
+    fn shutdown_cancels_a_stalled_profile_add_and_reaches_stopping_state() {
+        let drain = Arc::new(DrainController::default());
+        let delegate = Arc::new(BlockingMutationApplication::new());
+        let release = Arc::clone(&delegate);
+        drain.install_cancellation(Arc::new(move || release.release()));
+        let application = Arc::new(SupervisorApplication {
+            supervisor: Arc::clone(&delegate),
+            drain: Arc::clone(&drain),
+        });
+        let active_application = Arc::clone(&application);
+        let active = thread::spawn(move || {
+            active_application.execute(ApplicationOperation::ProfileAdd {
+                subscription_url: crate::domain::SubscriptionUrl::parse(
+                    "https://fixture.invalid/profile.yaml",
+                )
+                .expect("the fixture URL should parse"),
+            })
+        });
+        delegate.wait_until_entered();
+
+        drain.request();
+
+        assert!(drain.wait_for_mutations(Duration::from_secs(1)));
+        let output = active
+            .join()
+            .expect("the Profile Add worker should finish")
+            .expect("the cancelled fixture should return its final status");
+        let ApplicationOutput::Status(status) = output else {
+            panic!("the fixture should return status");
+        };
+        assert_eq!(status.supervisor.lifecycle, SupervisorLifecycle::Stopping);
+    }
+
+    #[test]
+    fn drain_timeout_skips_core_teardown_until_the_mutation_finishes() {
+        let drain = Arc::new(DrainController::default());
+        let _mutation = drain
+            .begin_mutation()
+            .expect("the fixture mutation should enter");
+        drain.request();
+        let teardown_called = AtomicBool::new(false);
+
+        let error = run_after_mutation_drain(&drain, Duration::from_millis(20), || {
+            teardown_called.store(true, Ordering::Release);
+            Ok(())
+        })
+        .expect_err("a stalled mutation should reach the drain deadline");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(!teardown_called.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn observer_shutdown_releases_a_stalled_thread_at_the_absolute_deadline() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_finished = Arc::clone(&finished);
+        let mut observer = SupervisorObserver {
+            shutdown: Arc::new(WakeSignal::default()),
+            thread: Some(thread::spawn(move || {
+                let _ = blocked.recv();
+                worker_finished.store(true, Ordering::Release);
+            })),
+        };
+        let started = Instant::now();
+
+        let error = observer
+            .shutdown_until(Instant::now() + Duration::from_millis(10))
+            .expect_err("the stalled observer should reach the shutdown deadline");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(observer.thread.is_none());
+        release
+            .send(())
+            .expect("the fixture observer should release");
+        let finish_deadline = Instant::now() + Duration::from_secs(1);
+        while !finished.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < finish_deadline,
+                "the detached fixture observer should finish"
+            );
+            thread::yield_now();
+        }
     }
 }

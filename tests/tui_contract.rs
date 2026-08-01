@@ -12,8 +12,9 @@ use ratatui::layout::Rect;
 
 use hopash::application::{LatencyFreshness, LatencyProbeStatus};
 use hopash::constants::{
-    LOG_CAPACITY, MAX_ACTIVE_NODES, MINIMUM_TERMINAL_HEIGHT, MINIMUM_TERMINAL_WIDTH,
-    TRAFFIC_SERIES_CAPACITY, TUI_SEARCH_MAX_BYTES, TUI_SEARCH_MAX_CHARACTERS,
+    CORE_LOG_LINE_MAX_BYTES, LOG_CAPACITY, LOG_RETENTION_MAX_BYTES, MAX_ACTIVE_NODES,
+    MINIMUM_TERMINAL_HEIGHT, MINIMUM_TERMINAL_WIDTH, TRAFFIC_SERIES_CAPACITY, TUI_SEARCH_MAX_BYTES,
+    TUI_SEARCH_MAX_CHARACTERS,
 };
 use hopash::domain::{
     ActiveProfileSummary, ApplyState, CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus,
@@ -511,12 +512,15 @@ fn every_search_field_enforces_character_and_utf8_byte_limits() {
         utf8.page = page;
         utf8.focus = Focus::Search;
         for _ in 0..TUI_SEARCH_MAX_CHARACTERS + 1 {
-            update(&mut utf8, UiEvent::Intent(UiIntent::InputCharacter('界')));
+            update(
+                &mut utf8,
+                UiEvent::Intent(UiIntent::InputCharacter('\u{754c}')),
+            );
         }
         let utf8_search = search_for_page(&utf8, page);
         assert!(utf8_search.chars().count() <= TUI_SEARCH_MAX_CHARACTERS);
         assert!(utf8_search.len() <= TUI_SEARCH_MAX_BYTES);
-        assert!(utf8_search.len().saturating_add('界'.len_utf8()) > TUI_SEARCH_MAX_BYTES);
+        assert!(utf8_search.len().saturating_add('\u{754c}'.len_utf8()) > TUI_SEARCH_MAX_BYTES);
     }
 }
 
@@ -958,6 +962,8 @@ fn collection_revision_discards_a_refresh_started_before_a_relevant_status_chang
 #[test]
 fn disconnect_retains_a_stale_snapshot_and_reconnect_replaces_all_view_data() {
     let mut state = connected_state();
+    state.logs.dropped_total = 9;
+    state.logs.evicted_total = 2;
     let old_status_started_at = state
         .status
         .as_ref()
@@ -1026,7 +1032,8 @@ fn disconnect_retains_a_stale_snapshot_and_reconnect_replaces_all_view_data() {
     assert_eq!(state.proxies.rows[0].name, "Replacement Node");
     assert_eq!(state.profiles.rows[0].name, "Replacement");
     assert_eq!(state.logs.records[0].sequence, 99);
-    assert_eq!(state.logs.dropped_total, 4);
+    assert_eq!(state.logs.dropped_total, 9);
+    assert_eq!(state.logs.evicted_total, 2);
 }
 
 #[test]
@@ -1063,6 +1070,55 @@ fn view_caches_remain_bounded_at_release_scale() {
         hopash::tui::PROFILE_VIEW_CAPACITY
     );
     assert_eq!(state.logs.records.len(), LOG_CAPACITY);
+}
+
+#[test]
+fn log_view_evicts_by_aggregate_message_bytes() {
+    let retained_records = LOG_RETENTION_MAX_BYTES / CORE_LOG_LINE_MAX_BYTES;
+    let message = "x".repeat(CORE_LOG_LINE_MAX_BYTES);
+    let mut state = connected_state();
+
+    update(
+        &mut state,
+        UiEvent::LogBatch {
+            connection_generation: 1,
+            records: (0..=retained_records)
+                .map(|index| log(index as u64, LogLevel::Info, &message))
+                .collect(),
+            gap: false,
+            dropped_total: 0,
+        },
+    );
+
+    assert_eq!(state.logs.records.len(), retained_records);
+    assert_eq!(state.logs.retained_bytes, LOG_RETENTION_MAX_BYTES);
+    assert_eq!(state.logs.evicted_total, 2);
+}
+
+#[test]
+fn log_drop_counter_remains_monotonic_across_recovery_batches() {
+    let mut state = connected_state();
+
+    update(
+        &mut state,
+        UiEvent::LogBatch {
+            connection_generation: 1,
+            records: Vec::new(),
+            gap: true,
+            dropped_total: 9,
+        },
+    );
+    update(
+        &mut state,
+        UiEvent::LogBatch {
+            connection_generation: 1,
+            records: Vec::new(),
+            gap: false,
+            dropped_total: 3,
+        },
+    );
+
+    assert_eq!(state.logs.dropped_total, 9);
 }
 
 #[test]

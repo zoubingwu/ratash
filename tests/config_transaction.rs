@@ -199,6 +199,7 @@ impl BlockPoint {
 struct FakeValidator {
     fail_next: AtomicBool,
     block_next: Mutex<Option<Arc<BlockPoint>>>,
+    active_block: Mutex<Option<Arc<BlockPoint>>>,
     events: Arc<Mutex<Vec<String>>>,
 }
 
@@ -223,12 +224,25 @@ impl CoreConfigValidator for FakeValidator {
             .expect("event lock")
             .push("validate".to_owned());
         if let Some(point) = self.block_next.lock().expect("block lock").take() {
+            *self.active_block.lock().expect("active block lock") = Some(Arc::clone(&point));
             point.wait();
+            self.active_block.lock().expect("active block lock").take();
         }
         if self.fail_next.swap(false, Ordering::AcqRel) {
             Err(CoreValidationError::new("injected validation failure"))
         } else {
             Ok(())
+        }
+    }
+
+    fn cancel_pending(&self) {
+        if let Some(point) = self
+            .active_block
+            .lock()
+            .expect("active block lock")
+            .as_ref()
+        {
+            point.release();
         }
     }
 }
@@ -278,6 +292,8 @@ struct FakeRuntimeState {
 struct FakeRuntime {
     state: Mutex<FakeRuntimeState>,
     events: Arc<Mutex<Vec<String>>>,
+    block_next: Mutex<Option<Arc<BlockPoint>>>,
+    active_block: Mutex<Option<Arc<BlockPoint>>>,
 }
 
 impl FakeRuntime {
@@ -320,6 +336,10 @@ impl FakeRuntime {
     fn event(&self, event: String) {
         self.events.lock().expect("event lock").push(event);
     }
+
+    fn block_next(&self, point: Arc<BlockPoint>) {
+        *self.block_next.lock().expect("runtime block lock") = Some(point);
+    }
 }
 
 impl RuntimeApplyPort for FakeRuntime {
@@ -329,6 +349,11 @@ impl RuntimeApplyPort for FakeRuntime {
         bundle: &RuntimeBundle,
     ) -> Result<ApplyCandidateResult, RuntimeApplyFailure> {
         self.event(format!("apply:{}", bundle.generation.0));
+        if let Some(point) = self.block_next.lock().expect("runtime block lock").take() {
+            *self.active_block.lock().expect("active block lock") = Some(Arc::clone(&point));
+            point.wait();
+            self.active_block.lock().expect("active block lock").take();
+        }
         let mut state = self.state.lock().expect("runtime lock");
         let script = state.scripts.pop_front().unwrap_or(ApplyScript::Success);
         match script {
@@ -379,6 +404,17 @@ impl RuntimeApplyPort for FakeRuntime {
         self.event("stop".to_owned());
         self.state.lock().expect("runtime lock").managed_core = None;
         Ok(())
+    }
+
+    fn cancel_pending_apply(&self) {
+        if let Some(point) = self
+            .active_block
+            .lock()
+            .expect("active block lock")
+            .as_ref()
+        {
+            point.release();
+        }
     }
 }
 
@@ -476,10 +512,13 @@ impl Harness {
                 mismatch_endpoint_once: false,
             }),
             events: events.clone(),
+            block_next: Mutex::new(None),
+            active_block: Mutex::new(None),
         });
         let validator = Arc::new(FakeValidator {
             fail_next: AtomicBool::new(false),
             block_next: Mutex::new(None),
+            active_block: Mutex::new(None),
             events: events.clone(),
         });
         let health = Arc::new(FakeHealth {
@@ -892,6 +931,69 @@ fn definite_apply_failure_rolls_back_to_the_previous_generation() {
     assert_eq!(harness.committed_generation(), Some(RuntimeGeneration(1)));
     assert_eq!(harness.runtime.generation(), Some(RuntimeGeneration(1)));
     assert!(!harness.has_prepared());
+}
+
+#[test]
+fn shutdown_cancels_validation_and_preserves_the_prepared_journal() {
+    let harness = Harness::new();
+    harness.commit_initial();
+    let candidate = harness.candidate(2);
+    let (point, entered) = BlockPoint::new();
+    harness.validator.block_next(point);
+    let coordinator = Arc::clone(&harness.coordinator);
+    let worker = std::thread::spawn(move || coordinator.execute(&candidate));
+    entered
+        .recv_timeout(Duration::from_secs(1))
+        .expect("validation should reach the cancellable fixture");
+
+    harness.coordinator.request_shutdown();
+
+    let error = worker
+        .join()
+        .expect("the validation worker should finish")
+        .expect_err("shutdown should interrupt validation before Runtime Apply");
+    assert_eq!(error.kind, ConfigTransactionErrorKind::Shutdown);
+    assert_eq!(
+        error.recovery,
+        RecoveryOutcome::Pending {
+            target: Some(RuntimeGeneration(1))
+        }
+    );
+    assert_eq!(harness.committed_generation(), Some(RuntimeGeneration(1)));
+    assert!(harness.has_prepared());
+    assert!(!harness.events().iter().any(|event| event == "apply:2"));
+    assert!(!harness.events().iter().any(|event| event == "commit"));
+}
+
+#[test]
+fn shutdown_cancels_runtime_apply_and_preserves_the_prepared_journal() {
+    let harness = Harness::new();
+    harness.commit_initial();
+    let candidate = harness.candidate(2);
+    let (point, entered) = BlockPoint::new();
+    harness.runtime.block_next(point);
+    let coordinator = Arc::clone(&harness.coordinator);
+    let worker = std::thread::spawn(move || coordinator.execute(&candidate));
+    entered
+        .recv_timeout(Duration::from_secs(1))
+        .expect("Runtime Apply should reach the cancellable fixture");
+
+    harness.coordinator.request_shutdown();
+
+    let error = worker
+        .join()
+        .expect("the Runtime Apply worker should finish")
+        .expect_err("shutdown should interrupt Runtime Apply before commit");
+    assert_eq!(error.kind, ConfigTransactionErrorKind::Shutdown);
+    assert_eq!(
+        error.recovery,
+        RecoveryOutcome::Pending {
+            target: Some(RuntimeGeneration(1))
+        }
+    );
+    assert_eq!(harness.committed_generation(), Some(RuntimeGeneration(1)));
+    assert!(harness.has_prepared());
+    assert!(!harness.events().iter().any(|event| event == "commit"));
 }
 
 #[test]
