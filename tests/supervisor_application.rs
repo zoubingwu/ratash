@@ -16,8 +16,8 @@ use hopash::domain::{
 use hopash::state::{AuthoritativeState, AuthoritativeStateStore};
 use hopash::supervisor::{
     FetchedProfile, ProfileFetchError, ProfileFetchPort, Supervisor, SupervisorCorePort,
-    SupervisorDependencies, SupervisorTransactionFailure, SupervisorTransactionPort,
-    SupervisorTransactionRequest, TelemetryStream,
+    SupervisorDependencies, SupervisorRuleTransactionReservation, SupervisorTransactionFailure,
+    SupervisorTransactionPort, SupervisorTransactionRequest, TelemetryStream,
 };
 use hopash::transaction::{
     CandidateRevisions, ConfigTransactionSuccess, RecoveryOutcome as TransactionRecoveryOutcome,
@@ -219,6 +219,13 @@ impl ProfileFetchPort for BlockingProfileSource {
 struct UnusedTransactions;
 
 impl SupervisorTransactionPort for UnusedTransactions {
+    fn try_reserve_rule(
+        &self,
+    ) -> Result<Box<dyn SupervisorRuleTransactionReservation + '_>, SupervisorTransactionFailure>
+    {
+        panic!("the zero-Profile status path must not reserve a transaction")
+    }
+
     fn apply(
         &self,
         _request: SupervisorTransactionRequest<'_>,
@@ -447,7 +454,34 @@ impl PersistingTransactions {
     }
 }
 
+struct PersistingRuleTransactionReservation<'a> {
+    transactions: &'a PersistingTransactions,
+}
+
+impl SupervisorRuleTransactionReservation for PersistingRuleTransactionReservation<'_> {
+    fn apply(
+        &self,
+        request: SupervisorTransactionRequest<'_>,
+    ) -> Result<ConfigTransactionSuccess, SupervisorTransactionFailure> {
+        self.transactions.apply(request, false)
+    }
+}
+
 impl SupervisorTransactionPort for PersistingTransactions {
+    fn try_reserve_rule(
+        &self,
+    ) -> Result<Box<dyn SupervisorRuleTransactionReservation + '_>, SupervisorTransactionFailure>
+    {
+        if self.busy_next_rule.swap(false, Ordering::Relaxed) {
+            return Err(SupervisorTransactionFailure::new(
+                hopash::supervisor::SupervisorTransactionFailureKind::Busy,
+            ));
+        }
+        Ok(Box::new(PersistingRuleTransactionReservation {
+            transactions: self,
+        }))
+    }
+
     fn apply(
         &self,
         request: SupervisorTransactionRequest<'_>,
@@ -850,6 +884,34 @@ impl Drop for TestDirectory {
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.path).expect("the test directory should be removed");
     }
+}
+
+fn directory_snapshot(root: &std::path::Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(
+        root: &std::path::Path,
+        directory: &std::path::Path,
+        files: &mut BTreeMap<PathBuf, Vec<u8>>,
+    ) {
+        for entry in std::fs::read_dir(directory).expect("the fixture directory should be readable")
+        {
+            let entry = entry.expect("the fixture entry should be readable");
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, files);
+            } else {
+                files.insert(
+                    path.strip_prefix(root)
+                        .expect("the fixture path should remain inside its root")
+                        .to_path_buf(),
+                    std::fs::read(path).expect("the fixture file should be readable"),
+                );
+            }
+        }
+    }
+
+    let mut files = BTreeMap::new();
+    visit(root, root, &mut files);
+    files
 }
 
 #[test]
@@ -2049,6 +2111,62 @@ fn latency_show_prefers_opaque_id_and_reports_name_ambiguity() {
 }
 
 #[test]
+fn probe_surfaces_share_the_active_profile_node_boundary() {
+    let harness = Harness::new("probe-node-boundary");
+    let mut view = fixture_proxy_view();
+    for name in ["DIRECT", "REJECT"] {
+        let record_id = NodeRecordId::for_core(name);
+        view.groups[0].members.push(ProxyMember::Node {
+            name: name.to_owned(),
+            record_id: record_id.clone(),
+            availability: Availability::Available,
+        });
+        view.nodes.insert(
+            record_id.clone(),
+            ProxyNode {
+                record_id,
+                name: name.to_owned(),
+                proxy_type: name.to_owned(),
+                availability: Availability::Available,
+                core_internal: true,
+                source: NodeSource::Core {
+                    proxy_name: name.to_owned(),
+                },
+            },
+        );
+    }
+    harness.core.state.lock().expect("the Core lock").view = view;
+    harness.queue_profile("Primary", "node-a");
+    let supervisor = harness.open();
+    add_profile(&supervisor, "https://example.test/primary.yaml");
+
+    let probes = supervisor
+        .take_due_probes()
+        .expect("due probes should remain available");
+    assert_eq!(probes.len(), 1);
+    assert_eq!(probes[0].task.node_id, NodeRecordId::for_core("node-a"));
+
+    let ApplicationOutput::Latencies(latencies) = supervisor
+        .execute(ApplicationOperation::LatencyList)
+        .expect("Latency list should remain available")
+    else {
+        panic!("Latency list should return Latencies")
+    };
+    assert_eq!(latencies.samples.len(), 1);
+    assert_eq!(latencies.samples[0].node_name, "node-a");
+
+    for selector in [
+        "DIRECT".to_owned(),
+        NodeRecordId::for_core("REJECT").as_str().to_owned(),
+    ] {
+        let error = supervisor
+            .execute(ApplicationOperation::LatencyShow { node: selector })
+            .expect_err("Core-internal targets should stay outside Delay Probe surfaces");
+        assert_eq!(error.code, hopash::error::ErrorCode::NodeNotFound);
+    }
+}
+
+#[test]
 fn proxy_and_rule_ambiguity_use_their_stable_error_codes() {
     let proxy_harness = Harness::new("proxy-ambiguity-code");
     proxy_harness.core.state.lock().expect("the Core lock").view = duplicate_node_name_proxy_view();
@@ -2168,7 +2286,11 @@ fn proxy_rows_preserve_group_and_unresolved_member_states() {
             selectable: false,
             core_internal: false,
             selected_name: None,
-            members: Vec::new(),
+            members: vec![ProxyMember::Node {
+                name: "node-a".to_owned(),
+                record_id: NodeRecordId::for_core("node-a"),
+                availability: Availability::Available,
+            }],
         },
     ]);
     harness.core.state.lock().expect("the Core lock").view = view;
@@ -2195,7 +2317,7 @@ fn proxy_rows_preserve_group_and_unresolved_member_states() {
             .iter()
             .map(|group| group.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["Main", "Nested"]
+        vec!["Main", "Nested", "GLOBAL", "Fallback"]
     );
     assert_eq!(kinds["Nested"], hopash::application::ProxyMemberKind::Group);
     assert_eq!(
@@ -2231,6 +2353,35 @@ fn proxy_rows_preserve_group_and_unresolved_member_states() {
     assert_eq!(page.nodes_total, proxies.nodes.len());
     assert_eq!(page.groups, proxies.groups);
     assert_eq!(page.nodes, proxies.nodes);
+
+    let selections_before = harness
+        .core
+        .state
+        .lock()
+        .expect("the Core lock")
+        .selections
+        .len();
+    let error = supervisor
+        .execute(ApplicationOperation::ProxySelect {
+            group: "Fallback".to_owned(),
+            node: NodeRecordId::for_core("node-a").as_str().to_owned(),
+        })
+        .expect_err("a non-selectable Proxy Group should reject selection");
+    assert_eq!(error.code, hopash::error::ErrorCode::CoreUnavailable);
+    assert_eq!(
+        harness
+            .core
+            .state
+            .lock()
+            .expect("the Core lock")
+            .selections
+            .len(),
+        selections_before
+    );
+    assert_eq!(
+        get_status(&supervisor).primary_proxy_group.as_deref(),
+        Some("Main")
+    );
 }
 
 #[test]
@@ -2271,16 +2422,24 @@ fn rule_mutations_use_exact_strings_and_keep_authority_on_busy_or_apply_failure(
     assert_eq!(replaced.changed_rule, replacement);
     assert_eq!(replaced.resulting_position, Some(0));
 
+    let files_before = directory_snapshot(&harness.directory.path);
+    let apply_count_before = harness.transactions.apply_count.load(Ordering::Relaxed);
     harness
         .transactions
         .busy_next_rule
         .store(true, Ordering::Relaxed);
     let busy = supervisor
-        .execute(ApplicationOperation::RuleRemove {
-            rule: replacement.to_owned(),
+        .execute(ApplicationOperation::RuleAdd {
+            rule: "invalid".to_owned(),
+            placement: hopash::application::RulePlacement::Prepend,
         })
-        .expect_err("the busy transaction should fail immediately");
+        .expect_err("reservation should report busy before validating the Rule String");
     assert_eq!(busy.code, hopash::error::ErrorCode::RuleBusy);
+    assert_eq!(
+        harness.transactions.apply_count.load(Ordering::Relaxed),
+        apply_count_before
+    );
+    assert_eq!(directory_snapshot(&harness.directory.path), files_before);
     assert_eq!(rule_strings_from_application(&supervisor)[0], replacement);
 
     harness

@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use crate::application::{
     ApplicationClient, ApplicationError, ApplicationErrorDetails, ApplicationOperation,
@@ -64,6 +64,7 @@ use crate::transaction::{
     CandidateRevisionSource, CandidateRevisions, ConfigTransactionCandidate,
     ConfigTransactionCoordinator, ConfigTransactionError, ConfigTransactionErrorKind,
     ConfigTransactionSuccess, RecoveryOutcome as TransactionRecoveryOutcome,
+    RuleConfigTransactionReservation,
 };
 
 // -----------------------------------------------------------------------------
@@ -250,6 +251,10 @@ impl From<ConfigTransactionError> for SupervisorTransactionFailure {
 }
 
 pub trait SupervisorTransactionPort: Send + Sync {
+    fn try_reserve_rule(
+        &self,
+    ) -> Result<Box<dyn SupervisorRuleTransactionReservation + '_>, SupervisorTransactionFailure>;
+
     fn apply(
         &self,
         request: SupervisorTransactionRequest<'_>,
@@ -282,6 +287,13 @@ pub trait SupervisorTransactionPort: Send + Sync {
     }
 
     fn set_current_revisions(&self, revisions: CandidateRevisions);
+}
+
+pub trait SupervisorRuleTransactionReservation {
+    fn apply(
+        &self,
+        request: SupervisorTransactionRequest<'_>,
+    ) -> Result<ConfigTransactionSuccess, SupervisorTransactionFailure>;
 }
 
 pub trait RuntimeBundleStagePort: Send + Sync {
@@ -373,28 +385,13 @@ impl CoordinatedSupervisorTransactions {
             })
     }
 
-    fn apply_transaction(
+    fn apply_staged_transaction(
         &self,
         request: SupervisorTransactionRequest<'_>,
-        fail_fast: bool,
-        startup: bool,
+        execute: impl FnOnce(
+            &ConfigTransactionCandidate,
+        ) -> Result<ConfigTransactionSuccess, ConfigTransactionError>,
     ) -> Result<ConfigTransactionSuccess, SupervisorTransactionFailure> {
-        let _guard = if fail_fast {
-            self.transaction_lock
-                .try_lock()
-                .map_err(|error| match error {
-                    TryLockError::WouldBlock => {
-                        SupervisorTransactionFailure::new(SupervisorTransactionFailureKind::Busy)
-                    }
-                    TryLockError::Poisoned(_) => {
-                        SupervisorTransactionFailure::new(SupervisorTransactionFailureKind::State)
-                    }
-                })?
-        } else {
-            self.transaction_lock.lock().map_err(|_| {
-                SupervisorTransactionFailure::new(SupervisorTransactionFailureKind::State)
-            })?
-        };
         let transaction = self.stage_state(&request)?;
         let runtime = self
             .bundles
@@ -410,13 +407,7 @@ impl CoordinatedSupervisorTransactions {
             configuration: request.configuration.clone(),
             revisions: request.revisions,
         };
-        let result = if startup {
-            self.coordinator.execute_startup_reapply(&candidate)
-        } else if fail_fast {
-            self.coordinator.try_execute_rule(&candidate)
-        } else {
-            self.coordinator.execute(&candidate)
-        };
+        let result = execute(&candidate);
         match result {
             Ok(success) => Ok(success),
             Err(error) => {
@@ -427,20 +418,73 @@ impl CoordinatedSupervisorTransactions {
     }
 }
 
+struct CoordinatedRuleTransactionReservation<'a> {
+    transactions: &'a CoordinatedSupervisorTransactions,
+    coordinator: RuleConfigTransactionReservation<'a>,
+    _transaction_guard: MutexGuard<'a, ()>,
+}
+
+impl SupervisorRuleTransactionReservation for CoordinatedRuleTransactionReservation<'_> {
+    fn apply(
+        &self,
+        request: SupervisorTransactionRequest<'_>,
+    ) -> Result<ConfigTransactionSuccess, SupervisorTransactionFailure> {
+        self.transactions
+            .apply_staged_transaction(request, |candidate| self.coordinator.execute(candidate))
+    }
+}
+
 impl SupervisorTransactionPort for CoordinatedSupervisorTransactions {
+    fn try_reserve_rule(
+        &self,
+    ) -> Result<Box<dyn SupervisorRuleTransactionReservation + '_>, SupervisorTransactionFailure>
+    {
+        let transaction_guard = self
+            .transaction_lock
+            .try_lock()
+            .map_err(|error| match error {
+                TryLockError::WouldBlock => {
+                    SupervisorTransactionFailure::new(SupervisorTransactionFailureKind::Busy)
+                }
+                TryLockError::Poisoned(_) => {
+                    SupervisorTransactionFailure::new(SupervisorTransactionFailureKind::State)
+                }
+            })?;
+        let coordinator = self
+            .coordinator
+            .try_reserve_rule()
+            .map_err(SupervisorTransactionFailure::from)?;
+        Ok(Box::new(CoordinatedRuleTransactionReservation {
+            transactions: self,
+            coordinator,
+            _transaction_guard: transaction_guard,
+        }))
+    }
+
     fn apply(
         &self,
         request: SupervisorTransactionRequest<'_>,
         fail_fast: bool,
     ) -> Result<ConfigTransactionSuccess, SupervisorTransactionFailure> {
-        self.apply_transaction(request, fail_fast, false)
+        if fail_fast {
+            return self.try_reserve_rule()?.apply(request);
+        }
+        let _guard = self.transaction_lock.lock().map_err(|_| {
+            SupervisorTransactionFailure::new(SupervisorTransactionFailureKind::State)
+        })?;
+        self.apply_staged_transaction(request, |candidate| self.coordinator.execute(candidate))
     }
 
     fn apply_startup(
         &self,
         request: SupervisorTransactionRequest<'_>,
     ) -> Result<ConfigTransactionSuccess, SupervisorTransactionFailure> {
-        self.apply_transaction(request, false, true)
+        let _guard = self.transaction_lock.lock().map_err(|_| {
+            SupervisorTransactionFailure::new(SupervisorTransactionFailureKind::State)
+        })?;
+        self.apply_staged_transaction(request, |candidate| {
+            self.coordinator.execute_startup_reapply(candidate)
+        })
     }
 
     fn persist_metadata(
@@ -1517,7 +1561,6 @@ impl Supervisor {
         let groups = view
             .groups
             .iter()
-            .filter(|group| group.selectable && !group.core_internal)
             .map(|group| proxy_group_summary(&view, group))
             .collect();
         Ok(ApplicationOutput::Proxies(ProxyListOutcome {
@@ -1547,11 +1590,7 @@ impl Supervisor {
         let (nodes_total, rows) = view
             .node_rows_page(&group.name, &observations, nodes_offset, IPC_LIST_PAGE_SIZE)
             .map_err(map_selection_error)?;
-        let groups_total = view
-            .groups
-            .iter()
-            .filter(|group| group.selectable && !group.core_internal)
-            .count();
+        let groups_total = view.groups.len();
         Ok(ApplicationOutput::ProxyPage(ProxyListPageOutcome {
             snapshot_id: proxy_list_snapshot_id(&view, core.instance_generation),
             group: proxy_group_summary(&view, group),
@@ -1560,7 +1599,6 @@ impl Supervisor {
             groups: view
                 .groups
                 .iter()
-                .filter(|group| group.selectable && !group.core_internal)
                 .skip(groups_offset)
                 .take(IPC_LIST_PAGE_SIZE)
                 .map(|group| proxy_group_summary(&view, group))
@@ -1656,6 +1694,7 @@ impl Supervisor {
         let samples = view
             .nodes
             .values()
+            .filter(|node| probe_eligible_node(node))
             .map(|node| {
                 latency_summary(&state, node.record_id.clone(), &node.name, generation, now)
             })
@@ -1714,6 +1753,10 @@ impl Supervisor {
     }
 
     fn rule_mutation(&self, mutation: RuleMutation) -> Result<ApplicationOutput, ApplicationError> {
+        let reservation = self
+            .transactions
+            .try_reserve_rule()
+            .map_err(map_transaction_error)?;
         let mut state = match self.state.try_lock() {
             Ok(state) => state,
             Err(TryLockError::WouldBlock) => return Err(rule_busy_error()),
@@ -1766,13 +1809,13 @@ impl Supervisor {
         let configuration = self.compile(active, &rules)?;
         let generation = next_runtime_generation(state.runtime_generation)?;
         let _apply = self.begin_apply(generation, state.runtime_generation);
-        let result = self.apply_candidate(
-            &state.profiles,
-            &local_rules,
-            &configuration,
+        let result = reservation.apply(SupervisorTransactionRequest {
+            profiles: &state.profiles,
+            local_rules: &local_rules,
+            configuration: &configuration,
             generation,
-            true,
-        );
+            revisions: current_revisions(&state.profiles, &local_rules, Some(&configuration)),
+        });
         let success = self.settle_transaction(&mut state, result)?;
         state.local_rules = local_rules;
         state.effective_configuration = Some(configuration);
@@ -1959,7 +2002,7 @@ impl Supervisor {
         let nodes = view
             .nodes
             .values()
-            .filter(|node| !node.core_internal)
+            .filter(|node| probe_eligible_node(node))
             .map(|node| node.record_id.clone())
             .collect::<Vec<_>>();
         if state
@@ -2307,12 +2350,15 @@ fn selection_by_selector(
     group_name: &str,
     selector: &str,
 ) -> Result<NodeSelection, SelectionError> {
+    let group = view
+        .groups
+        .iter()
+        .find(|group| group.name == group_name)
+        .ok_or_else(|| SelectionError::GroupMissing(group_name.to_owned()))?;
+    if !group.selectable {
+        return Err(SelectionError::GroupNotSelectable(group_name.to_owned()));
+    }
     if let Ok(record_id) = NodeRecordId::parse(selector) {
-        let group = view
-            .groups
-            .iter()
-            .find(|group| group.name == group_name)
-            .ok_or_else(|| SelectionError::GroupMissing(group_name.to_owned()))?;
         let node = group.members.iter().find_map(|member| match member {
             crate::core::ProxyMember::Node {
                 name,
@@ -2601,12 +2647,13 @@ fn resolve_latency_node<'a>(
         return view
             .nodes
             .get(&id)
+            .filter(|node| probe_eligible_node(node))
             .ok_or_else(|| selector_not_found(SelectorKind::Node, "Node"));
     }
     let candidates = view
         .nodes
         .values()
-        .filter(|node| node.name == selector)
+        .filter(|node| probe_eligible_node(node) && node.name == selector)
         .collect::<Vec<_>>();
     match candidates.as_slice() {
         [] => Err(selector_not_found(SelectorKind::Node, "Node")),
@@ -2624,6 +2671,10 @@ fn resolve_latency_node<'a>(
                 .collect(),
         )),
     }
+}
+
+fn probe_eligible_node(node: &crate::core::ProxyNode) -> bool {
+    !node.core_internal
 }
 
 struct CoreHealthProjection {

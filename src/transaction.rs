@@ -317,6 +317,21 @@ pub struct ConfigTransactionCoordinator {
     owner: OwnerSessionProof,
 }
 
+pub(crate) struct RuleConfigTransactionReservation<'a> {
+    coordinator: &'a ConfigTransactionCoordinator,
+    _guard: MutexGuard<'a, ()>,
+}
+
+impl RuleConfigTransactionReservation<'_> {
+    pub(crate) fn execute(
+        &self,
+        candidate: &ConfigTransactionCandidate,
+    ) -> Result<ConfigTransactionSuccess, ConfigTransactionError> {
+        self.coordinator
+            .execute_guarded(candidate, FailureRecoveryMode::ConvergeCommitted)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum FailureRecoveryMode {
     ConvergeCommitted,
@@ -343,26 +358,32 @@ impl ConfigTransactionCoordinator {
         &self,
         candidate: &ConfigTransactionCandidate,
     ) -> Result<ConfigTransactionSuccess, ConfigTransactionError> {
-        let guard = self.coordinator_lock.lock().map_err(|_| {
+        let _guard = self.coordinator_lock.lock().map_err(|_| {
             ConfigTransactionError::simple(ConfigTransactionErrorKind::LockPoisoned)
         })?;
-        self.execute_guarded(candidate, guard, FailureRecoveryMode::ConvergeCommitted)
+        self.execute_guarded(candidate, FailureRecoveryMode::ConvergeCommitted)
     }
 
     pub fn execute_startup_reapply(
         &self,
         candidate: &ConfigTransactionCandidate,
     ) -> Result<ConfigTransactionSuccess, ConfigTransactionError> {
-        let guard = self.coordinator_lock.lock().map_err(|_| {
+        let _guard = self.coordinator_lock.lock().map_err(|_| {
             ConfigTransactionError::simple(ConfigTransactionErrorKind::LockPoisoned)
         })?;
-        self.execute_guarded(candidate, guard, FailureRecoveryMode::StopStartupCandidate)
+        self.execute_guarded(candidate, FailureRecoveryMode::StopStartupCandidate)
     }
 
     pub fn try_execute_rule(
         &self,
         candidate: &ConfigTransactionCandidate,
     ) -> Result<ConfigTransactionSuccess, ConfigTransactionError> {
+        self.try_reserve_rule()?.execute(candidate)
+    }
+
+    pub(crate) fn try_reserve_rule(
+        &self,
+    ) -> Result<RuleConfigTransactionReservation<'_>, ConfigTransactionError> {
         let guard = match self.coordinator_lock.try_lock() {
             Ok(guard) => guard,
             Err(TryLockError::WouldBlock) => {
@@ -376,7 +397,10 @@ impl ConfigTransactionCoordinator {
                 ));
             }
         };
-        self.execute_guarded(candidate, guard, FailureRecoveryMode::ConvergeCommitted)
+        Ok(RuleConfigTransactionReservation {
+            coordinator: self,
+            _guard: guard,
+        })
     }
 
     pub fn recover_startup(&self) -> Result<StartupRecovery, ConfigTransactionError> {
@@ -520,7 +544,6 @@ impl ConfigTransactionCoordinator {
     fn execute_guarded(
         &self,
         candidate: &ConfigTransactionCandidate,
-        _guard: MutexGuard<'_, ()>,
         failure_recovery_mode: FailureRecoveryMode,
     ) -> Result<ConfigTransactionSuccess, ConfigTransactionError> {
         let mut initial_state = self.store.recover().map_err(|_| {
