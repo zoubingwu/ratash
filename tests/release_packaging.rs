@@ -150,9 +150,31 @@ fn package_staging_contains_the_complete_installation_contract() {
         "/Library/Application Support/Hopash RS/runtime",
         "--mihomo",
         "/Library/Application Support/Hopash RS/bin/mihomo",
+        "<key>ExitTimeOut</key>",
+        "<integer>50</integer>",
     ] {
         assert!(plist.contains(required), "plist is missing {required}");
     }
+}
+
+#[test]
+fn postinstall_waits_for_a_booted_out_service_before_bootstrap() {
+    let script = fs::read_to_string(project_path("packaging/macos/scripts/postinstall"))
+        .expect("postinstall should be readable");
+    let bootout = script
+        .find("/bin/launchctl bootout")
+        .expect("postinstall should boot out the previous service");
+    let wait = script
+        .find("while /bin/launchctl print")
+        .expect("postinstall should wait for launchd to remove the previous service");
+    let bootstrap = script
+        .find("/bin/launchctl bootstrap")
+        .expect("postinstall should bootstrap the replacement service");
+
+    assert!(bootout < wait && wait < bootstrap);
+    assert!(script.contains("SERVICE_REMOVAL_ATTEMPTS=600"));
+    assert!(script.contains("/bin/sleep 0.1"));
+    assert!(script.contains("timed out waiting for the previous Core service to stop"));
 }
 
 #[cfg(target_os = "macos")]

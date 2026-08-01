@@ -25,6 +25,8 @@
   <string>Interactive</string>
   <key>ThrottleInterval</key>
   <integer>5</integer>
+  <key>ExitTimeOut</key>
+  <integer>50</integer>
   <key>Umask</key>
   <integer>63</integer>
 </dict>

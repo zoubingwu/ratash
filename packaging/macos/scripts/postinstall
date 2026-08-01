@@ -6,6 +6,7 @@ SERVICE_PLIST='/Library/LaunchDaemons/io.hopash.core-runtime.plist'
 SERVICE_EXECUTABLE='/Library/PrivilegedHelperTools/io.hopash.core-runtime'
 SERVICE_ROOT='/Library/Application Support/Hopash RS'
 CLI_EXECUTABLE='/usr/local/bin/hopash'
+SERVICE_REMOVAL_ATTEMPTS=600
 
 owner_uid=${HOPASH_OWNER_UID:-}
 if [ -z "$owner_uid" ]; then
@@ -30,6 +31,15 @@ fi
 /usr/bin/plutil -lint "$SERVICE_PLIST" >/dev/null
 
 /bin/launchctl bootout "system/$SERVICE_LABEL" >/dev/null 2>&1 || true
+attempt=0
+while /bin/launchctl print "system/$SERVICE_LABEL" >/dev/null 2>&1; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge "$SERVICE_REMOVAL_ATTEMPTS" ]; then
+        echo 'Hopash RS timed out waiting for the previous Core service to stop.' >&2
+        exit 1
+    fi
+    /bin/sleep 0.1
+done
 /bin/launchctl bootstrap system "$SERVICE_PLIST"
 /bin/launchctl enable "system/$SERVICE_LABEL"
 /bin/launchctl kickstart -k "system/$SERVICE_LABEL"
