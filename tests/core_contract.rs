@@ -449,9 +449,9 @@ impl CoreRuntime for FakeCoreRuntime {
     }
 
     fn status(&self, _owner: &OwnerSessionProof) -> Result<CoreRuntimeStatus, CoreRuntimeError> {
-        Ok(CoreRuntimeStatus {
-            managed_core: Some(Self::handle(RuntimeGeneration(3))),
-        })
+        Ok(CoreRuntimeStatus::from_managed_core(Some(Self::handle(
+            RuntimeGeneration(3),
+        ))))
     }
 
     fn logs(

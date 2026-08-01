@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -145,6 +146,90 @@ pub struct ApplyCandidateResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoreRuntimeStatus {
     pub managed_core: Option<ManagedCoreHandle>,
+    pub lifecycle: CoreRuntimeLifecycle,
+    pub restart: CoreRuntimeRestartStatus,
+    pub tun: CoreRuntimeTunStatus,
+}
+
+impl CoreRuntimeStatus {
+    #[must_use]
+    pub fn from_managed_core(managed_core: Option<ManagedCoreHandle>) -> Self {
+        let lifecycle = if managed_core.is_some() {
+            CoreRuntimeLifecycle::Running
+        } else {
+            CoreRuntimeLifecycle::Owned
+        };
+        Self {
+            managed_core,
+            lifecycle,
+            restart: CoreRuntimeRestartStatus::inactive(),
+            tun: CoreRuntimeTunStatus::available(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoreRuntimeLifecycle {
+    Owned,
+    Running,
+    RestartPending,
+    Degraded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoreRuntimeDiagnosticCategory {
+    CoreRestartLimitReached,
+}
+
+impl CoreRuntimeDiagnosticCategory {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CoreRestartLimitReached => "core_restart_limit_reached",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoreRuntimeRestartStatus {
+    pub pending: bool,
+    pub attempts: usize,
+    pub backoff: Option<Duration>,
+    pub diagnostic: Option<CoreRuntimeDiagnosticCategory>,
+}
+
+impl CoreRuntimeRestartStatus {
+    #[must_use]
+    pub const fn inactive() -> Self {
+        Self {
+            pending: false,
+            attempts: 0,
+            backoff: None,
+            diagnostic: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoreRuntimeTunReason {
+    PermissionDenied,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CoreRuntimeTunStatus {
+    pub capable: bool,
+    pub reason: Option<CoreRuntimeTunReason>,
+}
+
+impl CoreRuntimeTunStatus {
+    #[must_use]
+    pub const fn available() -> Self {
+        Self {
+            capable: true,
+            reason: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

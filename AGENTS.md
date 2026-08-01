@@ -64,7 +64,8 @@
 - `src/daemon.rs` owns lifecycle-operation serialization, Supervisor singleton ownership, detached internal launch, one-time readiness, identity-bound shutdown, and validated stale-state cleanup.
 - `src/mihomo.rs` implements bounded authenticated Mihomo REST and WebSocket access over the private Core Unix socket.
 - `src/service.rs` owns the injected privileged CoreRuntime state machine, authenticated owner sessions, verified runtime bundles, process identity enforcement, bounded log forwarding, and bounded restart policy.
-- `src/process_controller.rs` implements verified Mihomo process spawn, bounded readiness and reload control, identity-matched stop, and bounded stdout/stderr capture for the privileged runtime service.
+- `src/process_controller.rs` launches the same-binary Core guardian, verifies its bounded PID handshake, and implements bounded readiness, reload, stop, and stdout/stderr capture for the privileged runtime service; its injected constructor retains direct fixture process control.
+- `src/core_guardian.rs` owns and reaps one verified Mihomo child, forwards its output after a versioned handshake, and terminates that exact child when the privileged service control pipe closes.
 - `src/runtime_bundle.rs` atomically stages private Runtime Generations and binds the Effective Configuration, bundled Mihomo executable, and local provider files to one verified manifest.
 - `src/runtime_adapters.rs` confirms pinned Mihomo readiness, classifies uncertain CoreRuntime outcomes, and resolves previously staged Runtime Generations for recovery.
 - `fixtures/mihomo/v1.19.28/*.json` are the pinned Core API contract fixtures for projection, readiness, probes, and telemetry.

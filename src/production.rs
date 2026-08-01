@@ -23,7 +23,10 @@ use crate::cli::{
 use crate::config::{
     AuthoritativeConfig, BUNDLED_CORE_VERSION, ConfigCompiler, CoreConfigValidator,
 };
-use crate::constants::{IPC_REQUEST_TIMEOUT, MIHOMO_BINARY_MAX_BYTES, STATUS_SAMPLE_INTERVAL};
+use crate::constants::{
+    CORE_SERVICE_LIVENESS_INTERVAL, IPC_REQUEST_TIMEOUT, MIHOMO_BINARY_MAX_BYTES,
+    STATUS_SAMPLE_INTERVAL,
+};
 use crate::core::{
     CoreRuntime, MihomoAdapter, OwnerSessionProof, OwnerSessionRequest, ProcessOutputSource,
 };
@@ -81,8 +84,9 @@ use crate::transaction::{
     RuntimeBundleResolver, TransactionStore,
 };
 use crate::tui_runtime::{
-    ProcessSignalSource, ShutdownSignal as ProcessShutdownSignal, StatusInterfaceErrorKind,
-    StatusInterfaceSources, run_crossterm_status_interface,
+    MonotonicClock, ProcessSignalSource, RuntimeClock, RuntimeWaiter, RuntimeWaker,
+    ShutdownSignal as ProcessShutdownSignal, StatusInterfaceErrorKind, StatusInterfaceSources,
+    run_crossterm_status_interface,
 };
 use crate::validator::MihomoCommandValidator;
 
@@ -90,7 +94,9 @@ pub const INTERNAL_CORE_SERVICE_MODE: &str = "__core-service";
 pub const CORE_SERVICE_SOCKET_PATH: &str = "/var/run/hopash-rs/core-service.sock";
 pub const BUNDLED_MIHOMO_PATH: &str = "/Library/Application Support/Hopash RS/bin/mihomo";
 
-const CORE_SERVICE_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(debug_assertions)]
+const DEBUG_CORE_SERVICE_SOCKET_ENV: &str = "HOPASH_CORE_SERVICE_SOCKET";
+
 const OBSERVER_LOG_BATCH: usize = 256;
 
 // -----------------------------------------------------------------------------
@@ -616,15 +622,41 @@ pub fn run_core_service(invocation: CoreServiceInvocation) -> io::Result<()> {
     )?;
     let signal = ProcessSignalSource::new()
         .map_err(|_| io::Error::other("the Core service signal listener could not start"))?;
-    while !signal.shutdown_requested() {
-        let _ = runtime.maintenance_tick();
-        thread::sleep(CORE_SERVICE_MAINTENANCE_INTERVAL);
-    }
+    let clock = MonotonicClock::default();
+    let wake = RuntimeWaker::default();
+    run_core_service_maintenance_loop(&signal, &clock, &wake, wake.clone(), |now| {
+        runtime
+            .maintenance_step(now)
+            .map(|step| step.next_deadline)
+            .unwrap_or_else(|_| now.saturating_add(CORE_SERVICE_LIVENESS_INTERVAL))
+    });
     let server_result = server.shutdown();
     let service_result = runtime
         .shutdown_service()
         .map_err(|_| io::Error::other("the Core service shutdown failed"));
     server_result.and(service_result)
+}
+
+fn run_core_service_maintenance_loop(
+    signal: &dyn ProcessShutdownSignal,
+    clock: &dyn RuntimeClock,
+    waiter: &dyn RuntimeWaiter,
+    waker: RuntimeWaker,
+    mut maintenance: impl FnMut(Duration) -> Duration,
+) {
+    signal.install_waker(waker);
+    loop {
+        let checkpoint = waiter.checkpoint();
+        if signal.shutdown_requested() {
+            break;
+        }
+        let next_deadline = maintenance(clock.now());
+        if signal.shutdown_requested() {
+            break;
+        }
+        let timeout = next_deadline.saturating_sub(clock.now());
+        waiter.wait(checkpoint, Some(timeout));
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -712,8 +744,13 @@ fn run_owned_supervisor(
         )
     })?;
 
-    let core_runtime: Arc<dyn CoreRuntime> =
-        Arc::new(CoreServiceClient::new(CORE_SERVICE_SOCKET_PATH));
+    let core_runtime: Arc<dyn CoreRuntime> = Arc::new(core_service_client().map_err(|_| {
+        StartupError::new(
+            StartupStage::SupervisorInitialization,
+            StartupFailureCategory::Configuration,
+            "The Core service endpoint configuration is invalid",
+        )
+    })?);
     let instance_token = ownership
         .lock()
         .map_err(|_| startup_internal("The Supervisor ownership state is unavailable"))?
@@ -1486,6 +1523,24 @@ fn bundled_mihomo_path() -> io::Result<PathBuf> {
     }
 }
 
+fn core_service_client() -> io::Result<CoreServiceClient> {
+    #[cfg(debug_assertions)]
+    if let Some(socket_path) = std::env::var_os(DEBUG_CORE_SERVICE_SOCKET_ENV) {
+        let socket_path = PathBuf::from(socket_path);
+        if !socket_path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the Core service socket path must be absolute",
+            ));
+        }
+        return Ok(CoreServiceClient::for_service_uid(
+            socket_path,
+            nix::unistd::Uid::effective().as_raw(),
+        ));
+    }
+    Ok(CoreServiceClient::new(CORE_SERVICE_SOCKET_PATH))
+}
+
 fn verified_binary_sha256(path: &Path) -> io::Result<String> {
     if !path.is_absolute() {
         return Err(io::Error::new(
@@ -1622,6 +1677,134 @@ fn run_log_signal_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Default)]
+    struct TestShutdownSignal {
+        requested: AtomicBool,
+        waker: Mutex<Option<RuntimeWaker>>,
+    }
+
+    impl TestShutdownSignal {
+        fn request(&self) {
+            self.requested.store(true, Ordering::Release);
+            if let Some(waker) = self
+                .waker
+                .lock()
+                .expect("the signal waker should lock")
+                .as_ref()
+            {
+                waker.wake();
+            }
+        }
+    }
+
+    impl ProcessShutdownSignal for TestShutdownSignal {
+        fn shutdown_requested(&self) -> bool {
+            self.requested.load(Ordering::Acquire)
+        }
+
+        fn install_waker(&self, waker: RuntimeWaker) {
+            *self.waker.lock().expect("the signal waker should lock") = Some(waker);
+        }
+    }
+
+    struct FixedMaintenanceClock;
+
+    impl RuntimeClock for FixedMaintenanceClock {
+        fn now(&self) -> Duration {
+            Duration::ZERO
+        }
+
+        fn now_unix_ms(&self) -> u64 {
+            0
+        }
+    }
+
+    struct RequestingWaiter {
+        signal: Arc<TestShutdownSignal>,
+        timeouts: Mutex<Vec<Option<Duration>>>,
+    }
+
+    impl RuntimeWaiter for RequestingWaiter {
+        fn checkpoint(&self) -> u64 {
+            0
+        }
+
+        fn wait(&self, _checkpoint: u64, timeout: Option<Duration>) {
+            self.timeouts
+                .lock()
+                .expect("the timeout log should lock")
+                .push(timeout);
+            self.signal.request();
+        }
+    }
+
+    #[test]
+    fn core_service_maintenance_waits_for_the_reported_deadline() {
+        let signal = Arc::new(TestShutdownSignal::default());
+        let waiter = RequestingWaiter {
+            signal: Arc::clone(&signal),
+            timeouts: Mutex::new(Vec::new()),
+        };
+        let calls = AtomicUsize::new(0);
+        run_core_service_maintenance_loop(
+            signal.as_ref(),
+            &FixedMaintenanceClock,
+            &waiter,
+            RuntimeWaker::default(),
+            |now| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                now + CORE_SERVICE_LIVENESS_INTERVAL
+            },
+        );
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            waiter
+                .timeouts
+                .lock()
+                .expect("the timeout log should lock")
+                .as_slice(),
+            &[Some(CORE_SERVICE_LIVENESS_INTERVAL)]
+        );
+    }
+
+    #[test]
+    fn core_service_signal_wakes_a_long_deadline_immediately() {
+        let signal = Arc::new(TestShutdownSignal::default());
+        let worker_signal = Arc::clone(&signal);
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let wake = RuntimeWaker::default();
+            run_core_service_maintenance_loop(
+                worker_signal.as_ref(),
+                &FixedMaintenanceClock,
+                &wake,
+                wake.clone(),
+                |_| {
+                    started_sender
+                        .send(())
+                        .expect("the fixture should report maintenance");
+                    Duration::from_secs(60 * 60)
+                },
+            );
+            done_sender
+                .send(())
+                .expect("the fixture should report shutdown");
+        });
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("maintenance should reach the long wait");
+
+        signal.request();
+
+        done_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the signal should wake the long wait");
+        worker.join().expect("the maintenance worker should join");
+    }
 
     struct TestDirectory {
         path: PathBuf,

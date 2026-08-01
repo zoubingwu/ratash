@@ -1,3 +1,7 @@
+use hopash::constants::{
+    CORE_RESTART_INITIAL_BACKOFF, CORE_RESTART_LIMIT, CORE_RESTART_MAX_BACKOFF,
+    CORE_SERVICE_LIVENESS_INTERVAL,
+};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
@@ -269,6 +273,27 @@ fn release_metadata_names_every_required_resource_measurement() {
     assert_eq!(metadata["workloads"]["active_nodes"], 10_000);
     assert_eq!(metadata["workloads"]["local_rules"], 20_000);
     assert_eq!(metadata["workloads"]["tui_duration_seconds"], 1_800);
+    assert_eq!(
+        metadata["versioned_defaults"]["core_restart_limit"],
+        CORE_RESTART_LIMIT
+    );
+    for (name, value) in [
+        (
+            "core_restart_initial_backoff_ms",
+            CORE_RESTART_INITIAL_BACKOFF,
+        ),
+        ("core_restart_max_backoff_ms", CORE_RESTART_MAX_BACKOFF),
+        (
+            "core_service_liveness_interval_ms",
+            CORE_SERVICE_LIVENESS_INTERVAL,
+        ),
+    ] {
+        assert_eq!(
+            metadata["versioned_defaults"][name],
+            u64::try_from(value.as_millis()).expect("the default duration should fit in u64"),
+            "{name} drifted"
+        );
+    }
     let status = metadata["status"]
         .as_str()
         .expect("benchmark status should be a string");

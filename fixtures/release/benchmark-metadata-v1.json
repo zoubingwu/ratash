@@ -17,6 +17,12 @@
     "sustained_traffic_samples": true,
     "tui_duration_seconds": 1800
   },
+  "versioned_defaults": {
+    "core_restart_limit": 3,
+    "core_restart_initial_backoff_ms": 1000,
+    "core_restart_max_backoff_ms": 30000,
+    "core_service_liveness_interval_ms": 5000
+  },
   "measurements": {
     "wrapper_binary_bytes": null,
     "one_shot_cli_cold_start_ms": null,

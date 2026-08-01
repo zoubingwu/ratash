@@ -1,26 +1,31 @@
+use hopash::constants::{CORE_RESTART_INITIAL_BACKOFF, CORE_RESTART_MAX_BACKOFF};
 use hopash::core::{
-    ApplyDisposition, CoreControlEndpoint, CoreRuntime, CoreRuntimeError, CoreRuntimeErrorKind,
+    ApplyDisposition, CoreControlEndpoint, CoreRuntime, CoreRuntimeDiagnosticCategory,
+    CoreRuntimeError, CoreRuntimeErrorKind, CoreRuntimeLifecycle, CoreRuntimeTunReason,
     OwnerSessionProof, OwnerSessionRequest, ProcessOutputSource, RuntimeBundle,
 };
 use hopash::domain::{CoreInstanceGeneration, RuntimeGeneration};
 use hopash::service::{
     CORE_RUNTIME_PROTOCOL_VERSION, CallerCredentialValidator, CoreExitIdentity,
-    CoreProcessController, CoreProcessLog, OwnedProcessIdentity, PrivilegedCoreRuntimeService,
-    PrivilegedServiceConfig, PrivilegedServiceDependencies, PrivilegedServiceLifecycle,
-    ProcessIdentityProbe, RuntimeManifestFileV1, RuntimeManifestV1, SecretGenerator,
-    ServiceGenerationStateCommitFault, ServiceMaintenanceOutcome, ServicePlatformError,
-    ServicePlatformErrorKind, SpawnedCoreProcess, TunCapabilityPreflight, UnexpectedExitOutcome,
-    VerifiedRuntimeBundle,
+    CoreProcessController, CoreProcessLog, CoreProcessLogBatch, OwnedProcessIdentity,
+    PrivilegedCoreRuntimeService, PrivilegedServiceConfig, PrivilegedServiceDependencies,
+    PrivilegedServiceLifecycle, ProcessIdentityProbe, RuntimeManifestFileV1, RuntimeManifestV1,
+    SecretGenerator, ServiceGenerationStateCommitFault, ServiceMaintenanceOutcome,
+    ServicePlatformError, ServicePlatformErrorKind, SpawnedCoreProcess, TunCapabilityPreflight,
+    UnexpectedExitOutcome, VerifiedRuntimeBundle,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -31,7 +36,7 @@ struct TestDirectory {
 impl TestDirectory {
     fn new() -> Self {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
+        let path = PathBuf::from("/tmp").join(format!(
             "hopash-service-contract-{}-{sequence}",
             std::process::id()
         ));
@@ -100,23 +105,26 @@ impl CallerCredentialValidator for FakeCredentials {
 
 #[derive(Clone, Default)]
 struct FakeTun {
-    denied: Arc<AtomicBool>,
+    error: Arc<Mutex<Option<ServicePlatformErrorKind>>>,
 }
 
 impl FakeTun {
     fn deny(&self, denied: bool) {
-        self.denied.store(denied, Ordering::Release);
+        *self.error.lock().expect("TUN error lock") =
+            denied.then_some(ServicePlatformErrorKind::TunUnavailable);
+    }
+
+    fn unsupported(&self) {
+        *self.error.lock().expect("TUN error lock") =
+            Some(ServicePlatformErrorKind::TunUnsupported);
     }
 }
 
 impl TunCapabilityPreflight for FakeTun {
     fn check(&self, _owner_uid: u32) -> Result<(), ServicePlatformError> {
-        if self.denied.load(Ordering::Acquire) {
-            Err(ServicePlatformError::new(
-                ServicePlatformErrorKind::TunUnavailable,
-            ))
-        } else {
-            Ok(())
+        match *self.error.lock().expect("TUN error lock") {
+            Some(kind) => Err(ServicePlatformError::new(kind)),
+            None => Ok(()),
         }
     }
 }
@@ -155,6 +163,7 @@ struct FakeProcessState {
     scripts: VecDeque<SpawnScript>,
     processes: BTreeMap<u32, String>,
     logs: VecDeque<CoreProcessLog>,
+    dropped_logs: u64,
     reload_error: Option<ServicePlatformErrorKind>,
     readiness_error: Option<ServicePlatformErrorKind>,
 }
@@ -199,6 +208,11 @@ impl FakeProcesses {
 
     fn push_logs(&self, logs: impl IntoIterator<Item = CoreProcessLog>) {
         self.state.lock().expect("process lock").logs.extend(logs);
+    }
+
+    fn drop_logs(&self, count: u64) {
+        let mut state = self.state.lock().expect("process lock");
+        state.dropped_logs = state.dropped_logs.saturating_add(count);
     }
 
     fn mark_exited(&self, pid: u32) {
@@ -297,10 +311,14 @@ impl CoreProcessController for FakeProcesses {
         &self,
         _process: &OwnedProcessIdentity,
         limit: usize,
-    ) -> Result<Vec<CoreProcessLog>, ServicePlatformError> {
+    ) -> Result<CoreProcessLogBatch, ServicePlatformError> {
         let mut state = self.state.lock().expect("process lock");
         let take = limit.min(state.logs.len());
-        Ok(state.logs.drain(..take).collect())
+        let dropped = std::mem::take(&mut state.dropped_logs);
+        Ok(CoreProcessLogBatch {
+            records: state.logs.drain(..take).collect(),
+            dropped,
+        })
     }
 }
 
@@ -1060,8 +1078,9 @@ fn maintenance_revokes_a_dead_or_replaced_owner_and_stops_its_owned_core() {
 
         let outcome = harness
             .service
-            .maintenance_tick()
-            .expect("maintenance should revoke the stale owner");
+            .maintenance_step(Duration::ZERO)
+            .expect("maintenance should revoke the stale owner")
+            .outcome;
 
         assert_eq!(outcome, ServiceMaintenanceOutcome::OwnerRevoked);
         assert_eq!(harness.processes.stop_count.load(Ordering::Relaxed), 1);
@@ -1076,8 +1095,9 @@ fn maintenance_revokes_a_dead_or_replaced_owner_and_stops_its_owned_core() {
         assert_eq!(
             harness
                 .service
-                .maintenance_tick()
-                .expect("idle maintenance should remain available"),
+                .maintenance_step(Duration::ZERO)
+                .expect("idle maintenance should remain available")
+                .outcome,
             ServiceMaintenanceOutcome::Unchanged(PrivilegedServiceLifecycle::Idle)
         );
     }
@@ -1096,10 +1116,73 @@ fn maintenance_restarts_an_unexpected_core_exit_with_the_bounded_policy() {
         .processes
         .script_spawns([SpawnScript::Failure, SpawnScript::Success]);
 
+    let scheduled = harness
+        .service
+        .maintenance_step(Duration::ZERO)
+        .expect("maintenance should schedule recovery");
+    assert_eq!(
+        scheduled.outcome,
+        ServiceMaintenanceOutcome::UnexpectedExit(UnexpectedExitOutcome::Pending {
+            attempts: 0,
+            next_attempt_at: CORE_RESTART_INITIAL_BACKOFF,
+        })
+    );
+    assert_eq!(scheduled.next_deadline, CORE_RESTART_INITIAL_BACKOFF);
+    assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 1);
+    let status = harness
+        .service
+        .status(&session.proof)
+        .expect("pending restart status should load");
+    assert_eq!(status.lifecycle, CoreRuntimeLifecycle::RestartPending);
+    assert!(status.restart.pending);
+    assert_eq!(status.restart.attempts, 0);
+    assert_eq!(status.restart.backoff, Some(CORE_RESTART_INITIAL_BACKOFF));
+    assert_eq!(status.restart.diagnostic, None);
+
+    let early = harness
+        .service
+        .maintenance_step(CORE_RESTART_INITIAL_BACKOFF - Duration::from_millis(1))
+        .expect("early maintenance should retain the deadline");
+    assert_eq!(early, scheduled);
+    assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 1);
+
+    let first_attempt = harness
+        .service
+        .maintenance_step(CORE_RESTART_INITIAL_BACKOFF)
+        .expect("the first due step should make one attempt");
+    let second_deadline = CORE_RESTART_INITIAL_BACKOFF + (CORE_RESTART_INITIAL_BACKOFF * 2);
+    assert_eq!(
+        first_attempt.outcome,
+        ServiceMaintenanceOutcome::UnexpectedExit(UnexpectedExitOutcome::Pending {
+            attempts: 1,
+            next_attempt_at: second_deadline,
+        })
+    );
+    assert_eq!(first_attempt.next_deadline, second_deadline);
+    assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 2);
+    let retry_status = harness
+        .service
+        .status(&session.proof)
+        .expect("retry status should load");
+    assert_eq!(retry_status.lifecycle, CoreRuntimeLifecycle::RestartPending);
+    assert_eq!(retry_status.restart.attempts, 1);
+    assert_eq!(
+        retry_status.restart.backoff,
+        Some(CORE_RESTART_INITIAL_BACKOFF * 2)
+    );
+
+    let repeated = harness
+        .service
+        .maintenance_step(CORE_RESTART_INITIAL_BACKOFF)
+        .expect("a repeated step before the deadline should preserve retry state");
+    assert_eq!(repeated, first_attempt);
+    assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 2);
+
     let outcome = harness
         .service
-        .maintenance_tick()
-        .expect("maintenance should recover the unexpected exit");
+        .maintenance_step(second_deadline)
+        .expect("the second due step should recover the unexpected exit")
+        .outcome;
 
     let ServiceMaintenanceOutcome::UnexpectedExit(UnexpectedExitOutcome::Restarted {
         attempts,
@@ -1114,10 +1197,46 @@ fn maintenance_restarts_an_unexpected_core_exit_with_the_bounded_policy() {
     assert_eq!(
         harness
             .service
-            .maintenance_tick()
+            .maintenance_step(second_deadline)
             .expect("the restarted Core should remain healthy"),
-        ServiceMaintenanceOutcome::Unchanged(PrivilegedServiceLifecycle::Running)
+        hopash::service::ServiceMaintenanceStep {
+            outcome: ServiceMaintenanceOutcome::Unchanged(PrivilegedServiceLifecycle::Running),
+            next_deadline: second_deadline + hopash::constants::CORE_SERVICE_LIVENESS_INTERVAL,
+        }
     );
+}
+
+#[test]
+fn runtime_status_observes_an_exit_before_maintenance_schedules_recovery() {
+    let harness = Harness::new();
+    let session = harness.open();
+    let first = harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect("the initial Core should spawn");
+    harness.processes.mark_exited(first.managed_core.pid);
+
+    let status = harness
+        .service
+        .status(&session.proof)
+        .expect("status should observe the exited Core");
+
+    assert_eq!(status.lifecycle, CoreRuntimeLifecycle::RestartPending);
+    assert!(status.managed_core.is_none());
+    assert!(status.restart.pending);
+    assert_eq!(status.restart.attempts, 0);
+    assert_eq!(status.restart.backoff, Some(CORE_RESTART_INITIAL_BACKOFF));
+    assert!(matches!(
+        harness
+            .service
+            .maintenance_step(Duration::ZERO)
+            .expect("maintenance should schedule recovery after status observation")
+            .outcome,
+        ServiceMaintenanceOutcome::UnexpectedExit(UnexpectedExitOutcome::Pending {
+            attempts: 0,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -1133,21 +1252,322 @@ fn maintenance_preserves_the_degraded_restart_bound() {
         .processes
         .script_spawns([SpawnScript::Failure, SpawnScript::Failure]);
 
+    let scheduled = harness
+        .service
+        .maintenance_step(Duration::ZERO)
+        .expect("maintenance should schedule recovery");
+    let first_deadline = scheduled.next_deadline;
+    let retry = harness
+        .service
+        .maintenance_step(first_deadline)
+        .expect("the first due step should retain retry state");
+    let second_deadline = retry.next_deadline;
+    assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 2);
     assert_eq!(
         harness
             .service
-            .maintenance_tick()
-            .expect("maintenance should exhaust the bounded restart policy"),
-        ServiceMaintenanceOutcome::UnexpectedExit(UnexpectedExitOutcome::Degraded { attempts: 2 })
+            .maintenance_step(second_deadline)
+            .expect("the second due step should reach the restart bound")
+            .outcome,
+        ServiceMaintenanceOutcome::UnexpectedExit(UnexpectedExitOutcome::Degraded {
+            attempts: 2,
+            diagnostic: CoreRuntimeDiagnosticCategory::CoreRestartLimitReached,
+        })
     );
     assert_eq!(
         harness
             .service
-            .maintenance_tick()
+            .maintenance_step(second_deadline)
             .expect("degraded maintenance should remain bounded"),
-        ServiceMaintenanceOutcome::Unchanged(PrivilegedServiceLifecycle::Degraded)
+        hopash::service::ServiceMaintenanceStep {
+            outcome: ServiceMaintenanceOutcome::Unchanged(PrivilegedServiceLifecycle::Degraded),
+            next_deadline: hopash::constants::CORE_SERVICE_LIVENESS_INTERVAL,
+        }
     );
     assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 3);
+    let status = harness
+        .service
+        .status(&session.proof)
+        .expect("degraded runtime status should load");
+    assert_eq!(status.lifecycle, CoreRuntimeLifecycle::Degraded);
+    assert!(!status.restart.pending);
+    assert_eq!(status.restart.attempts, 2);
+    assert_eq!(status.restart.backoff, None);
+    assert_eq!(
+        status.restart.diagnostic,
+        Some(CoreRuntimeDiagnosticCategory::CoreRestartLimitReached)
+    );
+}
+
+#[test]
+fn runtime_status_projects_tun_permission_and_platform_support() {
+    let harness = Harness::new();
+    let session = harness.open();
+    harness.tun.deny(true);
+
+    let denied = harness
+        .service
+        .status(&session.proof)
+        .expect("permission status should load");
+    assert!(!denied.tun.capable);
+    assert_eq!(
+        denied.tun.reason,
+        Some(CoreRuntimeTunReason::PermissionDenied)
+    );
+
+    harness.tun.unsupported();
+    let unsupported = harness
+        .service
+        .status(&session.proof)
+        .expect("platform support status should load");
+    assert!(!unsupported.tun.capable);
+    assert_eq!(
+        unsupported.tun.reason,
+        Some(CoreRuntimeTunReason::Unsupported)
+    );
+}
+
+#[test]
+fn restart_backoff_grows_exponentially_and_stays_at_the_versioned_cap() {
+    let harness = Harness::with_limits(8, 4, 8);
+    let session = harness.open();
+    let first = harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect("the initial Core should spawn");
+    harness.processes.mark_exited(first.managed_core.pid);
+    harness
+        .processes
+        .script_spawns(std::iter::repeat_n(SpawnScript::Failure, 6));
+
+    let mut deadline = pending_attempt_deadline(
+        harness
+            .service
+            .maintenance_step(Duration::ZERO)
+            .expect("maintenance should schedule recovery")
+            .outcome,
+    );
+    let expected_delays = [
+        Duration::from_secs(2),
+        Duration::from_secs(4),
+        Duration::from_secs(8),
+        Duration::from_secs(16),
+        CORE_RESTART_MAX_BACKOFF,
+        CORE_RESTART_MAX_BACKOFF,
+    ];
+    for (index, expected_delay) in expected_delays.into_iter().enumerate() {
+        let step = harness
+            .service
+            .maintenance_step(deadline)
+            .expect("a due maintenance step should make one restart attempt");
+        let next_deadline = pending_attempt_deadline(step.outcome);
+        assert_eq!(next_deadline - deadline, expected_delay);
+        deadline = next_deadline;
+        assert_eq!(
+            harness.processes.spawn_count.load(Ordering::Relaxed),
+            index + 2,
+            "each due maintenance step should make one spawn attempt"
+        );
+    }
+}
+
+#[test]
+fn successful_restart_resets_retry_state_for_the_next_exit() {
+    let harness = Harness::with_limits(3, 4, 8);
+    let session = harness.open();
+    let first = harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect("the initial Core should spawn");
+    harness.processes.mark_exited(first.managed_core.pid);
+    harness.processes.script_spawns([
+        SpawnScript::Failure,
+        SpawnScript::Success,
+        SpawnScript::Success,
+    ]);
+
+    let first_deadline = pending_attempt_deadline(ServiceMaintenanceOutcome::UnexpectedExit(
+        harness
+            .service
+            .handle_unexpected_exit_at(
+                &session.proof,
+                &exit_identity(&first.managed_core),
+                Duration::ZERO,
+            )
+            .expect("the first exit should schedule recovery"),
+    ));
+    let retry = harness
+        .service
+        .maintenance_step(first_deadline)
+        .expect("the first restart attempt should fail");
+    let recovered = harness
+        .service
+        .maintenance_step(pending_attempt_deadline(retry.outcome))
+        .expect("the second restart attempt should recover");
+    let ServiceMaintenanceOutcome::UnexpectedExit(UnexpectedExitOutcome::Restarted {
+        managed_core,
+        attempts: 2,
+    }) = recovered.outcome
+    else {
+        panic!("the second restart attempt should succeed");
+    };
+    let snapshot = harness
+        .service
+        .snapshot(&session.proof)
+        .expect("the recovered snapshot should load");
+    assert_eq!(snapshot.consecutive_restart_failures, 0);
+    assert_eq!(snapshot.diagnostic, None);
+
+    harness.processes.mark_exited(managed_core.pid);
+    let second_exit_at = Duration::from_secs(10);
+    let next_deadline = match harness
+        .service
+        .handle_unexpected_exit_at(
+            &session.proof,
+            &exit_identity(&managed_core),
+            second_exit_at,
+        )
+        .expect("the second exit should schedule recovery")
+    {
+        UnexpectedExitOutcome::Pending {
+            attempts: 0,
+            next_attempt_at,
+        } => next_attempt_at,
+        outcome => panic!("the second exit should start a fresh policy: {outcome:?}"),
+    };
+    assert_eq!(next_deadline, second_exit_at + CORE_RESTART_INITIAL_BACKOFF);
+    assert!(matches!(
+        harness
+            .service
+            .maintenance_step(next_deadline)
+            .expect("the fresh first attempt should recover")
+            .outcome,
+        ServiceMaintenanceOutcome::UnexpectedExit(UnexpectedExitOutcome::Restarted {
+            attempts: 1,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn successful_apply_clears_a_degraded_restart_policy() {
+    let harness = Harness::with_limits(1, 4, 8);
+    let session = harness.open();
+    let first = harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect("the initial Core should spawn");
+    harness.processes.mark_exited(first.managed_core.pid);
+    harness.processes.script_spawns([SpawnScript::Failure]);
+    let first_deadline = pending_attempt_deadline(
+        harness
+            .service
+            .maintenance_step(Duration::ZERO)
+            .expect("maintenance should schedule recovery")
+            .outcome,
+    );
+    assert!(matches!(
+        harness
+            .service
+            .maintenance_step(first_deadline)
+            .expect("the restart attempt should reach the bound")
+            .outcome,
+        ServiceMaintenanceOutcome::UnexpectedExit(UnexpectedExitOutcome::Degraded { .. })
+    ));
+
+    let applied = harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(2))
+        .expect("a valid apply should recover the service");
+    let snapshot = harness
+        .service
+        .snapshot(&session.proof)
+        .expect("the recovered snapshot should load");
+    assert_eq!(applied.disposition, ApplyDisposition::Spawned);
+    assert_eq!(snapshot.lifecycle, PrivilegedServiceLifecycle::Running);
+    assert_eq!(snapshot.consecutive_restart_failures, 0);
+    assert_eq!(snapshot.diagnostic, None);
+}
+
+#[test]
+fn a_new_owner_starts_with_fresh_restart_state() {
+    let harness = Harness::with_limits(1, 4, 8);
+    let first_session = harness.open();
+    let first = harness
+        .service
+        .apply_candidate(&first_session.proof, &harness.bundle(1))
+        .expect("the initial Core should spawn");
+    harness.processes.mark_exited(first.managed_core.pid);
+    harness.processes.script_spawns([SpawnScript::Failure]);
+    let first_deadline = pending_attempt_deadline(
+        harness
+            .service
+            .maintenance_step(Duration::ZERO)
+            .expect("maintenance should schedule recovery")
+            .outcome,
+    );
+    harness
+        .service
+        .maintenance_step(first_deadline)
+        .expect("the restart attempt should reach the bound");
+    harness.identities.remove(100);
+
+    let second_session = harness
+        .service
+        .open_owner_session(&harness.request(200, "supervisor-200", "instance-200"))
+        .expect("a new owner should replace the stale owner");
+    let snapshot = harness
+        .service
+        .snapshot(&second_session.proof)
+        .expect("the new owner snapshot should load");
+    assert_eq!(snapshot.lifecycle, PrivilegedServiceLifecycle::Owned);
+    assert_eq!(snapshot.consecutive_restart_failures, 0);
+    assert_eq!(snapshot.diagnostic, None);
+}
+
+#[cfg(unix)]
+#[test]
+fn owned_core_stop_removes_the_exact_recorded_endpoint() {
+    let harness = Harness::new();
+    let session = harness.open();
+    let endpoint = session.endpoint.socket_path.clone();
+    let listener = UnixListener::bind(&endpoint).expect("the endpoint fixture should bind");
+    harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect("the Core should spawn");
+
+    harness
+        .service
+        .stop(&session.proof)
+        .expect("the owned Core should stop");
+
+    assert!(!endpoint.exists());
+    drop(listener);
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_cleanup_preserves_a_replacement_endpoint() {
+    let harness = Harness::new();
+    let session = harness.open();
+    let endpoint = session.endpoint.socket_path.clone();
+    let original = UnixListener::bind(&endpoint).expect("the original endpoint should bind");
+    harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect("the Core should spawn");
+    drop(original);
+    fs::remove_file(&endpoint).expect("the original endpoint should be removed");
+    let replacement = UnixListener::bind(&endpoint).expect("the replacement endpoint should bind");
+
+    harness
+        .service
+        .close_owner_session(&session.proof)
+        .expect("owner cleanup should stop the Core");
+
+    assert!(endpoint.exists());
+    drop(replacement);
 }
 
 #[test]
@@ -1180,10 +1600,34 @@ fn service_shutdown_is_idempotent_and_clears_the_owner() {
     assert_eq!(
         harness
             .service
-            .maintenance_tick()
-            .expect("maintenance should observe an idle service"),
+            .maintenance_step(Duration::ZERO)
+            .expect("maintenance should observe an idle service")
+            .outcome,
         ServiceMaintenanceOutcome::Unchanged(PrivilegedServiceLifecycle::Idle)
     );
+}
+
+#[test]
+fn exited_owner_cleanup_consumes_the_final_controller_log_batch() {
+    let harness = Harness::new();
+    let session = harness.open();
+    let applied = harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect("the Core should spawn");
+    harness.processes.push_logs([process_log(1, "final log")]);
+    harness.processes.drop_logs(2);
+    harness.processes.mark_exited(applied.managed_core.pid);
+
+    harness
+        .service
+        .close_owner_session(&session.proof)
+        .expect("owner cleanup should consume the exited Core log batch");
+
+    let process_state = harness.processes.state.lock().expect("process lock");
+    assert!(process_state.logs.is_empty());
+    assert_eq!(process_state.dropped_logs, 0);
+    assert_eq!(harness.processes.stop_count.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -1357,17 +1801,18 @@ fn bounded_log_forwarding_evicts_old_records_and_truncates_utf8_safely() {
     harness
         .processes
         .push_logs([process_log(3, "ééé"), process_log(4, "fourth")]);
+    harness.processes.drop_logs(3);
     let second = harness
         .service
         .logs(&session.proof, Some(0), usize::MAX)
         .expect("the bounded log tail should load");
 
     assert_eq!(second.records.len(), 2);
-    assert_eq!(second.records[0].sequence, 3);
+    assert_eq!(second.records[0].sequence, 6);
     assert_eq!(second.records[0].message, "éé");
     assert_eq!(second.records[1].message, "fourt");
-    assert_eq!(second.dropped_before, 2);
-    assert_eq!(second.next_sequence, Some(4));
+    assert_eq!(second.dropped_before, 5);
+    assert_eq!(second.next_sequence, Some(7));
 }
 
 #[test]
@@ -1457,13 +1902,30 @@ fn unexpected_exit_restarts_with_monotonic_instance_generation() {
 
     let outcome = harness
         .service
-        .handle_unexpected_exit(&session.proof, &exit)
-        .expect("the unexpected exit should recover");
+        .handle_unexpected_exit_at(&session.proof, &exit, Duration::ZERO)
+        .expect("the unexpected exit should schedule recovery");
+    assert_eq!(
+        outcome,
+        UnexpectedExitOutcome::Pending {
+            attempts: 0,
+            next_attempt_at: CORE_RESTART_INITIAL_BACKOFF,
+        }
+    );
+    let retry = harness
+        .service
+        .maintenance_step(CORE_RESTART_INITIAL_BACKOFF)
+        .expect("the first restart attempt should retain retry state");
+    let next_deadline = retry.next_deadline;
+    let outcome = harness
+        .service
+        .maintenance_step(next_deadline)
+        .expect("the second restart attempt should recover")
+        .outcome;
 
-    let UnexpectedExitOutcome::Restarted {
+    let ServiceMaintenanceOutcome::UnexpectedExit(UnexpectedExitOutcome::Restarted {
         attempts,
         managed_core,
-    } = outcome
+    }) = outcome
     else {
         panic!("the fixture should restart");
     };
@@ -1488,16 +1950,47 @@ fn repeated_restart_failure_enters_degraded_state_at_the_bound() {
 
     let outcome = harness
         .service
-        .handle_unexpected_exit(&session.proof, &exit)
-        .expect("the restart policy should settle");
+        .handle_unexpected_exit_at(&session.proof, &exit, Duration::ZERO)
+        .expect("the restart policy should schedule recovery");
+    let first_deadline = match outcome {
+        UnexpectedExitOutcome::Pending {
+            next_attempt_at, ..
+        } => next_attempt_at,
+        outcome => panic!("the restart should be pending: {outcome:?}"),
+    };
+    let retry = harness
+        .service
+        .maintenance_step(first_deadline)
+        .expect("the first restart attempt should retain retry state");
+    let outcome = harness
+        .service
+        .maintenance_step(retry.next_deadline)
+        .expect("the restart policy should reach its bound")
+        .outcome;
 
-    assert_eq!(outcome, UnexpectedExitOutcome::Degraded { attempts: 2 });
+    assert_eq!(
+        outcome,
+        ServiceMaintenanceOutcome::UnexpectedExit(UnexpectedExitOutcome::Degraded {
+            attempts: 2,
+            diagnostic: CoreRuntimeDiagnosticCategory::CoreRestartLimitReached,
+        })
+    );
     let snapshot = harness
         .service
         .snapshot(&session.proof)
         .expect("the degraded snapshot should be visible");
     assert_eq!(snapshot.lifecycle, PrivilegedServiceLifecycle::Degraded);
     assert_eq!(snapshot.consecutive_restart_failures, 2);
+    assert_eq!(
+        snapshot.diagnostic,
+        Some(CoreRuntimeDiagnosticCategory::CoreRestartLimitReached)
+    );
+    assert_eq!(
+        snapshot
+            .diagnostic
+            .map(CoreRuntimeDiagnosticCategory::as_str),
+        Some("core_restart_limit_reached")
+    );
     assert!(snapshot.managed_core.is_none());
     assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 3);
 }
@@ -1687,6 +2180,16 @@ fn exit_identity(handle: &hopash::core::ManagedCoreHandle) -> CoreExitIdentity {
     }
 }
 
+fn pending_attempt_deadline(outcome: ServiceMaintenanceOutcome) -> Duration {
+    match outcome {
+        ServiceMaintenanceOutcome::UnexpectedExit(UnexpectedExitOutcome::Pending {
+            next_attempt_at,
+            ..
+        }) => next_attempt_at,
+        outcome => panic!("the restart should remain pending: {outcome:?}"),
+    }
+}
+
 fn sha256(content: &[u8]) -> String {
     Sha256::digest(content)
         .iter()
@@ -1856,7 +2359,10 @@ impl CoreProcessController for FixtureProcesses {
         &self,
         _process: &OwnedProcessIdentity,
         _limit: usize,
-    ) -> Result<Vec<CoreProcessLog>, ServicePlatformError> {
-        Ok(Vec::new())
+    ) -> Result<CoreProcessLogBatch, ServicePlatformError> {
+        Ok(CoreProcessLogBatch {
+            records: Vec::new(),
+            dropped: 0,
+        })
     }
 }

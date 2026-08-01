@@ -7,8 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hopash::config::{AuthoritativeConfig, ConfigCompiler, EffectiveConfiguration};
+use hopash::constants::CORE_RESTART_INITIAL_BACKOFF;
 use hopash::core::{
-    ApplyDisposition, CoreControlEndpoint, CoreRuntime, MihomoReadiness, OwnerSessionRequest,
+    ApplyDisposition, CoreControlEndpoint, CoreRuntime, CoreRuntimeLifecycle, MihomoReadiness,
+    OwnerSessionRequest,
 };
 use hopash::domain::RuntimeGeneration;
 use hopash::lifecycle::{ProcessInspector, PsProcessInspector};
@@ -116,6 +118,8 @@ fn verified_runtime_spawns_reloads_forwards_bounded_logs_and_stops() {
     let second_bundle = stager
         .stage(RuntimeGeneration(2), &effective)
         .expect("second Runtime Generation should be staged");
+    fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o711))
+        .expect("the service runtime root should permit owner traversal");
 
     let control = Arc::new(FakeControl::default());
     let process_controller = NativeCoreProcessController::new(
@@ -202,20 +206,46 @@ fn verified_runtime_spawns_reloads_forwards_bounded_logs_and_stops() {
         .expect("fixture Core kill command should run");
     assert!(kill_status.success());
     let deadline = Instant::now() + Duration::from_secs(2);
-    let restarted = loop {
-        match service
-            .maintenance_tick()
-            .expect("service maintenance should inspect the fixture child")
-        {
-            ServiceMaintenanceOutcome::UnexpectedExit(UnexpectedExitOutcome::Restarted {
-                managed_core,
-                ..
-            }) => break managed_core,
-            ServiceMaintenanceOutcome::Unchanged(_) if Instant::now() < deadline => {
+    let exited_status = loop {
+        match service.status(&session.proof) {
+            Ok(status) if status.lifecycle == CoreRuntimeLifecycle::RestartPending => break status,
+            Ok(_) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            outcome => panic!("fixture Core should restart after its child exit: {outcome:?}"),
+            Err(error) => panic!("status should observe the fixture child exit: {error:?}"),
+            Ok(_) => panic!("status should observe the fixture child exit before the deadline"),
         }
+    };
+    assert!(exited_status.managed_core.is_none());
+    assert!(exited_status.restart.pending);
+    assert_eq!(exited_status.restart.attempts, 0);
+    assert_eq!(
+        exited_status.restart.backoff,
+        Some(CORE_RESTART_INITIAL_BACKOFF)
+    );
+    let scheduled = service
+        .maintenance_step(Duration::ZERO)
+        .expect("maintenance should inspect the exit already observed by status");
+    assert_eq!(
+        scheduled.outcome,
+        ServiceMaintenanceOutcome::UnexpectedExit(UnexpectedExitOutcome::Pending {
+            attempts: 0,
+            next_attempt_at: CORE_RESTART_INITIAL_BACKOFF,
+        })
+    );
+    drop(endpoint_listener);
+    let endpoint_listener = UnixListener::bind(&session.endpoint.socket_path)
+        .expect("the restarted fixture Core control endpoint should bind");
+    let restarted = match service
+        .maintenance_step(CORE_RESTART_INITIAL_BACKOFF)
+        .expect("due maintenance should restart the fixture child")
+        .outcome
+    {
+        ServiceMaintenanceOutcome::UnexpectedExit(UnexpectedExitOutcome::Restarted {
+            managed_core,
+            ..
+        }) => managed_core,
+        outcome => panic!("fixture Core should restart after its child exit: {outcome:?}"),
     };
     assert_eq!(restarted.runtime_generation, RuntimeGeneration(2));
     assert_eq!(
@@ -235,6 +265,140 @@ fn verified_runtime_spawns_reloads_forwards_bounded_logs_and_stops() {
     service
         .close_owner_session(&session.proof)
         .expect("owner session should close");
+}
+
+#[test]
+fn guarded_controller_stop_and_drop_contain_the_exact_core() {
+    let directory = TestDirectory::new("guardian");
+    let executable = directory.0.join("fixture-core");
+    let script = b"#!/bin/sh\ntrap 'printf guardian-final-stdout; printf guardian-final-stderr >&2; exit 0' TERM\nprintf 'guardian stdout\\n'\nprintf 'guardian stderr\\n' >&2\nwhile :; do /bin/sleep 0.05; done\n";
+    fs::write(&executable, script).expect("fixture executable should be written");
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+        .expect("fixture executable should be executable");
+    let effective = effective_configuration(&directory.0);
+    let binary_sha256 = sha256(script);
+    let runtime_root = directory.0.join("guardian-runtime");
+    let bundle = RuntimeBundleStager::new(
+        &runtime_root,
+        &executable,
+        &binary_sha256,
+        effective.compiler_policy_sha256(),
+    )
+    .expect("runtime stager should be configured")
+    .stage(RuntimeGeneration(1), &effective)
+    .expect("the Runtime Generation should be staged");
+    fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o711))
+        .expect("the service runtime root should permit owner traversal");
+    let process_controller = NativeCoreProcessController::new_guarded(
+        NativeCoreProcessConfig {
+            readiness_timeout: Duration::from_secs(2),
+            readiness_poll_interval: Duration::from_millis(5),
+            stop_timeout: Duration::from_secs(1),
+            log_capacity: 8,
+            max_log_line_bytes: 64,
+        },
+        Arc::new(FakeControl::default()),
+        Arc::new(PsProcessInspector),
+        PathBuf::from(env!("CARGO_BIN_EXE_hopash")),
+    )
+    .expect("guarded process controller should be configured");
+    let service = PrivilegedCoreRuntimeService::new(
+        PrivilegedServiceConfig::product_defaults(
+            runtime_root,
+            effective.compiler_policy_sha256().to_owned(),
+            binary_sha256,
+        ),
+        PrivilegedServiceDependencies {
+            credentials: Box::new(AllowCaller),
+            identities: Box::new(SystemProcessIdentityProbe),
+            tun: Box::new(AllowTun),
+            secrets: Box::new(UuidSecretGenerator),
+            processes: Box::new(process_controller),
+        },
+    )
+    .expect("privileged runtime service should start");
+    let supervisor_identity = PsProcessInspector
+        .identity(std::process::id())
+        .expect("Supervisor identity lookup should succeed")
+        .expect("Supervisor identity should exist");
+    let session = service
+        .open_owner_session(&OwnerSessionRequest {
+            owner_uid: nix::unistd::Uid::current().as_raw(),
+            supervisor_pid: std::process::id(),
+            supervisor_start_identity: supervisor_identity,
+            instance_token: "guardian-fixture-instance".to_owned(),
+            protocol_version: CORE_RUNTIME_PROTOCOL_VERSION,
+        })
+        .expect("owner session should open");
+    let endpoint_listener = UnixListener::bind(&session.endpoint.socket_path)
+        .expect("fixture Core control endpoint should bind");
+    let mut unrelated = Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("the unrelated fixture should start");
+
+    let first = service
+        .apply_candidate(&session.proof, &bundle)
+        .expect("the guarded Core should start");
+    let first_identity = first.managed_core.process_start_identity.clone();
+    let logs = wait_for_logs(&service, &session.proof, 2);
+    assert!(
+        logs.records
+            .iter()
+            .any(|record| record.message == "guardian stdout")
+    );
+    assert!(
+        logs.records
+            .iter()
+            .any(|record| record.message == "guardian stderr")
+    );
+    service
+        .stop(&session.proof)
+        .expect("normal service stop should close the guardian control pipe");
+    wait_for_identity_gone(first.managed_core.pid, &first_identity);
+    let stopped_logs = service
+        .logs(&session.proof, None, usize::MAX)
+        .expect("stopped Core logs should remain available");
+    assert!(
+        stopped_logs
+            .records
+            .iter()
+            .any(|record| record.message == "guardian-final-stdout")
+    );
+    assert!(
+        stopped_logs
+            .records
+            .iter()
+            .any(|record| record.message == "guardian-final-stderr")
+    );
+    assert!(
+        unrelated
+            .try_wait()
+            .expect("the unrelated fixture should be inspectable")
+            .is_none()
+    );
+
+    drop(endpoint_listener);
+    let endpoint_listener = UnixListener::bind(&session.endpoint.socket_path)
+        .expect("the restarted fixture Core control endpoint should bind");
+    let second = service
+        .apply_candidate(&session.proof, &bundle)
+        .expect("the guarded Core should restart");
+    let second_identity = second.managed_core.process_start_identity.clone();
+    drop(service);
+    wait_for_identity_gone(second.managed_core.pid, &second_identity);
+    assert!(
+        unrelated
+            .try_wait()
+            .expect("the unrelated fixture should be inspectable")
+            .is_none()
+    );
+
+    unrelated.kill().expect("the unrelated fixture should stop");
+    unrelated
+        .wait()
+        .expect("the unrelated fixture should be reaped");
+    drop(endpoint_listener);
 }
 
 #[test]
@@ -363,4 +527,18 @@ fn sha256(content: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn wait_for_identity_gone(pid: u32, identity: &str) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let current = PsProcessInspector
+            .identity(pid)
+            .expect("fixture process identity should be inspectable");
+        if current.as_deref() != Some(identity) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the guarded Core should exit");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }

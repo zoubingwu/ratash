@@ -370,7 +370,7 @@ impl RuntimeApplyPort for FakeRuntime {
                     CoreControlEndpoint::new("/fixture/unexpected-core.sock", "unexpected-secret");
             }
         }
-        Ok(CoreRuntimeStatus { managed_core })
+        Ok(CoreRuntimeStatus::from_managed_core(managed_core))
     }
 
     fn stop(&self, _owner: &OwnerSessionProof) -> Result<(), CoreRuntimeError> {

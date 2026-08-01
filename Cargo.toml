@@ -19,7 +19,7 @@ crossterm = { version = "0.28.1", features = ["event-stream"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 httparse = "1"
 mio = { version = "1", features = ["net", "os-poll"] }
-nix = { version = "0.31.3", features = ["fs", "socket", "user"] }
+nix = { version = "0.31.3", features = ["fs", "poll", "signal", "socket", "user"] }
 percent-encoding = "2"
 ratatui = "0.29"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }

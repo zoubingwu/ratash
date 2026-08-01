@@ -31,10 +31,11 @@ use crate::constants::{
     PROFILE_RESPONSE_MAX_BYTES,
 };
 use crate::core::{
-    ApplyCandidateResult, ApplyDisposition, CoreControlEndpoint, CoreRuntime, CoreRuntimeError,
-    CoreRuntimeErrorKind, CoreRuntimeStatus, ForwardedCoreLog, ForwardedCoreLogBatch,
-    ManagedCoreHandle, OwnerSession, OwnerSessionProof, OwnerSessionRequest, ProcessOutputSource,
-    RuntimeBundle, StopCoreResult,
+    ApplyCandidateResult, ApplyDisposition, CoreControlEndpoint, CoreRuntime,
+    CoreRuntimeDiagnosticCategory, CoreRuntimeError, CoreRuntimeErrorKind, CoreRuntimeLifecycle,
+    CoreRuntimeRestartStatus, CoreRuntimeStatus, CoreRuntimeTunReason, CoreRuntimeTunStatus,
+    ForwardedCoreLog, ForwardedCoreLogBatch, ManagedCoreHandle, OwnerSession, OwnerSessionProof,
+    OwnerSessionRequest, ProcessOutputSource, RuntimeBundle, StopCoreResult,
 };
 use crate::domain::{CoreInstanceGeneration, RuntimeGeneration};
 use crate::ipc::{FrameError, read_frame, write_frame};
@@ -1288,12 +1289,18 @@ impl WireApplyCandidateResult {
 #[serde(deny_unknown_fields)]
 struct WireCoreRuntimeStatus {
     managed_core: Option<WireManagedCoreHandle>,
+    lifecycle: WireCoreRuntimeLifecycle,
+    restart: WireCoreRuntimeRestartStatus,
+    tun: WireCoreRuntimeTunStatus,
 }
 
 impl From<&CoreRuntimeStatus> for WireCoreRuntimeStatus {
     fn from(status: &CoreRuntimeStatus) -> Self {
         Self {
             managed_core: status.managed_core.as_ref().map(Into::into),
+            lifecycle: status.lifecycle.into(),
+            restart: (&status.restart).into(),
+            tun: status.tun.into(),
         }
     }
 }
@@ -1302,6 +1309,147 @@ impl WireCoreRuntimeStatus {
     fn into_core(self) -> CoreRuntimeStatus {
         CoreRuntimeStatus {
             managed_core: self.managed_core.map(WireManagedCoreHandle::into_core),
+            lifecycle: self.lifecycle.into_core(),
+            restart: self.restart.into_core(),
+            tun: self.tun.into_core(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireCoreRuntimeLifecycle {
+    Owned,
+    Running,
+    RestartPending,
+    Degraded,
+}
+
+impl From<CoreRuntimeLifecycle> for WireCoreRuntimeLifecycle {
+    fn from(lifecycle: CoreRuntimeLifecycle) -> Self {
+        match lifecycle {
+            CoreRuntimeLifecycle::Owned => Self::Owned,
+            CoreRuntimeLifecycle::Running => Self::Running,
+            CoreRuntimeLifecycle::RestartPending => Self::RestartPending,
+            CoreRuntimeLifecycle::Degraded => Self::Degraded,
+        }
+    }
+}
+
+impl WireCoreRuntimeLifecycle {
+    fn into_core(self) -> CoreRuntimeLifecycle {
+        match self {
+            Self::Owned => CoreRuntimeLifecycle::Owned,
+            Self::Running => CoreRuntimeLifecycle::Running,
+            Self::RestartPending => CoreRuntimeLifecycle::RestartPending,
+            Self::Degraded => CoreRuntimeLifecycle::Degraded,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireCoreRuntimeRestartStatus {
+    pending: bool,
+    attempts: u64,
+    backoff_ms: Option<u64>,
+    diagnostic: Option<WireCoreRuntimeDiagnosticCategory>,
+}
+
+impl From<&CoreRuntimeRestartStatus> for WireCoreRuntimeRestartStatus {
+    fn from(status: &CoreRuntimeRestartStatus) -> Self {
+        Self {
+            pending: status.pending,
+            attempts: u64::try_from(status.attempts).unwrap_or(u64::MAX),
+            backoff_ms: status
+                .backoff
+                .map(|backoff| u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX)),
+            diagnostic: status.diagnostic.map(Into::into),
+        }
+    }
+}
+
+impl WireCoreRuntimeRestartStatus {
+    fn into_core(self) -> CoreRuntimeRestartStatus {
+        CoreRuntimeRestartStatus {
+            pending: self.pending,
+            attempts: usize::try_from(self.attempts).unwrap_or(usize::MAX),
+            backoff: self.backoff_ms.map(Duration::from_millis),
+            diagnostic: self
+                .diagnostic
+                .map(WireCoreRuntimeDiagnosticCategory::into_core),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireCoreRuntimeDiagnosticCategory {
+    CoreRestartLimitReached,
+}
+
+impl From<CoreRuntimeDiagnosticCategory> for WireCoreRuntimeDiagnosticCategory {
+    fn from(category: CoreRuntimeDiagnosticCategory) -> Self {
+        match category {
+            CoreRuntimeDiagnosticCategory::CoreRestartLimitReached => Self::CoreRestartLimitReached,
+        }
+    }
+}
+
+impl WireCoreRuntimeDiagnosticCategory {
+    fn into_core(self) -> CoreRuntimeDiagnosticCategory {
+        match self {
+            Self::CoreRestartLimitReached => CoreRuntimeDiagnosticCategory::CoreRestartLimitReached,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireCoreRuntimeTunStatus {
+    capable: bool,
+    reason: Option<WireCoreRuntimeTunReason>,
+}
+
+impl From<CoreRuntimeTunStatus> for WireCoreRuntimeTunStatus {
+    fn from(status: CoreRuntimeTunStatus) -> Self {
+        Self {
+            capable: status.capable,
+            reason: status.reason.map(Into::into),
+        }
+    }
+}
+
+impl WireCoreRuntimeTunStatus {
+    fn into_core(self) -> CoreRuntimeTunStatus {
+        CoreRuntimeTunStatus {
+            capable: self.capable,
+            reason: self.reason.map(WireCoreRuntimeTunReason::into_core),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireCoreRuntimeTunReason {
+    PermissionDenied,
+    Unsupported,
+}
+
+impl From<CoreRuntimeTunReason> for WireCoreRuntimeTunReason {
+    fn from(reason: CoreRuntimeTunReason) -> Self {
+        match reason {
+            CoreRuntimeTunReason::PermissionDenied => Self::PermissionDenied,
+            CoreRuntimeTunReason::Unsupported => Self::Unsupported,
+        }
+    }
+}
+
+impl WireCoreRuntimeTunReason {
+    fn into_core(self) -> CoreRuntimeTunReason {
+        match self {
+            Self::PermissionDenied => CoreRuntimeTunReason::PermissionDenied,
+            Self::Unsupported => CoreRuntimeTunReason::Unsupported,
         }
     }
 }

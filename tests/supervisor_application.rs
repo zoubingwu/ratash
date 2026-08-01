@@ -294,14 +294,13 @@ impl FakeCore {
 
 impl SupervisorCorePort for FakeCore {
     fn runtime_status(&self) -> Result<CoreRuntimeStatus, MihomoError> {
-        Ok(CoreRuntimeStatus {
-            managed_core: self
-                .state
+        Ok(CoreRuntimeStatus::from_managed_core(
+            self.state
                 .lock()
                 .expect("the Core lock should be available")
                 .managed_core
                 .clone(),
-        })
+        ))
     }
 
     fn proxy_view(

@@ -1,4 +1,5 @@
 use hopash::cli::parse_process_invocation;
+use hopash::core_guardian::{CoreGuardianInvocation, run_core_guardian};
 use hopash::daemon::InternalSupervisorInvocation;
 use hopash::error::ProcessExitCode;
 use hopash::production::{
@@ -9,8 +10,8 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args = std::env::args_os().collect::<Vec<_>>();
-    let stderr = io::stderr();
-    if let Some(exit) = run_internal_mode(&args, &mut stderr.lock()) {
+    let mut stderr = io::stderr();
+    if let Some(exit) = run_internal_mode(&args, &mut stderr) {
         return ExitCode::from(exit.as_u8());
     }
     let invocation = match parse_process_invocation(&args, &mut stderr.lock()) {
@@ -26,6 +27,22 @@ fn run_internal_mode(
     args: &[std::ffi::OsString],
     stderr: &mut dyn Write,
 ) -> Option<ProcessExitCode> {
+    match CoreGuardianInvocation::parse_process_arguments(args) {
+        Ok(Some(invocation)) => {
+            return Some(match run_core_guardian(invocation) {
+                Ok(()) => ProcessExitCode::Success,
+                Err(_) => {
+                    let _ = writeln!(stderr, "The Core guardian stopped with an error");
+                    ProcessExitCode::InternalFailure
+                }
+            });
+        }
+        Ok(None) => {}
+        Err(_) => {
+            let _ = writeln!(stderr, "The internal Core guardian invocation is invalid");
+            return Some(ProcessExitCode::Usage);
+        }
+    }
     match CoreServiceInvocation::parse_process_arguments(args) {
         Ok(Some(invocation)) => {
             return Some(match run_core_service(invocation) {

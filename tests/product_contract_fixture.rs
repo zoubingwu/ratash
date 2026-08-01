@@ -38,6 +38,12 @@ fn release_fixture_freezes_versions_and_user_observable_intervals() {
         ("profile_total_timeout", PROFILE_TOTAL_TIMEOUT),
         ("core_readiness_timeout", CORE_READINESS_TIMEOUT),
         ("core_health_timeout", CORE_HEALTH_TIMEOUT),
+        ("core_restart_initial_backoff", CORE_RESTART_INITIAL_BACKOFF),
+        ("core_restart_max_backoff", CORE_RESTART_MAX_BACKOFF),
+        (
+            "core_service_liveness_interval",
+            CORE_SERVICE_LIVENESS_INTERVAL,
+        ),
         ("mihomo_validation_timeout", MIHOMO_VALIDATION_TIMEOUT),
         ("probe_interval", PROBE_INTERVAL),
         ("probe_timeout", PROBE_TIMEOUT),

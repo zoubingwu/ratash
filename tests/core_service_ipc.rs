@@ -9,10 +9,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hopash::core::{
-    ApplyCandidateResult, ApplyDisposition, CoreControlEndpoint, CoreRuntime, CoreRuntimeError,
-    CoreRuntimeErrorKind, CoreRuntimeStatus, ForwardedCoreLog, ForwardedCoreLogBatch,
-    ManagedCoreHandle, OwnerSession, OwnerSessionProof, OwnerSessionRequest, ProcessOutputSource,
-    RuntimeBundle, StopCoreResult,
+    ApplyCandidateResult, ApplyDisposition, CoreControlEndpoint, CoreRuntime,
+    CoreRuntimeDiagnosticCategory, CoreRuntimeError, CoreRuntimeErrorKind, CoreRuntimeLifecycle,
+    CoreRuntimeRestartStatus, CoreRuntimeStatus, CoreRuntimeTunReason, CoreRuntimeTunStatus,
+    ForwardedCoreLog, ForwardedCoreLogBatch, ManagedCoreHandle, OwnerSession, OwnerSessionProof,
+    OwnerSessionRequest, ProcessOutputSource, RuntimeBundle, StopCoreResult,
 };
 use hopash::core_service_ipc::{CoreServiceClient, CoreServiceServer, CoreServiceServerConfig};
 use hopash::domain::{CoreInstanceGeneration, RuntimeGeneration};
@@ -53,6 +54,7 @@ struct FakeRuntimeState {
     apply_delay: Option<Duration>,
     status_delay: Option<Duration>,
     status_diagnostic: Option<String>,
+    runtime_status: Option<CoreRuntimeStatus>,
     oversized_logs: bool,
     apply_failures: VecDeque<CoreRuntimeErrorKind>,
 }
@@ -99,6 +101,10 @@ impl FakeRuntime {
 
     fn fail_next_apply(&self, kind: CoreRuntimeErrorKind) {
         self.state().apply_failures.push_back(kind);
+    }
+
+    fn set_runtime_status(&self, status: CoreRuntimeStatus) {
+        self.state().runtime_status = Some(status);
     }
 }
 
@@ -161,12 +167,13 @@ impl CoreRuntime for FakeRuntime {
 
     fn status(&self, owner: &OwnerSessionProof) -> Result<CoreRuntimeStatus, CoreRuntimeError> {
         self.require_owner(owner)?;
-        let (delay, diagnostic, managed_core) = {
+        let (delay, diagnostic, runtime_status, managed_core) = {
             let mut state = self.state();
             state.status_count += 1;
             (
                 state.status_delay,
                 state.status_diagnostic.clone(),
+                state.runtime_status.clone(),
                 state.managed_core.clone(),
             )
         };
@@ -179,7 +186,7 @@ impl CoreRuntime for FakeRuntime {
                 diagnostic,
             ));
         }
-        Ok(CoreRuntimeStatus { managed_core })
+        Ok(runtime_status.unwrap_or_else(|| CoreRuntimeStatus::from_managed_core(managed_core)))
     }
 
     fn logs(
@@ -414,6 +421,62 @@ fn all_core_runtime_operations_round_trip_through_staged_service_owned_state() {
         .shutdown()
         .expect("the server should shut down cleanly");
     assert!(!harness.socket_path.exists());
+}
+
+#[test]
+fn runtime_status_round_trips_restart_and_tun_capability_details() {
+    let harness = Harness::new();
+    let session = harness
+        .client
+        .open_owner_session(&harness.owner_request())
+        .expect("the owner session should open");
+    let pending = CoreRuntimeStatus {
+        managed_core: None,
+        lifecycle: CoreRuntimeLifecycle::RestartPending,
+        restart: CoreRuntimeRestartStatus {
+            pending: true,
+            attempts: 1,
+            backoff: Some(Duration::from_secs(2)),
+            diagnostic: None,
+        },
+        tun: CoreRuntimeTunStatus {
+            capable: false,
+            reason: Some(CoreRuntimeTunReason::PermissionDenied),
+        },
+    };
+    harness.runtime.set_runtime_status(pending.clone());
+
+    assert_eq!(
+        harness
+            .client
+            .status(&session.proof)
+            .expect("pending status should round trip"),
+        pending
+    );
+
+    let degraded = CoreRuntimeStatus {
+        managed_core: None,
+        lifecycle: CoreRuntimeLifecycle::Degraded,
+        restart: CoreRuntimeRestartStatus {
+            pending: false,
+            attempts: 3,
+            backoff: None,
+            diagnostic: Some(CoreRuntimeDiagnosticCategory::CoreRestartLimitReached),
+        },
+        tun: CoreRuntimeTunStatus {
+            capable: false,
+            reason: Some(CoreRuntimeTunReason::Unsupported),
+        },
+    };
+    harness.runtime.set_runtime_status(degraded.clone());
+
+    assert_eq!(
+        harness
+            .client
+            .status(&session.proof)
+            .expect("degraded status should round trip"),
+        degraded
+    );
 }
 
 #[test]

@@ -7,6 +7,7 @@ pub mod config;
 pub mod constants;
 pub mod contract;
 pub mod core;
+pub mod core_guardian;
 pub mod core_service_ipc;
 pub mod daemon;
 mod digest;
