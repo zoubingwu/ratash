@@ -879,15 +879,18 @@ fn map_log_level(level: MihomoLogLevel) -> LogLevel {
     }
 }
 
+const LOG_TRUNCATION_MARKER: &str = " [truncated]";
+
 fn truncate_log_message(mut message: String) -> String {
     if message.len() <= CORE_LOG_LINE_MAX_BYTES {
         return message;
     }
-    let mut end = CORE_LOG_LINE_MAX_BYTES;
+    let mut end = CORE_LOG_LINE_MAX_BYTES - LOG_TRUNCATION_MARKER.len();
     while !message.is_char_boundary(end) {
         end -= 1;
     }
     message.truncate(end);
+    message.push_str(LOG_TRUNCATION_MARKER);
     message
 }
 
@@ -1100,13 +1103,30 @@ mod tests {
     }
 
     #[test]
-    fn log_truncation_preserves_a_utf8_boundary() {
-        let mut message = "a".repeat(CORE_LOG_LINE_MAX_BYTES - 1);
-        message.push('界');
+    fn ascii_log_truncation_appends_the_stable_marker_within_the_bound() {
+        let message = "a".repeat(CORE_LOG_LINE_MAX_BYTES + 1);
 
         let truncated = truncate_log_message(message);
 
-        assert_eq!(truncated.len(), CORE_LOG_LINE_MAX_BYTES - 1);
+        assert_eq!(truncated.len(), CORE_LOG_LINE_MAX_BYTES);
+        assert!(truncated.ends_with(LOG_TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn log_truncation_preserves_a_utf8_boundary_before_the_marker() {
+        let prefix_bytes = CORE_LOG_LINE_MAX_BYTES - LOG_TRUNCATION_MARKER.len();
+        let mut message = "a".repeat(prefix_bytes - 1);
+        message.push('界');
+        message.push_str(&"b".repeat(LOG_TRUNCATION_MARKER.len()));
+
+        let truncated = truncate_log_message(message);
+
+        assert!(truncated.len() <= CORE_LOG_LINE_MAX_BYTES);
         assert!(truncated.is_char_boundary(truncated.len()));
+        assert!(truncated.ends_with(LOG_TRUNCATION_MARKER));
+        assert_eq!(
+            &truncated[..truncated.len() - LOG_TRUNCATION_MARKER.len()],
+            "a".repeat(prefix_bytes - 1)
+        );
     }
 }

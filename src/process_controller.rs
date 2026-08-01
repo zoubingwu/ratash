@@ -30,6 +30,7 @@ use crate::service::{
 const PROCESS_IDENTITY_ATTEMPTS: usize = 20;
 const PROCESS_IDENTITY_RETRY: Duration = Duration::from_millis(10);
 const PROCESS_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const LOG_TRUNCATION_MARKER: &str = " [truncated]";
 
 pub trait CoreControlClient: Send + Sync {
     fn readiness(
@@ -963,6 +964,8 @@ fn collect_log_stream<R: Read>(
 ) {
     let mut chunk = [0_u8; 4 * 1024];
     let mut line = Vec::with_capacity(max_line_bytes.min(chunk.len()));
+    let mut discarded_bytes = 0_usize;
+    let mut last_discarded_byte = None;
     loop {
         let read = match reader.read(&mut chunk) {
             Ok(0) | Err(_) => break,
@@ -970,14 +973,42 @@ fn collect_log_stream<R: Read>(
         };
         for byte in &chunk[..read] {
             if *byte == b'\n' {
-                publish_log_line(&logs, generation, source, &mut line);
+                let trailing_cr_is_discarded =
+                    discarded_bytes > 0 && last_discarded_byte == Some(b'\r');
+                let discarded_content_bytes =
+                    discarded_bytes.saturating_sub(usize::from(trailing_cr_is_discarded));
+                let strip_trailing_cr = discarded_bytes == 0 && line.last() == Some(&b'\r');
+                publish_log_line(
+                    &logs,
+                    generation,
+                    source,
+                    &mut line,
+                    strip_trailing_cr,
+                    discarded_content_bytes > 0,
+                    max_line_bytes,
+                );
+                discarded_bytes = 0;
+                last_discarded_byte = None;
             } else if line.len() < max_line_bytes {
                 line.push(*byte);
+            } else {
+                discarded_bytes = discarded_bytes.saturating_add(1);
+                last_discarded_byte = Some(*byte);
             }
         }
     }
-    if !line.is_empty() {
-        publish_log_line(&logs, generation, source, &mut line);
+    if !line.is_empty() || discarded_bytes > 0 {
+        let trailing_cr_is_discarded = discarded_bytes > 0 && last_discarded_byte == Some(b'\r');
+        let strip_trailing_cr = discarded_bytes == 0 && line.last() == Some(&b'\r');
+        publish_log_line(
+            &logs,
+            generation,
+            source,
+            &mut line,
+            strip_trailing_cr,
+            discarded_bytes.saturating_sub(usize::from(trailing_cr_is_discarded)) > 0,
+            max_line_bytes,
+        );
     }
 }
 
@@ -986,15 +1017,38 @@ fn publish_log_line(
     generation: crate::domain::CoreInstanceGeneration,
     source: ProcessOutputSource,
     line: &mut Vec<u8>,
+    strip_trailing_cr: bool,
+    truncated: bool,
+    max_line_bytes: usize,
 ) {
-    if line.last() == Some(&b'\r') {
+    if strip_trailing_cr {
         line.pop();
     }
-    let message = String::from_utf8_lossy(line).into_owned();
+    let message = bound_log_message(
+        String::from_utf8_lossy(line).into_owned(),
+        truncated,
+        max_line_bytes,
+    );
     line.clear();
     if let Ok(mut logs) = logs.lock() {
         logs.push(generation, source, message);
     }
+}
+
+fn bound_log_message(mut message: String, truncated: bool, max_line_bytes: usize) -> String {
+    if !truncated && message.len() <= max_line_bytes {
+        return message;
+    }
+    if max_line_bytes < LOG_TRUNCATION_MARKER.len() {
+        return LOG_TRUNCATION_MARKER[..max_line_bytes].to_owned();
+    }
+    let mut end = (max_line_bytes - LOG_TRUNCATION_MARKER.len()).min(message.len());
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message.truncate(end);
+    message.push_str(LOG_TRUNCATION_MARKER);
+    message
 }
 
 fn now_unix_ms() -> u64 {
@@ -1014,6 +1068,24 @@ fn platform_error(kind: ServicePlatformErrorKind) -> ServicePlatformError {
 mod tests {
     use super::*;
     use crate::domain::CoreInstanceGeneration;
+    use std::io::Cursor;
+
+    fn collect_fixture_logs(input: Vec<u8>, max_line_bytes: usize) -> CoreProcessLogBatch {
+        let generation = CoreInstanceGeneration(11);
+        let logs = Arc::new(Mutex::new(LogQueue::new(16)));
+        logs.lock()
+            .expect("fixture log queue")
+            .begin_generation(generation);
+        collect_log_stream(
+            Cursor::new(input),
+            ProcessOutputSource::Stdout,
+            generation,
+            Arc::clone(&logs),
+            max_line_bytes,
+        );
+        let batch = logs.lock().expect("fixture log queue").take(16);
+        batch
+    }
 
     #[test]
     fn high_volume_log_queue_reports_each_eviction_once() {
@@ -1037,5 +1109,83 @@ mod tests {
         let second = logs.take(usize::MAX);
         assert_eq!(second.dropped, 0);
         assert!(second.records.is_empty());
+    }
+
+    #[test]
+    fn oversized_ascii_process_line_ends_with_the_stable_marker() {
+        let max_line_bytes = 64;
+        let mut input = vec![b'a'; max_line_bytes + 100];
+        input.push(b'\n');
+
+        let batch = collect_fixture_logs(input, max_line_bytes);
+
+        assert_eq!(batch.records.len(), 1);
+        assert_eq!(batch.records[0].message.len(), max_line_bytes);
+        assert!(batch.records[0].message.ends_with(LOG_TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn oversized_multibyte_process_line_keeps_valid_utf8_and_the_marker() {
+        let max_line_bytes = 32;
+        let mut input = "a".repeat(max_line_bytes - LOG_TRUNCATION_MARKER.len() - 1);
+        input.push('界');
+        input.push_str(&"b".repeat(max_line_bytes));
+        input.push('\n');
+
+        let batch = collect_fixture_logs(input.into_bytes(), max_line_bytes);
+
+        assert_eq!(batch.records.len(), 1);
+        assert!(batch.records[0].message.len() <= max_line_bytes);
+        assert!(
+            batch.records[0]
+                .message
+                .is_char_boundary(batch.records[0].message.len())
+        );
+        assert!(batch.records[0].message.ends_with(LOG_TRUNCATION_MARKER));
+        assert_eq!(
+            &batch.records[0].message
+                [..batch.records[0].message.len() - LOG_TRUNCATION_MARKER.len()],
+            "a".repeat(max_line_bytes - LOG_TRUNCATION_MARKER.len() - 1)
+        );
+    }
+
+    #[test]
+    fn crlf_is_removed_without_marking_an_exact_bound_line_as_truncated() {
+        let max_line_bytes = 64;
+        let mut input = vec![b'a'; max_line_bytes];
+        input.extend_from_slice(b"\r\nsecond\r\n");
+
+        let batch = collect_fixture_logs(input, max_line_bytes);
+
+        assert_eq!(batch.records.len(), 2);
+        assert_eq!(batch.records[0].message, "a".repeat(max_line_bytes));
+        assert_eq!(batch.records[1].message, "second");
+    }
+
+    #[test]
+    fn chunk_boundaries_preserve_one_record_per_physical_line() {
+        let max_line_bytes = 4 * 1024 + 64;
+        let mut input = vec![b'a'; 4 * 1024 - 1];
+        input.push(b'\n');
+        input.extend(std::iter::repeat_n(b'b', 4 * 1024));
+        input.extend_from_slice(b"\r\n");
+
+        let batch = collect_fixture_logs(input, max_line_bytes);
+
+        assert_eq!(batch.records.len(), 2);
+        assert_eq!(batch.records[0].message, "a".repeat(4 * 1024 - 1));
+        assert_eq!(batch.records[1].message, "b".repeat(4 * 1024));
+    }
+
+    #[test]
+    fn huge_unterminated_line_is_consumed_as_one_bounded_record() {
+        let max_line_bytes = 64;
+        let input = vec![b'x'; 2 * 1024 * 1024];
+
+        let batch = collect_fixture_logs(input, max_line_bytes);
+
+        assert_eq!(batch.records.len(), 1);
+        assert_eq!(batch.records[0].message.len(), max_line_bytes);
+        assert!(batch.records[0].message.ends_with(LOG_TRUNCATION_MARKER));
     }
 }
