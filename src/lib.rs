@@ -10,6 +10,7 @@ pub mod core;
 pub mod core_guardian;
 pub mod core_service_ipc;
 pub mod daemon;
+pub mod diagnostics;
 mod digest;
 pub mod domain;
 pub mod error;

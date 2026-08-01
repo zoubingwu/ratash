@@ -47,6 +47,7 @@ pub const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 pub const LOG_CAPACITY: usize = 10_000;
 pub const LOG_SUBSCRIBER_CAPACITY: usize = 256;
+pub const WRAPPER_DIAGNOSTIC_CAPACITY: usize = 256;
 pub const STATUS_SUBSCRIBER_CAPACITY: usize = 64;
 pub const TRAFFIC_SERIES_CAPACITY: usize = 300;
 

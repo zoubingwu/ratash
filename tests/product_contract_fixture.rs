@@ -91,6 +91,7 @@ fn release_fixture_freezes_capacities_and_input_boundaries() {
         ("active_nodes", MAX_ACTIVE_NODES),
         ("logs", LOG_CAPACITY),
         ("log_subscriber", LOG_SUBSCRIBER_CAPACITY),
+        ("wrapper_diagnostics", WRAPPER_DIAGNOSTIC_CAPACITY),
         ("status_subscriber", STATUS_SUBSCRIBER_CAPACITY),
         ("traffic_series", TRAFFIC_SERIES_CAPACITY),
         ("local_rules", LOCAL_RULE_COUNT_MAX),

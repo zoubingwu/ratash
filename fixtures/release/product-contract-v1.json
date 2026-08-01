@@ -52,6 +52,7 @@
     "active_nodes": 10000,
     "logs": 10000,
     "log_subscriber": 256,
+    "wrapper_diagnostics": 256,
     "status_subscriber": 64,
     "traffic_series": 300,
     "local_rules": 20000
