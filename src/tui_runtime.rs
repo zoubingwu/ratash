@@ -389,7 +389,7 @@ where
                 .client
                 .execute_cancellable(
                     ApplicationOperation::ProxyList {
-                        group: group.clone(),
+                        group,
                     },
                     cancellation,
                 )

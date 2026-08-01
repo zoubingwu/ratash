@@ -392,34 +392,34 @@ impl ProbeScheduler {
             return Vec::new();
         };
         let available = PROBE_WORKER_COUNT.saturating_sub(self.in_flight.len());
-        let due = self
-            .queue
-            .iter()
-            .take_while(|entry| entry.due_at_unix_ms <= now_unix_ms)
-            .take(available)
-            .cloned()
-            .collect::<Vec<_>>();
-
-        due.into_iter()
-            .map(|entry| {
-                self.queue.remove(&entry);
-                self.queued_deadlines.remove(&entry.node_id);
-                let attempt_id = self.take_attempt_id();
-                self.in_flight.insert(
-                    entry.node_id.clone(),
-                    InFlightProbe {
-                        attempt_id,
-                        generation,
-                    },
-                );
-                ProbeTask {
+        let mut tasks = Vec::with_capacity(available.min(self.queue.len()));
+        while tasks.len() < available {
+            let Some(entry) = self
+                .queue
+                .first()
+                .filter(|entry| entry.due_at_unix_ms <= now_unix_ms)
+                .cloned()
+            else {
+                break;
+            };
+            self.queue.remove(&entry);
+            self.queued_deadlines.remove(&entry.node_id);
+            let attempt_id = self.take_attempt_id();
+            self.in_flight.insert(
+                entry.node_id.clone(),
+                InFlightProbe {
                     attempt_id,
                     generation,
-                    node_id: entry.node_id,
-                    due_at_unix_ms: entry.due_at_unix_ms,
-                }
-            })
-            .collect()
+                },
+            );
+            tasks.push(ProbeTask {
+                attempt_id,
+                generation,
+                node_id: entry.node_id,
+                due_at_unix_ms: entry.due_at_unix_ms,
+            });
+        }
+        tasks
     }
 
     pub fn complete(&mut self, completion: ProbeCompletion) -> ProbeCompletionStatus {

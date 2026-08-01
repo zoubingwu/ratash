@@ -999,7 +999,7 @@ fn run_owned_supervisor(
         profile: ProfileRevision(0),
         active_profile: ActiveProfileRevision(0),
         local_rule_set: LocalRuleSetRevision(0),
-        compiler_policy_sha256: compiler_policy_sha256.clone(),
+        compiler_policy_sha256,
         core_version: BUNDLED_CORE_VERSION.to_owned(),
     }));
     let revision_source: Arc<dyn CandidateRevisionSource> = revisions.clone();
@@ -1007,11 +1007,10 @@ fn run_owned_supervisor(
         Arc::clone(&core_runtime),
         classify_runtime_apply_error,
     ));
-    let mihomo = Arc::new(
+    let mihomo_port: Arc<dyn MihomoAdapter> = Arc::new(
         UnixMihomoAdapter::new(MihomoAdapterConfig::default())
             .map_err(|_| startup_internal("The Mihomo adapter policy is invalid"))?,
     );
-    let mihomo_port: Arc<dyn MihomoAdapter> = mihomo.clone();
     let lifecycle_lock = Arc::new(Mutex::new(()));
     let coordinator = Arc::new(ConfigTransactionCoordinator::new(
         ConfigTransactionDependencies {
@@ -1080,7 +1079,7 @@ fn run_owned_supervisor(
     .map_err(|_| startup_internal("The Supervisor instance record could not be updated"))?;
 
     let broker = Arc::new(
-        IpcStreamBroker::new(0, SystemClock.now_unix_ms(), initial_status.clone())
+        IpcStreamBroker::new(0, SystemClock.now_unix_ms(), initial_status)
             .map_err(|_| startup_internal("The IPC stream broker could not start"))?,
     );
     let drain = Arc::new(DrainController::default());
@@ -1101,7 +1100,7 @@ fn run_owned_supervisor(
     )
     .map_err(|_| startup_internal("The Supervisor IPC server could not start"))?;
     let shutdown_handler = Arc::new(ProductionShutdownHandler {
-        process: process.clone(),
+        process,
         instance_token,
         drain: Arc::clone(&drain),
     });
