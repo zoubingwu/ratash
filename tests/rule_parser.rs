@@ -641,10 +641,26 @@ fn rules_yaml_accepts_the_twenty_thousand_rule_regression_boundary() {
             .collect::<String>()
     );
 
-    let rules = LocalRuleSet::from_yaml(&document, LocalRuleSetRevision(3), TEST_LIMITS).unwrap();
+    let mut rules =
+        LocalRuleSet::from_yaml(&document, LocalRuleSetRevision(3), TEST_LIMITS).unwrap();
+    let target = RuleString::new("DOMAIN,node-19999.example,DIRECT", 1024).unwrap();
+    let matching_indexes = rules
+        .list()
+        .unwrap()
+        .entries
+        .iter()
+        .filter_map(|entry| (entry.rule == &target).then_some(entry.index))
+        .collect::<Vec<_>>();
+    let replacement = RuleString::new("DOMAIN,node-19999.example,REJECT", 1024).unwrap();
+    let position = rules.replace(&target, replacement.clone()).unwrap();
+    let serialized = rules.to_yaml().unwrap();
 
     assert_eq!(rules.list().unwrap().entries.len(), 20_000);
-    assert_eq!(rules.revision(), LocalRuleSetRevision(3));
+    assert_eq!(matching_indexes, vec![19_999]);
+    assert_eq!(position, 19_999);
+    assert_eq!(rules.revision(), LocalRuleSetRevision(4));
+    assert!(serialized.contains(replacement.as_str()));
+    assert!(!serialized.contains(target.as_str()));
 }
 
 #[test]
