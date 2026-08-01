@@ -14,6 +14,7 @@ fn observable_product_limits_are_frozen_for_the_release_contract() {
     assert_eq!(SUPERVISOR_STATE_MAX_BYTES, 16 * 1_024 * 1_024);
     assert_eq!(EFFECTIVE_CONFIGURATION_MAX_BYTES, 64 * 1_024 * 1_024);
     assert_eq!(MIHOMO_VALIDATION_TIMEOUT.as_secs(), 10);
+    assert_eq!(CORE_PROCESS_STOP_TIMEOUT.as_secs(), 5);
     assert_eq!(MIHOMO_BINARY_MAX_BYTES, 128 * 1_024 * 1_024);
     assert_eq!(MIHOMO_VALIDATION_OUTPUT_MAX_BYTES, 256 * 1_024);
     assert_eq!(PROBE_WORKER_COUNT, 16);
@@ -29,6 +30,13 @@ fn observable_product_limits_are_frozen_for_the_release_contract() {
     assert_eq!(SELECTION_RESTORE_ATTEMPT_LIMIT, 10);
     assert_eq!(LOCAL_RULE_COUNT_MAX, 20_000);
     assert_eq!(PROBE_URL, "https://www.gstatic.com/generate_204");
+    assert_eq!(CORE_SERVICE_REQUEST_TIMEOUT.as_secs(), 10);
+    assert_eq!(CORE_SERVICE_MUTATION_TIMEOUT.as_secs(), 40);
+    assert_eq!(IPC_REQUEST_TIMEOUT.as_secs(), 15);
+    assert_eq!(IPC_RUNTIME_MUTATION_TIMEOUT.as_secs(), 55);
+    assert_eq!(IPC_PROFILE_ADD_TIMEOUT.as_secs(), 95);
+    assert_eq!(DAEMON_STARTUP_TIMEOUT.as_secs(), 90);
+    assert_eq!(DAEMON_SHUTDOWN_TIMEOUT.as_secs(), 10);
 }
 
 #[test]

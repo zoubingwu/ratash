@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::constants::{
+    DAEMON_POLL_INTERVAL, DAEMON_SHUTDOWN_TIMEOUT, DAEMON_STARTUP_TIMEOUT,
+};
 use crate::ipc::IPC_PROTOCOL_VERSION;
 use crate::lifecycle::{
     DirectoryLease, InstanceRecord, LeaseAcquisition, LeaseOwner, LifecycleError, ProcessIdentity,
@@ -212,9 +215,9 @@ pub struct DaemonTimeouts {
 impl Default for DaemonTimeouts {
     fn default() -> Self {
         Self {
-            startup: Duration::from_secs(20),
-            shutdown: Duration::from_secs(10),
-            poll_interval: Duration::from_millis(25),
+            startup: DAEMON_STARTUP_TIMEOUT,
+            shutdown: DAEMON_SHUTDOWN_TIMEOUT,
+            poll_interval: DAEMON_POLL_INTERVAL,
         }
     }
 }

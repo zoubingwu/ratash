@@ -12,7 +12,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
-use crate::constants::{CORE_LOG_LINE_MAX_BYTES, CORE_READINESS_TIMEOUT, LOG_CAPACITY};
+use crate::constants::{
+    CORE_LOG_LINE_MAX_BYTES, CORE_PROCESS_STOP_TIMEOUT, CORE_READINESS_TIMEOUT, LOG_CAPACITY,
+};
 use crate::core::{CoreControlEndpoint, MihomoAdapter, MihomoReadiness, ProcessOutputSource};
 use crate::core_guardian::{CoreGuardianHandshake, CoreGuardianInvocation, read_handshake};
 use crate::lifecycle::{ProcessInspector, PsProcessInspector};
@@ -87,7 +89,7 @@ impl Default for NativeCoreProcessConfig {
         Self {
             readiness_timeout: CORE_READINESS_TIMEOUT,
             readiness_poll_interval: Duration::from_millis(50),
-            stop_timeout: Duration::from_secs(5),
+            stop_timeout: CORE_PROCESS_STOP_TIMEOUT,
             log_capacity: LOG_CAPACITY,
             max_log_line_bytes: CORE_LOG_LINE_MAX_BYTES,
         }

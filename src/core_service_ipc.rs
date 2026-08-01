@@ -26,8 +26,8 @@ use sha2::{Digest, Sha256};
 use socket2::{Domain, SockAddr, Socket, Type};
 
 use crate::constants::{
-    CORE_LOG_LINE_MAX_BYTES, EFFECTIVE_CONFIGURATION_MAX_BYTES, IPC_FRAME_MAX_BYTES,
-    IPC_REQUEST_TIMEOUT, IPC_RUNTIME_MUTATION_TIMEOUT, MIHOMO_BINARY_MAX_BYTES,
+    CORE_LOG_LINE_MAX_BYTES, CORE_SERVICE_MUTATION_TIMEOUT, CORE_SERVICE_REQUEST_TIMEOUT,
+    EFFECTIVE_CONFIGURATION_MAX_BYTES, IPC_FRAME_MAX_BYTES, MIHOMO_BINARY_MAX_BYTES,
     PROFILE_RESPONSE_MAX_BYTES,
 };
 use crate::core::{
@@ -102,7 +102,7 @@ impl CoreServiceClient {
         Self {
             socket_path: socket_path.into(),
             expected_service_uid,
-            connect_timeout: IPC_REQUEST_TIMEOUT,
+            connect_timeout: CORE_SERVICE_REQUEST_TIMEOUT,
             timeout_policy: CoreServiceTimeoutPolicy::Product,
             next_request_id: AtomicU64::new(1),
         }
@@ -219,7 +219,7 @@ impl fmt::Debug for CoreServiceClient {
 impl CoreServiceTimeoutPolicy {
     fn request_timeout(self) -> Duration {
         match self {
-            Self::Product => IPC_REQUEST_TIMEOUT,
+            Self::Product => CORE_SERVICE_REQUEST_TIMEOUT,
             Self::Fixed(timeout) => timeout,
             Self::OperationSpecific { request, .. } => request,
         }
@@ -227,7 +227,7 @@ impl CoreServiceTimeoutPolicy {
 
     fn mutation_timeout(self) -> Duration {
         match self {
-            Self::Product => IPC_RUNTIME_MUTATION_TIMEOUT,
+            Self::Product => CORE_SERVICE_MUTATION_TIMEOUT,
             Self::Fixed(timeout) => timeout,
             Self::OperationSpecific { mutation, .. } => mutation,
         }
@@ -335,7 +335,7 @@ impl CoreServiceServerConfig {
         Self {
             runtime_staging_root: runtime_staging_root.into(),
             allowed_owner_uid,
-            io_timeout: IPC_REQUEST_TIMEOUT,
+            io_timeout: CORE_SERVICE_REQUEST_TIMEOUT,
             worker_count: DEFAULT_SERVER_WORKERS,
             pending_connection_capacity: DEFAULT_PENDING_CONNECTIONS,
         }

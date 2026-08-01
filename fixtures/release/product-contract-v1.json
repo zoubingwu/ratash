@@ -2,7 +2,7 @@
   "schema_version": 1,
   "product": "Hopash RS",
   "executable": "hopash",
-  "minimum_rust_version": "1.85",
+  "minimum_rust_version": "1.88",
   "supported_targets": [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin"
@@ -20,6 +20,7 @@
     "profile_total_timeout": 30000,
     "core_readiness_timeout": 10000,
     "core_health_timeout": 5000,
+    "core_process_stop_timeout": 5000,
     "core_restart_initial_backoff": 1000,
     "core_restart_max_backoff": 30000,
     "core_service_liveness_interval": 5000,
@@ -31,9 +32,15 @@
     "stream_stale_timeout": 10000,
     "reconnect_initial_backoff": 250,
     "reconnect_max_backoff": 10000,
-    "ipc_request_timeout": 10000,
-    "ipc_runtime_mutation_timeout": 40000,
-    "ipc_profile_add_timeout": 65000
+    "core_service_request_timeout": 10000,
+    "core_service_mutation_timeout": 40000,
+    "ipc_deadline_layer_margin": 5000,
+    "ipc_request_timeout": 15000,
+    "ipc_runtime_mutation_timeout": 55000,
+    "ipc_profile_add_timeout": 95000,
+    "daemon_startup_timeout": 90000,
+    "daemon_shutdown_timeout": 10000,
+    "daemon_poll_interval": 25
   },
   "capacities": {
     "profile_refresh_concurrency": 2,

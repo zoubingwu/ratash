@@ -14,6 +14,7 @@ pub const EFFECTIVE_CONFIGURATION_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 pub const CORE_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CORE_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+pub const CORE_PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 pub const CORE_RESTART_LIMIT: usize = 3;
 pub const CORE_RESTART_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 pub const CORE_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -34,9 +35,15 @@ pub const STATUS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 pub const STREAM_STALE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 pub const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(10);
-pub const IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-pub const IPC_RUNTIME_MUTATION_TIMEOUT: Duration = Duration::from_secs(40);
-pub const IPC_PROFILE_ADD_TIMEOUT: Duration = Duration::from_secs(65);
+pub const CORE_SERVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub const CORE_SERVICE_MUTATION_TIMEOUT: Duration = Duration::from_secs(40);
+pub const IPC_DEADLINE_LAYER_MARGIN: Duration = Duration::from_secs(5);
+pub const IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+pub const IPC_RUNTIME_MUTATION_TIMEOUT: Duration = Duration::from_secs(55);
+pub const IPC_PROFILE_ADD_TIMEOUT: Duration = Duration::from_secs(95);
+pub const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
+pub const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 pub const LOG_CAPACITY: usize = 10_000;
 pub const LOG_SUBSCRIBER_CAPACITY: usize = 256;
@@ -56,3 +63,33 @@ pub const IPC_LIST_PAGE_SIZE: usize = 128;
 
 pub const MINIMUM_TERMINAL_WIDTH: u16 = 80;
 pub const MINIMUM_TERMINAL_HEIGHT: u16 = 24;
+
+const _: () = {
+    assert!(
+        IPC_REQUEST_TIMEOUT.as_millis()
+            >= CORE_SERVICE_REQUEST_TIMEOUT.as_millis()
+                + IPC_DEADLINE_LAYER_MARGIN.as_millis()
+    );
+    assert!(
+        IPC_RUNTIME_MUTATION_TIMEOUT.as_millis()
+            >= CORE_SERVICE_MUTATION_TIMEOUT.as_millis()
+                + IPC_DEADLINE_LAYER_MARGIN.as_millis()
+    );
+    assert!(
+        IPC_PROFILE_ADD_TIMEOUT.as_millis()
+            >= PROFILE_TOTAL_TIMEOUT.as_millis()
+                + IPC_RUNTIME_MUTATION_TIMEOUT.as_millis()
+                + IPC_DEADLINE_LAYER_MARGIN.as_millis()
+    );
+    assert!(
+        DAEMON_STARTUP_TIMEOUT.as_millis()
+            >= CORE_SERVICE_MUTATION_TIMEOUT.as_millis()
+                + CORE_READINESS_TIMEOUT.as_millis()
+                + IPC_DEADLINE_LAYER_MARGIN.as_millis()
+    );
+    assert!(
+        DAEMON_SHUTDOWN_TIMEOUT.as_millis()
+            >= CORE_PROCESS_STOP_TIMEOUT.as_millis()
+                + IPC_DEADLINE_LAYER_MARGIN.as_millis()
+    );
+};

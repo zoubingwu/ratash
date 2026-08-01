@@ -22,6 +22,10 @@ fn duration_ms(value: std::time::Duration) -> u64 {
 fn release_fixture_freezes_versions_and_user_observable_intervals() {
     let contract = fixture();
     assert_eq!(contract["schema_version"], 1);
+    assert_eq!(
+        contract["minimum_rust_version"],
+        env!("CARGO_PKG_RUST_VERSION")
+    );
     assert_eq!(contract["mihomo_version"], BUNDLED_CORE_VERSION);
     assert_eq!(contract["protocol_versions"]["cli_json"], SCHEMA_VERSION);
     assert_eq!(contract["protocol_versions"]["ipc"], IPC_PROTOCOL_VERSION);
@@ -38,6 +42,7 @@ fn release_fixture_freezes_versions_and_user_observable_intervals() {
         ("profile_total_timeout", PROFILE_TOTAL_TIMEOUT),
         ("core_readiness_timeout", CORE_READINESS_TIMEOUT),
         ("core_health_timeout", CORE_HEALTH_TIMEOUT),
+        ("core_process_stop_timeout", CORE_PROCESS_STOP_TIMEOUT),
         ("core_restart_initial_backoff", CORE_RESTART_INITIAL_BACKOFF),
         ("core_restart_max_backoff", CORE_RESTART_MAX_BACKOFF),
         (
@@ -52,9 +57,18 @@ fn release_fixture_freezes_versions_and_user_observable_intervals() {
         ("stream_stale_timeout", STREAM_STALE_TIMEOUT),
         ("reconnect_initial_backoff", RECONNECT_INITIAL_BACKOFF),
         ("reconnect_max_backoff", RECONNECT_MAX_BACKOFF),
+        ("core_service_request_timeout", CORE_SERVICE_REQUEST_TIMEOUT),
+        (
+            "core_service_mutation_timeout",
+            CORE_SERVICE_MUTATION_TIMEOUT,
+        ),
+        ("ipc_deadline_layer_margin", IPC_DEADLINE_LAYER_MARGIN),
         ("ipc_request_timeout", IPC_REQUEST_TIMEOUT),
         ("ipc_runtime_mutation_timeout", IPC_RUNTIME_MUTATION_TIMEOUT),
         ("ipc_profile_add_timeout", IPC_PROFILE_ADD_TIMEOUT),
+        ("daemon_startup_timeout", DAEMON_STARTUP_TIMEOUT),
+        ("daemon_shutdown_timeout", DAEMON_SHUTDOWN_TIMEOUT),
+        ("daemon_poll_interval", DAEMON_POLL_INTERVAL),
     ] {
         assert_eq!(intervals[name], duration_ms(actual), "{name} drifted");
     }
