@@ -85,6 +85,7 @@
 - `src/tui.rs` owns the revision-aware Ratatui view model, reducer, count-and-byte-bounded Core Log view, bounded search input, and input mapping.
 - `src/tui/render.rs` owns pure layout, rendering, and interaction projection; `src/tui/event_inbox.rs` owns fair bounded event scheduling; `src/tui/terminal.rs` owns reversible Crossterm terminal sessions.
 - `src/tui_runtime.rs` owns pre-terminal bootstrap, latest-intent mutation dispatch, cancellable foreground waits, bounded snapshot resynchronization, reconnect timing, live status and log intake, the coalesced event loop, signal handling, and the Ratatui/Crossterm runner.
+- `src/tui_runtime/command.rs` owns cancellable application command execution and the bounded latest-intent dispatcher; `src/tui_runtime/snapshot.rs` owns full snapshot loading and transport-independent TUI view projection.
 - `src/constants.rs` centralizes versioned product intervals, capacities, terminal limits, and input-size boundaries.
 - `src/digest.rs` is the internal SHA-256 helper shared by stable identities, immutable storage, and compiler policies.
 - `src/cli/command.rs` defines the public Clap command tree and maps parsed commands to typed invocations.
