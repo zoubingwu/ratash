@@ -6,17 +6,20 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hopash::application::ApplicationOperation;
+use hopash::application::{ApplicationOperation, LatencyFreshness, LatencyProbeStatus};
 use hopash::domain::{
-    ActiveProfileSummary, ApplyState, CoreLifecycle, CoreStatus, ProbeQueueStatus, ProfileId,
-    SampleState, StatusSnapshot, StreamHealthSet, StreamState, SupervisorLifecycle,
-    SupervisorStatus, TrafficSample, TunStatus,
+    ActiveProfileSummary, ApplyState, CoreLifecycle, CoreStatus, NodeRecordId, ProbeQueueStatus,
+    ProfileId, ProxyGroupId, SampleState, StatusSnapshot, StreamHealthSet, StreamState,
+    SupervisorLifecycle, SupervisorStatus, TrafficSample, TunStatus,
 };
-use hopash::tui::{CrosstermControl, FullViewSnapshot, TerminalSession, ViewLogRecord};
+use hopash::tui::{
+    CrosstermControl, FullViewSnapshot, ProfileRow, ProxyGroupRow, ProxyGroupSnapshot, ProxyRow,
+    TerminalSession, ViewLogRecord,
+};
 use hopash::tui_runtime::{
     CancellationToken, FullSnapshotSource, LogTail, StatusInterfaceError, StatusInterfaceSources,
     StatusLogEvent, StatusLogEventSource, UiCommandExecutor, run_crossterm_status_interface,
-    run_with_terminal_session,
+    run_crossterm_status_interface_with_render_writer, run_with_terminal_session,
 };
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -61,6 +64,7 @@ fn pty_child_entry() {
             assert!(result.is_err(), "the injected runtime panic should unwind");
         }
         "partial" => exercise_partial_terminal_initialization(),
+        "render" => exercise_render_failure(),
         "repeat" => exercise_repeated_terminal_cleanup(),
         other => panic!("unknown PTY child scenario: {other}"),
     }
@@ -74,12 +78,16 @@ fn real_pty_interaction_covers_resize_keyboard_mouse_and_restoration() {
     interactive.wait_for_text("Required:");
     interactive.resize(RESIZED_PTY_SIZE);
     interactive.wait_for_text("Connection:");
+    interactive.write_input(b"3");
+    interactive.wait_for_text("Profiles (2)");
+    interactive.write_input(b"\r");
+    interactive.wait_for_text("HOPASH_PTY_COMMAND profile_use");
     interactive.write_input(b"2");
-    interactive.wait_for_text(" Original ");
+    interactive.wait_for_text("Nodes (2)");
+    interactive.write_input(b"\x1b[<0;2;11M\x1b[<0;2;11m");
+    interactive.wait_for_text("HOPASH_PTY_COMMAND proxy_select");
     interactive.write_input(b"\x1b[<0;39;2M\x1b[<0;39;2m");
     interactive.wait_for_text(" Follow  ");
-    interactive.write_input(b"3");
-    interactive.wait_for_text("Profiles (0)");
     interactive.write_input(b"q");
     let interactive_output = interactive.finish();
     assert_terminal_restored(&interactive_output, "interactive");
@@ -138,6 +146,12 @@ fn real_pty_partial_initialization_restores_raw_mode() {
 }
 
 #[test]
+fn real_pty_render_error_restores_terminal_modes() {
+    let render_output = PtySession::spawn("render").finish();
+    assert_terminal_restored(&render_output, "render");
+}
+
+#[test]
 fn real_pty_repeated_cleanup_emits_each_restoration_once() {
     let repeat_output = PtySession::spawn("repeat").finish();
     assert_terminal_restored(&repeat_output, "repeat");
@@ -189,6 +203,18 @@ fn exercise_repeated_terminal_cleanup() {
         .expect("the repeated terminal cleanup should be idempotent");
 }
 
+fn exercise_render_failure() {
+    let error = run_crossterm_status_interface_with_render_writer(
+        status_sources(false),
+        RenderFailingWriter,
+    )
+    .expect_err("the injected frame writer should reject rendering");
+    assert_eq!(
+        error.kind,
+        hopash::tui_runtime::StatusInterfaceErrorKind::Render
+    );
+}
+
 fn emit_terminal_result(scenario: &str) {
     let raw = crossterm::terminal::is_raw_mode_enabled()
         .expect("the PTY raw-mode state should remain readable");
@@ -217,6 +243,19 @@ impl FullSnapshotSource for StaticSnapshots {
         _cancellation: &CancellationToken,
     ) -> Result<FullViewSnapshot, StatusInterfaceError> {
         Ok(full_snapshot())
+    }
+
+    fn fetch_proxy_group(
+        &self,
+        _group: &str,
+        _connection_generation: u64,
+        _cancellation: &CancellationToken,
+    ) -> Result<ProxyGroupSnapshot, StatusInterfaceError> {
+        Ok(ProxyGroupSnapshot {
+            group: proxy_group(),
+            groups: vec![proxy_group()],
+            proxies: proxy_rows(),
+        })
     }
 }
 
@@ -259,9 +298,18 @@ struct ImmediateCommands;
 impl UiCommandExecutor for ImmediateCommands {
     fn execute(
         &self,
-        _operation: ApplicationOperation,
+        operation: ApplicationOperation,
         _cancellation: &CancellationToken,
     ) -> Result<String, StatusInterfaceError> {
+        match operation {
+            ApplicationOperation::ProfileUse { .. } => {
+                eprintln!("HOPASH_PTY_COMMAND profile_use");
+            }
+            ApplicationOperation::ProxySelect { .. } => {
+                eprintln!("HOPASH_PTY_COMMAND proxy_select");
+            }
+            other => panic!("unexpected PTY command: {other:?}"),
+        }
         Ok("done".to_owned())
     }
 }
@@ -302,6 +350,7 @@ fn full_snapshot() -> FullViewSnapshot {
             connection_count: 1,
             runtime_generation: None,
             apply_state: ApplyState::Idle,
+            runtime_apply: Default::default(),
             selection_restore_pending: false,
             probe_queue: ProbeQueueStatus::default(),
             stream_health: StreamHealthSet {
@@ -310,11 +359,52 @@ fn full_snapshot() -> FullViewSnapshot {
                 logs: StreamState::Healthy,
             },
         },
-        proxy_groups: Vec::new(),
-        proxies: Vec::new(),
-        profiles: Vec::new(),
+        proxy_groups: vec![proxy_group()],
+        proxies: proxy_rows(),
+        profiles: vec![profile("Primary", true), profile("Fallback", false)],
         logs: Vec::new(),
         dropped_logs: 0,
+    }
+}
+
+fn proxy_group() -> ProxyGroupRow {
+    ProxyGroupRow {
+        id: ProxyGroupId::for_name("Automatic"),
+        name: "Automatic".to_owned(),
+        proxy_type: "Selector".to_owned(),
+        selected_node: Some("Tokyo".to_owned()),
+    }
+}
+
+fn proxy_rows() -> Vec<ProxyRow> {
+    ["Tokyo", "Berlin"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| ProxyRow {
+            group_id: ProxyGroupId::for_name("Automatic"),
+            group: "Automatic".to_owned(),
+            node_id: Some(NodeRecordId::for_core(name)),
+            name: name.to_owned(),
+            node_type: "Shadowsocks".to_owned(),
+            available: true,
+            selected: index == 0,
+            delay_ms: Some(20 + index as u64),
+            sampled_at_unix_ms: Some(3),
+            freshness: LatencyFreshness::Fresh,
+            probe_status: LatencyProbeStatus::Succeeded,
+        })
+        .collect()
+}
+
+fn profile(name: &str, active: bool) -> ProfileRow {
+    ProfileRow {
+        id: ProfileId::new(),
+        name: name.to_owned(),
+        active,
+        fresh: true,
+        last_success_at_unix_ms: 2,
+        next_refresh_at_unix_ms: 4,
+        error: None,
     }
 }
 
@@ -343,6 +433,18 @@ impl Write for FailingWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         self.stdout.flush()
+    }
+}
+
+struct RenderFailingWriter;
+
+impl Write for RenderFailingWriter {
+    fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+        Err(io::Error::other("injected frame write failure"))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Err(io::Error::other("injected frame flush failure"))
     }
 }
 

@@ -2295,19 +2295,32 @@ pub fn run_with_terminal_session<T>(
 pub fn run_crossterm_status_interface(
     sources: StatusInterfaceSources,
 ) -> Result<(), StatusInterfaceError> {
+    run_crossterm_status_interface_with_render_writer(sources, io::stdout())
+}
+
+#[doc(hidden)]
+pub fn run_crossterm_status_interface_with_render_writer<W: io::Write>(
+    sources: StatusInterfaceSources,
+    render_writer: W,
+) -> Result<(), StatusInterfaceError> {
     const INITIAL_CONNECTION_GENERATION: u64 = 1;
 
     let snapshot = bootstrap_status_interface(&sources, INITIAL_CONNECTION_GENERATION)?;
-    let result =
-        run_crossterm_after_bootstrap(sources.clone(), INITIAL_CONNECTION_GENERATION, snapshot);
+    let result = run_crossterm_after_bootstrap(
+        sources.clone(),
+        INITIAL_CONNECTION_GENERATION,
+        snapshot,
+        render_writer,
+    );
     sources.events.disconnect(INITIAL_CONNECTION_GENERATION);
     result
 }
 
-fn run_crossterm_after_bootstrap(
+fn run_crossterm_after_bootstrap<W: io::Write>(
     sources: StatusInterfaceSources,
     connection_generation: u64,
     snapshot: FullViewSnapshot,
+    render_writer: W,
 ) -> Result<(), StatusInterfaceError> {
     let mut dispatcher = BackgroundCommandDispatcher::new(sources.clone())?;
     let signal = ProcessSignalSource::new()?;
@@ -2316,7 +2329,7 @@ fn run_crossterm_after_bootstrap(
         BoundedReconnectTimer::new(RECONNECT_INITIAL_BACKOFF, RECONNECT_MAX_BACKOFF)?;
     let mut input = CrosstermEventSource::new()?;
     let waker = RuntimeWaker::default();
-    let backend = CrosstermBackend::new(io::stdout());
+    let backend = CrosstermBackend::new(render_writer);
     let mut renderer = RatatuiStatusRenderer::new(backend)?;
     let mut control = CrosstermControl::new(io::stdout());
     let panic_hook = TerminalPanicHook::install();
