@@ -47,15 +47,6 @@ pub(super) fn map_spawn_error(error: ServicePlatformError) -> CoreRuntimeError {
     }
 }
 
-pub(super) fn map_reload_error(error: ServicePlatformError) -> CoreRuntimeError {
-    match error.kind {
-        ServicePlatformErrorKind::ReloadTimeout | ServicePlatformErrorKind::ApplyCancelled => {
-            service_error(CoreRuntimeErrorKind::ReloadTimeout, "Core reload timed out")
-        }
-        _ => service_error(CoreRuntimeErrorKind::Apply, "Core reload failed"),
-    }
-}
-
 pub(super) fn map_readiness_error(error: ServicePlatformError) -> CoreRuntimeError {
     if error.kind == ServicePlatformErrorKind::ApplyCancelled {
         service_error(

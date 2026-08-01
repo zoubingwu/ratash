@@ -42,8 +42,7 @@ use crate::domain::CoreInstanceGeneration;
 
 use bundle::verify_runtime_bundle;
 use error::{
-    map_readiness_error, map_reload_error, map_spawn_error, map_stop_error,
-    map_tun_preflight_error, service_error,
+    map_readiness_error, map_spawn_error, map_stop_error, map_tun_preflight_error, service_error,
 };
 use generation_state::{
     ServiceGenerationStateV1, cleanup_pending_generation_states, load_generation_state,
@@ -1239,34 +1238,11 @@ impl CoreRuntime for PrivilegedCoreRuntimeService {
             .map_err(map_tun_preflight_error)?;
         self.ensure_apply_active(owner)?;
 
-        if let Some(OwnedCoreState::Active(mut record)) = state.managed_core.clone() {
+        if let Some(OwnedCoreState::Active(record)) = state.managed_core.clone() {
             self.require_owned_process(&record)?;
-            let reload = self
-                .dependencies
-                .processes
-                .reload(&record.owned_identity, &verified);
-            if let Err(error) = reload {
-                return Err(map_reload_error(error));
-            }
+            state.managed_core = Some(OwnedCoreState::CleanupPending(record));
+            self.cleanup_pending_core(&mut state)?;
             self.ensure_apply_active(owner)?;
-            if let Err(error) = self
-                .dependencies
-                .processes
-                .readiness(&record.owned_identity, &record.handle.endpoint)
-            {
-                return Err(map_readiness_error(error));
-            }
-            let _active_apply = self.active_apply_guard(owner)?;
-            record.handle.runtime_generation = bundle.generation;
-            let handle = record.handle.clone();
-            state.managed_core = Some(OwnedCoreState::Active(record));
-            state.last_bundle = Some(bundle.clone());
-            reset_restart_state(&mut state);
-            state.next_liveness_at = None;
-            return Ok(ApplyCandidateResult {
-                disposition: ApplyDisposition::Reloaded,
-                managed_core: handle,
-            });
         }
 
         let record = self.spawn_verified(&mut state, &authenticated, &verified)?;

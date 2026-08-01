@@ -195,7 +195,7 @@ struct FakeProcessState {
     processes: BTreeMap<u32, String>,
     logs: VecDeque<CoreProcessLog>,
     dropped_logs: u64,
-    reload_error: Option<ServicePlatformErrorKind>,
+    spawned_generations: Vec<RuntimeGeneration>,
     readiness_error: Option<ServicePlatformErrorKind>,
     stop_error: Option<ServicePlatformErrorKind>,
     bind_endpoint_on_readiness: bool,
@@ -289,10 +289,6 @@ impl FakeProcesses {
             .extend(scripts);
     }
 
-    fn fail_reload(&self, kind: ServicePlatformErrorKind) {
-        self.state.lock().expect("process lock").reload_error = Some(kind);
-    }
-
     fn fail_readiness(&self, kind: ServicePlatformErrorKind) {
         self.state.lock().expect("process lock").readiness_error = Some(kind);
     }
@@ -310,6 +306,14 @@ impl FakeProcesses {
 
     fn live_process_count(&self) -> usize {
         self.state.lock().expect("process lock").processes.len()
+    }
+
+    fn spawned_generations(&self) -> Vec<RuntimeGeneration> {
+        self.state
+            .lock()
+            .expect("process lock")
+            .spawned_generations
+            .clone()
     }
 
     fn push_logs(&self, logs: impl IntoIterator<Item = CoreProcessLog>) {
@@ -376,7 +380,7 @@ impl FakeProcesses {
 impl CoreProcessController for FakeProcesses {
     fn spawn(
         &self,
-        _bundle: &VerifiedRuntimeBundle,
+        bundle: &VerifiedRuntimeBundle,
         _endpoint: &CoreControlEndpoint,
         instance_generation: CoreInstanceGeneration,
     ) -> Result<SpawnedCoreProcess, ServicePlatformError> {
@@ -387,6 +391,7 @@ impl CoreProcessController for FakeProcesses {
         }
         self.spawn_count.fetch_add(1, Ordering::Relaxed);
         let mut state = self.state.lock().expect("process lock");
+        state.spawned_generations.push(bundle.bundle().generation);
         if state.scripts.pop_front() == Some(SpawnScript::Failure) {
             return Err(ServicePlatformError::new(ServicePlatformErrorKind::Spawn));
         }
@@ -406,10 +411,7 @@ impl CoreProcessController for FakeProcesses {
         _bundle: &VerifiedRuntimeBundle,
     ) -> Result<(), ServicePlatformError> {
         self.reload_count.fetch_add(1, Ordering::Relaxed);
-        let mut state = self.state.lock().expect("process lock");
-        if let Some(kind) = state.reload_error.take() {
-            return Err(ServicePlatformError::new(kind));
-        }
+        let state = self.state.lock().expect("process lock");
         match state.processes.get(&process.pid) {
             Some(identity) if identity == &process.process_start_identity => Ok(()),
             _ => Err(ServicePlatformError::new(ServicePlatformErrorKind::Reload)),
@@ -1438,7 +1440,8 @@ fn cancelling_blocked_service_readiness_releases_owner_cleanup_promptly() {
             .apply_candidate(&session.proof, &harness.bundle(3))
             .expect_err("the owner-scoped cancellation should remain terminal");
         assert_eq!(retry.kind, CoreRuntimeErrorKind::ReloadTimeout);
-        assert_eq!(harness.processes.reload_count.load(Ordering::Relaxed), 1);
+        assert_eq!(harness.processes.reload_count.load(Ordering::Relaxed), 0);
+        assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 2);
 
         let close_started = Instant::now();
         harness
@@ -1448,7 +1451,7 @@ fn cancelling_blocked_service_readiness_releases_owner_cleanup_promptly() {
         assert!(close_started.elapsed() < Duration::from_millis(200));
     });
 
-    assert_eq!(harness.processes.stop_count.load(Ordering::Relaxed), 1);
+    assert_eq!(harness.processes.stop_count.load(Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -2172,7 +2175,7 @@ fn unsupported_tun_preflight_has_a_distinct_runtime_error() {
 }
 
 #[test]
-fn configuration_policy_rejection_precedes_spawn_and_reload() {
+fn configuration_policy_rejection_precedes_process_transition() {
     let harness = Harness::new();
     let session = harness.open();
     harness.configuration_policy.deny(true);
@@ -2193,13 +2196,14 @@ fn configuration_policy_rejection_precedes_spawn_and_reload() {
     assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 1);
     harness.configuration_policy.deny(true);
 
-    let reload_error = harness
+    let candidate_error = harness
         .service
         .apply_candidate(&session.proof, &harness.bundle(3))
-        .expect_err("a rejected configuration should not reload the Core");
-    assert_eq!(reload_error.kind, CoreRuntimeErrorKind::InvalidBundle);
+        .expect_err("a rejected configuration should preserve the Managed Core");
+    assert_eq!(candidate_error.kind, CoreRuntimeErrorKind::InvalidBundle);
     assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 1);
     assert_eq!(harness.processes.reload_count.load(Ordering::Relaxed), 0);
+    assert_eq!(harness.processes.stop_count.load(Ordering::Relaxed), 0);
     assert_eq!(
         applied.managed_core.runtime_generation,
         RuntimeGeneration(2)
@@ -2539,7 +2543,58 @@ fn spawn_readiness_failure_stops_the_fixture_and_keeps_service_owned_only() {
 }
 
 #[test]
-fn reload_timeout_preserves_the_recorded_previous_generation() {
+fn failed_generation_restart_allows_recovery_to_the_previous_generation() {
+    let harness = Harness::new();
+    let session = harness.open();
+    let first = harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect("the initial Core should spawn");
+    harness.processes.script_spawns([SpawnScript::Failure]);
+
+    let error = harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(2))
+        .expect_err("the candidate restart should fail");
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Apply);
+    assert!(
+        harness
+            .service
+            .status(&session.proof)
+            .expect("status should remain available")
+            .managed_core
+            .is_none()
+    );
+    let stopped = harness
+        .service
+        .stop(&session.proof)
+        .expect("transaction recovery should tolerate the absent candidate Core");
+    assert!(!stopped.stopped);
+    let recovered = harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect("the previous Runtime Generation should recover");
+    assert_eq!(
+        recovered.managed_core.runtime_generation,
+        RuntimeGeneration(1)
+    );
+    assert_eq!(
+        recovered.managed_core.instance_generation,
+        CoreInstanceGeneration(first.managed_core.instance_generation.0 + 2)
+    );
+    assert_eq!(
+        harness.processes.spawned_generations(),
+        [
+            RuntimeGeneration(1),
+            RuntimeGeneration(2),
+            RuntimeGeneration(1)
+        ]
+    );
+}
+
+#[test]
+fn failed_generation_stop_retains_cleanup_authority_for_recovery() {
     let harness = Harness::new();
     let session = harness.open();
     let first = harness
@@ -2548,25 +2603,43 @@ fn reload_timeout_preserves_the_recorded_previous_generation() {
         .expect("the initial Core should spawn");
     harness
         .processes
-        .fail_reload(ServicePlatformErrorKind::ReloadTimeout);
+        .fail_next_stop(ServicePlatformErrorKind::Stop);
 
     let error = harness
         .service
         .apply_candidate(&session.proof, &harness.bundle(2))
-        .expect_err("the reload should time out");
+        .expect_err("the candidate transition should retain failed cleanup authority");
 
-    assert_eq!(error.kind, CoreRuntimeErrorKind::ReloadTimeout);
-    let status = harness
-        .service
-        .status(&session.proof)
-        .expect("status should retain the previous record")
-        .managed_core
-        .expect("the previous Core should remain recorded");
-    assert_eq!(status.runtime_generation, RuntimeGeneration(1));
+    assert_eq!(error.kind, CoreRuntimeErrorKind::Apply);
     assert_eq!(
-        status.instance_generation,
-        first.managed_core.instance_generation
+        harness
+            .service
+            .status(&session.proof)
+            .expect("pending cleanup status should remain available")
+            .lifecycle,
+        CoreRuntimeLifecycle::Degraded
     );
+    let stopped = harness
+        .service
+        .stop(&session.proof)
+        .expect("transaction recovery should retry the exact owned Core stop");
+    assert_eq!(
+        stopped.instance_generation,
+        Some(first.managed_core.instance_generation)
+    );
+    let recovered = harness
+        .service
+        .apply_candidate(&session.proof, &harness.bundle(1))
+        .expect("the previous Runtime Generation should recover");
+    assert_eq!(
+        recovered.managed_core.instance_generation,
+        CoreInstanceGeneration(first.managed_core.instance_generation.0 + 1)
+    );
+    assert_eq!(
+        harness.processes.spawned_generations(),
+        [RuntimeGeneration(1), RuntimeGeneration(1)]
+    );
+    assert_eq!(harness.processes.stop_count.load(Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -2718,7 +2791,7 @@ fn unexpected_exit_requires_the_owned_process_to_have_exited() {
 }
 
 #[test]
-fn fixture_subprocess_supports_spawn_reload_readiness_and_owned_stop() {
+fn fixture_subprocess_restarts_for_each_runtime_generation_and_stops() {
     let directory = TestDirectory::new();
     let service_root = directory.path.join("fixture-service");
     let policy_sha256 = sha256(b"fixture-policy");
@@ -2774,19 +2847,23 @@ fn fixture_subprocess_supports_spawn_reload_readiness_and_owned_stop() {
     let spawned = service
         .apply_candidate(&session.proof, &first_bundle)
         .expect("the fixture subprocess should spawn");
-    let reloaded = service
+    let restarted = service
         .apply_candidate(&session.proof, &second_bundle)
-        .expect("the fixture subprocess should reload");
+        .expect("the fixture subprocess should restart");
     let stopped = service
         .stop(&session.proof)
         .expect("the fixture subprocess should stop");
 
     assert_eq!(spawned.disposition, ApplyDisposition::Spawned);
-    assert_eq!(reloaded.disposition, ApplyDisposition::Reloaded);
-    assert_eq!(spawned.managed_core.pid, reloaded.managed_core.pid);
+    assert_eq!(restarted.disposition, ApplyDisposition::Spawned);
+    assert_ne!(spawned.managed_core.pid, restarted.managed_core.pid);
     assert_eq!(
-        spawned.managed_core.instance_generation,
-        reloaded.managed_core.instance_generation
+        restarted.managed_core.instance_generation,
+        CoreInstanceGeneration(spawned.managed_core.instance_generation.0 + 1)
+    );
+    assert_eq!(
+        restarted.managed_core.runtime_generation,
+        RuntimeGeneration(2)
     );
     assert!(stopped.stopped);
     assert_eq!(processes.child_count(), 0);

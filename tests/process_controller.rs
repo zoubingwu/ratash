@@ -53,13 +53,23 @@ impl Drop for TestDirectory {
 #[derive(Default)]
 struct FakeControl {
     reloads: Mutex<Vec<PathBuf>>,
+    endpoint_listener: Mutex<Option<UnixListener>>,
 }
 
 impl CoreControlClient for FakeControl {
     fn readiness(
         &self,
-        _endpoint: &CoreControlEndpoint,
+        endpoint: &CoreControlEndpoint,
     ) -> Result<MihomoReadiness, ServicePlatformError> {
+        if !endpoint.socket_path.exists() {
+            let listener = UnixListener::bind(&endpoint.socket_path).map_err(|_| {
+                ServicePlatformError::new(hopash::service::ServicePlatformErrorKind::Readiness)
+            })?;
+            *self
+                .endpoint_listener
+                .lock()
+                .expect("endpoint listener lock should remain available") = Some(listener);
+        }
         Ok(MihomoReadiness::Ready)
     }
 
@@ -106,7 +116,7 @@ impl RuntimeConfigurationPolicy for AllowConfiguration {
 }
 
 #[test]
-fn verified_runtime_spawns_reloads_forwards_bounded_logs_and_stops() {
+fn verified_runtime_restarts_for_each_generation_forwards_bounded_logs_and_stops() {
     let directory = TestDirectory::new("lifecycle");
     let executable = directory.0.join("fixture-core");
     fs::write(
@@ -197,18 +207,19 @@ fn verified_runtime_spawns_reloads_forwards_bounded_logs_and_stops() {
 
     let second = service
         .apply_candidate(&session.proof, &second_bundle)
-        .expect("second Runtime Apply should reload the fixture Core");
-    assert_eq!(second.disposition, ApplyDisposition::Reloaded);
-    assert_eq!(second.managed_core.pid, first.managed_core.pid);
+        .expect("second Runtime Apply should restart the fixture Core");
+    assert_eq!(second.disposition, ApplyDisposition::Spawned);
+    assert_ne!(second.managed_core.pid, first.managed_core.pid);
+    assert_eq!(
+        second.managed_core.instance_generation,
+        hopash::domain::CoreInstanceGeneration(first.managed_core.instance_generation.0 + 1)
+    );
     assert_eq!(second.managed_core.runtime_generation, RuntimeGeneration(2));
     let reloads = control
         .reloads
         .lock()
         .expect("reload fixture lock should remain available");
-    assert_eq!(
-        reloads.as_slice(),
-        &[second_bundle.generation_root.join("config.yaml")]
-    );
+    assert!(reloads.is_empty());
     drop(reloads);
 
     let kill_status = Command::new("/bin/kill")
@@ -261,7 +272,7 @@ fn verified_runtime_spawns_reloads_forwards_bounded_logs_and_stops() {
     assert_eq!(restarted.runtime_generation, RuntimeGeneration(2));
     assert_eq!(
         restarted.instance_generation,
-        hopash::domain::CoreInstanceGeneration(first.managed_core.instance_generation.0 + 1)
+        hopash::domain::CoreInstanceGeneration(first.managed_core.instance_generation.0 + 2)
     );
 
     let stopped = service
@@ -606,7 +617,7 @@ fn wait_for_logs(
     proof: &hopash::core::OwnerSessionProof,
     expected: usize,
 ) -> hopash::core::ForwardedCoreLogBatch {
-    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let batch = service
             .logs(proof, None, expected)
