@@ -328,10 +328,7 @@ fn production_binary_lifecycle_is_ready_idempotent_persistent_and_replaces_exact
     let stop = success_json(commands.run(&["stop", "--json"]));
     assert_eq!(stop["data"]["action"], "stop");
     assert_eq!(stop["data"]["changed"], true);
-    assert_eq!(
-        stop["data"]["status"]["supervisor"]["lifecycle"],
-        "stopping"
-    );
+    assert_eq!(stop["data"]["status"]["supervisor"]["lifecycle"], "stopped");
     assert_eq!(stop["data"]["status"]["core"]["lifecycle"], "stopped");
     assert!(
         InstanceRecord::read_private(&paths.instance_record)
@@ -346,7 +343,7 @@ fn production_binary_lifecycle_is_ready_idempotent_persistent_and_replaces_exact
     assert_eq!(repeated_stop["data"]["changed"], false);
     assert_eq!(
         repeated_stop["data"]["status"]["supervisor"]["lifecycle"],
-        "stopping"
+        "stopped"
     );
     assert_eq!(
         runtime.snapshot(),

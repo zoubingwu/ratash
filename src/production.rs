@@ -335,7 +335,7 @@ fn stopped_status(
         Some(status) => status,
         None => crate::domain::StatusSnapshot {
             supervisor: crate::domain::SupervisorStatus {
-                lifecycle: SupervisorLifecycle::Stopping,
+                lifecycle: SupervisorLifecycle::Stopped,
                 started_at_unix_ms: now,
                 uptime_seconds: 0,
             },
@@ -374,7 +374,7 @@ fn stopped_status(
             },
         },
     };
-    status.supervisor.lifecycle = SupervisorLifecycle::Stopping;
+    status.supervisor.lifecycle = SupervisorLifecycle::Stopped;
     status.core.lifecycle = CoreLifecycle::Stopped;
     status.core.pid = None;
     status.core.instance_generation = None;

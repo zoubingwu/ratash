@@ -103,6 +103,21 @@ fn overview_renders_core_restart_and_tun_diagnostics() {
 }
 
 #[test]
+fn overview_renders_the_final_stopped_supervisor_lifecycle() {
+    let mut state = connected_state();
+    let status = state
+        .status
+        .as_mut()
+        .expect("the connected fixture should have status");
+    status.supervisor.lifecycle = SupervisorLifecycle::Stopped;
+    status.core.lifecycle = CoreLifecycle::Stopped;
+
+    let (text, _) = render_with_backend(&state, 80, 24);
+
+    assert!(text.contains("Supervisor: Stopped | Core: Stopped"));
+}
+
+#[test]
 fn compact_overview_renders_runtime_apply_recovery() {
     let mut state = connected_state();
     let status = state

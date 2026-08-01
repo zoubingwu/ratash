@@ -3674,6 +3674,7 @@ enum WireSupervisorLifecycle {
     Starting,
     Ready,
     Stopping,
+    Stopped,
     Degraded,
 }
 
@@ -3683,6 +3684,7 @@ impl From<SupervisorLifecycle> for WireSupervisorLifecycle {
             SupervisorLifecycle::Starting => Self::Starting,
             SupervisorLifecycle::Ready => Self::Ready,
             SupervisorLifecycle::Stopping => Self::Stopping,
+            SupervisorLifecycle::Stopped => Self::Stopped,
             SupervisorLifecycle::Degraded => Self::Degraded,
         }
     }
@@ -3694,6 +3696,7 @@ impl From<WireSupervisorLifecycle> for SupervisorLifecycle {
             WireSupervisorLifecycle::Starting => Self::Starting,
             WireSupervisorLifecycle::Ready => Self::Ready,
             WireSupervisorLifecycle::Stopping => Self::Stopping,
+            WireSupervisorLifecycle::Stopped => Self::Stopped,
             WireSupervisorLifecycle::Degraded => Self::Degraded,
         }
     }

@@ -7,7 +7,7 @@ use hopash::cli::{
     ForegroundRunner, Invocation, OutputMode, run_invocation, run_invocation_with_frontend,
 };
 use hopash::contract::ProcessExitCode;
-use hopash::domain::{ProfileId, SubscriptionUrl};
+use hopash::domain::{CoreLifecycle, ProfileId, SubscriptionUrl, SupervisorLifecycle};
 use hopash::error::ErrorCode;
 use std::cell::RefCell;
 use std::io::Write;
@@ -119,6 +119,35 @@ fn json_status_invokes_one_use_case_and_writes_stdout_only() {
     assert_eq!(value["schema_version"], 1);
     assert_eq!(value["data"]["supervisor"]["lifecycle"], "ready");
     assert_eq!(value["data"]["core"]["lifecycle"], "unconfigured");
+}
+
+#[test]
+fn human_status_renders_the_final_stopped_lifecycle() {
+    let mut status = ApplicationService::new().status();
+    status.supervisor.lifecycle = SupervisorLifecycle::Stopped;
+    status.core.lifecycle = CoreLifecycle::Stopped;
+    let client = RecordingClient {
+        calls: RefCell::new(Vec::new()),
+        result: Ok(ApplicationOutput::Status(status)),
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let exit = run_invocation(
+        Invocation::Application {
+            operation: ApplicationOperation::GetStatus,
+            output: OutputMode::Human,
+        },
+        &client,
+        &mut stdout,
+        &mut stderr,
+    );
+
+    assert_eq!(exit, ProcessExitCode::Success);
+    assert!(stderr.is_empty());
+    let output = String::from_utf8(stdout).expect("status output should be UTF-8");
+    assert!(output.contains("Supervisor: stopped"));
+    assert!(output.contains("Core: stopped"));
 }
 
 #[test]

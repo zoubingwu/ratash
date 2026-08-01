@@ -3,6 +3,7 @@ use hopash::contract::{JsonEnvelope, StatusViewV1};
 use hopash::domain::{
     ApplyState, CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus, RuntimeApplyPhase,
     RuntimeApplySnapshot, RuntimeGeneration, RuntimeRecoverySnapshot, RuntimeRecoveryStatus,
+    SupervisorLifecycle,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -155,4 +156,17 @@ fn runtime_apply_status_serializes_generations_phase_and_recovery() {
             }
         })
     );
+}
+
+#[test]
+fn stopped_supervisor_serializes_the_final_v1_lifecycle() {
+    let mut status = ApplicationService::new().status();
+    status.supervisor.lifecycle = SupervisorLifecycle::Stopped;
+    status.core.lifecycle = CoreLifecycle::Stopped;
+
+    let value = serde_json::to_value(StatusViewV1::from(status))
+        .expect("stopped status should serialize through the public contract");
+
+    assert_eq!(value["supervisor"]["lifecycle"], json!("stopped"));
+    assert_eq!(value["core"]["lifecycle"], json!("stopped"));
 }

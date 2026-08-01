@@ -1079,6 +1079,7 @@ pub enum SupervisorLifecycleViewV1 {
     Starting,
     Ready,
     Stopping,
+    Stopped,
     Degraded,
 }
 
@@ -1088,6 +1089,7 @@ impl From<SupervisorLifecycle> for SupervisorLifecycleViewV1 {
             SupervisorLifecycle::Starting => Self::Starting,
             SupervisorLifecycle::Ready => Self::Ready,
             SupervisorLifecycle::Stopping => Self::Stopping,
+            SupervisorLifecycle::Stopped => Self::Stopped,
             SupervisorLifecycle::Degraded => Self::Degraded,
         }
     }

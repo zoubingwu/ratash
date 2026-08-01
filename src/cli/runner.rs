@@ -679,6 +679,7 @@ fn supervisor_lifecycle(lifecycle: crate::domain::SupervisorLifecycle) -> &'stat
         crate::domain::SupervisorLifecycle::Starting => "starting",
         crate::domain::SupervisorLifecycle::Ready => "ready",
         crate::domain::SupervisorLifecycle::Stopping => "stopping",
+        crate::domain::SupervisorLifecycle::Stopped => "stopped",
         crate::domain::SupervisorLifecycle::Degraded => "degraded",
     }
 }

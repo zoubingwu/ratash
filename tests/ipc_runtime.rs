@@ -28,6 +28,7 @@ use hopash::domain::{
     CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus, LocalRuleSetRevision, NodeRecordId,
     ProbeGeneration, ProfileId, ProxyGroupId, RuntimeApplyPhase, RuntimeApplySnapshot,
     RuntimeGeneration, RuntimeRecoverySnapshot, RuntimeRecoveryStatus, SubscriptionUrl,
+    SupervisorLifecycle,
 };
 use hopash::error::ErrorCode;
 use hopash::ipc::{
@@ -405,6 +406,30 @@ fn runtime_apply_and_core_health_round_trip_through_typed_ipc() {
     let output = IpcClient::new(socket.path())
         .execute(ApplicationOperation::GetStatus)
         .expect("rich status should round trip");
+
+    assert_eq!(output, ApplicationOutput::Status(expected));
+    server.shutdown().expect("server should stop cleanly");
+}
+
+#[test]
+fn stopped_supervisor_round_trips_through_typed_ipc() {
+    let socket = TempSocket::new("stopped-supervisor-round-trip");
+    let mut expected = ApplicationService::new().status();
+    expected.supervisor.lifecycle = SupervisorLifecycle::Stopped;
+    expected.core.lifecycle = CoreLifecycle::Stopped;
+    let mut server = IpcServer::start(
+        socket.path(),
+        Arc::new(QueuedClient::new(vec![Ok(ApplicationOutput::Status(
+            expected.clone(),
+        ))])),
+        Arc::new(AllowPeer),
+        IpcServerConfig::default(),
+    )
+    .expect("server should start");
+
+    let output = IpcClient::new(socket.path())
+        .execute(ApplicationOperation::GetStatus)
+        .expect("stopped status should round trip");
 
     assert_eq!(output, ApplicationOutput::Status(expected));
     server.shutdown().expect("server should stop cleanly");

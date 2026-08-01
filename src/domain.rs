@@ -3,6 +3,7 @@ pub enum SupervisorLifecycle {
     Starting,
     Ready,
     Stopping,
+    Stopped,
     Degraded,
 }
 
