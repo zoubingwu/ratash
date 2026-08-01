@@ -9,6 +9,7 @@ use crate::core::{
     CoreRuntimeError, CoreRuntimeErrorKind, ManagedCoreHandle, MihomoAdapter, MihomoReadiness,
     RuntimeBundle,
 };
+use crate::digest::is_lower_sha256_hex;
 use crate::runtime_bundle::{
     RuntimeGenerationPruneResult, RuntimeGenerationRetention, prune_runtime_generations,
 };
@@ -81,8 +82,8 @@ impl StagedRuntimeBundleResolver {
         let compiler_policy_sha256 = compiler_policy_sha256.into();
         let mihomo_binary_sha256 = mihomo_binary_sha256.into();
         if !root.is_absolute()
-            || !valid_digest(&compiler_policy_sha256)
-            || !valid_digest(&mihomo_binary_sha256)
+            || !is_lower_sha256_hex(&compiler_policy_sha256)
+            || !is_lower_sha256_hex(&mihomo_binary_sha256)
         {
             return Err(RuntimeBundleResolveError);
         }
@@ -174,11 +175,4 @@ fn read_bounded_regular(path: &Path, limit: usize) -> Result<Vec<u8>, RuntimeBun
         return Err(RuntimeBundleResolveError);
     }
     Ok(content)
-}
-
-fn valid_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }

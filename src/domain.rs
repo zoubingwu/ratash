@@ -267,11 +267,7 @@ pub struct NodeRecordId(String);
 impl NodeRecordId {
     pub fn parse(value: &str) -> Result<Self, InvalidNodeRecordId> {
         let digest = value.strip_prefix("node_v1_").ok_or(InvalidNodeRecordId)?;
-        if digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        {
+        if crate::digest::is_lower_sha256_hex(digest) {
             Ok(Self(value.to_owned()))
         } else {
             Err(InvalidNodeRecordId)
@@ -325,11 +321,7 @@ pub struct ProxyGroupId(String);
 impl ProxyGroupId {
     pub fn parse(value: &str) -> Result<Self, InvalidProxyGroupId> {
         let digest = value.strip_prefix("group_v1_").ok_or(InvalidProxyGroupId)?;
-        if digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        {
+        if crate::digest::is_lower_sha256_hex(digest) {
             Ok(Self(value.to_owned()))
         } else {
             Err(InvalidProxyGroupId)

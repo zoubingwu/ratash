@@ -14,6 +14,7 @@ use crate::constants::{
     EFFECTIVE_CONFIGURATION_MAX_BYTES, MIHOMO_BINARY_MAX_BYTES, MIHOMO_VALIDATION_OUTPUT_MAX_BYTES,
     MIHOMO_VALIDATION_TIMEOUT,
 };
+use crate::digest::is_lower_sha256_hex;
 
 #[derive(Clone)]
 pub struct MihomoCommandValidator {
@@ -31,7 +32,7 @@ impl MihomoCommandValidator {
     ) -> Result<Self, MihomoValidationError> {
         let binary = binary.into();
         let expected_sha256 = expected_sha256.into();
-        if !binary.is_absolute() || !valid_sha256(&expected_sha256) || timeout.is_zero() {
+        if !binary.is_absolute() || !is_lower_sha256_hex(&expected_sha256) || timeout.is_zero() {
             return Err(MihomoValidationError::new(
                 MihomoValidationErrorKind::InvalidPolicy,
             ));
@@ -320,13 +321,6 @@ fn map_output_error(error: io::Error) -> MihomoValidationError {
 fn contains_fatal_marker(bytes: &[u8]) -> bool {
     let value = String::from_utf8_lossy(bytes).to_ascii_lowercase();
     value.contains("fatal") || value.contains("parse config error")
-}
-
-fn valid_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn sync_directory(path: &Path) -> Result<(), MihomoValidationError> {

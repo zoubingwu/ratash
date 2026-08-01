@@ -21,6 +21,7 @@ use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 
 use crate::constants::MIHOMO_BINARY_MAX_BYTES;
+use crate::digest::is_lower_sha256_hex;
 use crate::lifecycle::{ProcessInspector, PsProcessInspector};
 
 pub const INTERNAL_CORE_GUARDIAN_MODE: &str = "__core-guardian";
@@ -239,7 +240,7 @@ impl CoreGuardianInvocation {
             || !self.control_socket.is_absolute()
             || self.mihomo != self.working_directory.join("mihomo")
             || self.configuration != self.working_directory.join("config.yaml")
-            || !valid_sha256(&self.mihomo_sha256)
+            || !is_lower_sha256_hex(&self.mihomo_sha256)
         {
             return Err(invalid_invocation());
         }
@@ -589,13 +590,6 @@ fn descriptor_ready(descriptor: &PollFd<'_>) -> bool {
             PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL,
         )
     })
-}
-
-fn valid_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn invalid_invocation() -> io::Error {

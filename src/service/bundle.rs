@@ -12,6 +12,7 @@ use crate::constants::{
     EFFECTIVE_CONFIGURATION_MAX_BYTES, MIHOMO_BINARY_MAX_BYTES, PROFILE_RESPONSE_MAX_BYTES,
 };
 use crate::core::{CoreControlEndpoint, CoreRuntimeError, RuntimeBundle};
+use crate::digest::is_lower_sha256_hex;
 use crate::domain::RuntimeGeneration;
 
 use super::error::{ServicePlatformError, invalid_bundle};
@@ -131,7 +132,7 @@ pub(super) fn verify_runtime_bundle(
     bundle: &RuntimeBundle,
     endpoint: &CoreControlEndpoint,
 ) -> Result<VerifiedRuntimeBundle, CoreRuntimeError> {
-    if !valid_digest(&bundle.manifest_sha256)
+    if !is_lower_sha256_hex(&bundle.manifest_sha256)
         || bundle.compiler_policy_sha256 != compiler_policy_sha256
         || bundle.mihomo_binary_sha256 != mihomo_binary_sha256
     {
@@ -154,7 +155,7 @@ pub(super) fn verify_runtime_bundle(
         || manifest.runtime_generation != bundle.generation.0
         || manifest.compiler_policy_sha256 != bundle.compiler_policy_sha256
         || manifest.mihomo_binary_sha256 != bundle.mihomo_binary_sha256
-        || !valid_digest(&manifest.configuration_sha256)
+        || !is_lower_sha256_hex(&manifest.configuration_sha256)
         || manifest.executable != "mihomo"
         || manifest.configuration != "config.yaml"
     {
@@ -206,7 +207,7 @@ fn verify_provider_files(
     for file in files {
         if previous_path.is_some_and(|previous| previous >= file.path.as_str())
             || !valid_manifest_relative_path(&file.path)
-            || !valid_digest(&file.sha256)
+            || !is_lower_sha256_hex(&file.sha256)
             || file.size > PROFILE_RESPONSE_MAX_BYTES as u64
         {
             return Err(invalid_bundle("runtime provider manifest entry is invalid"));
@@ -268,11 +269,4 @@ fn read_bounded_executable(
         return Err(invalid_bundle("Mihomo binary is not executable"));
     }
     read_bounded_regular(root, path, max_bytes)
-}
-
-pub(super) fn valid_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }

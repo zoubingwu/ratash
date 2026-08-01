@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::constants::SUPERVISOR_STATE_MAX_BYTES;
+use crate::digest::is_lower_sha256_hex;
 use crate::domain::{LocalRuleSetRevision, ProfileId, RuntimeGeneration};
 use crate::profile::ProfileRevision;
 
@@ -23,11 +24,7 @@ pub struct ObjectId(String);
 
 impl ObjectId {
     pub fn parse(value: &str) -> io::Result<Self> {
-        if value.len() == 64
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        {
+        if is_lower_sha256_hex(value) {
             Ok(Self(value.to_owned()))
         } else {
             Err(io::Error::new(
@@ -657,11 +654,7 @@ where
 }
 
 fn validate_digest(value: &str) -> io::Result<()> {
-    if value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
+    if is_lower_sha256_hex(value) {
         Ok(())
     } else {
         Err(io::Error::new(

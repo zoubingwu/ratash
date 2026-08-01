@@ -16,6 +16,7 @@ use crate::constants::{
     EFFECTIVE_CONFIGURATION_MAX_BYTES, MIHOMO_BINARY_MAX_BYTES, PROFILE_RESPONSE_MAX_BYTES,
 };
 use crate::core::{CoreRuntimeError, CoreRuntimeErrorKind, RuntimeBundle};
+use crate::digest::is_lower_sha256_hex;
 use crate::domain::RuntimeGeneration;
 
 use super::socket::sync_directory;
@@ -80,9 +81,9 @@ fn stage_runtime_bundle_inner(
     bundle: &RuntimeBundle,
 ) -> Result<RuntimeBundle, BundleIngressError> {
     if !bundle.generation_root.is_absolute()
-        || !valid_digest(&bundle.manifest_sha256)
-        || !valid_digest(&bundle.compiler_policy_sha256)
-        || !valid_digest(&bundle.mihomo_binary_sha256)
+        || !is_lower_sha256_hex(&bundle.manifest_sha256)
+        || !is_lower_sha256_hex(&bundle.compiler_policy_sha256)
+        || !is_lower_sha256_hex(&bundle.mihomo_binary_sha256)
     {
         return Err(BundleIngressError::Invalid);
     }
@@ -147,7 +148,7 @@ fn validate_ingress_manifest(
         || manifest.runtime_generation != bundle.generation.0
         || manifest.compiler_policy_sha256 != bundle.compiler_policy_sha256
         || manifest.mihomo_binary_sha256 != bundle.mihomo_binary_sha256
-        || !valid_digest(&manifest.configuration_sha256)
+        || !is_lower_sha256_hex(&manifest.configuration_sha256)
         || manifest.executable != "mihomo"
         || manifest.configuration != "config.yaml"
         || manifest.provider_files.len() > RUNTIME_PROVIDER_FILE_MAX
@@ -158,7 +159,7 @@ fn validate_ingress_manifest(
     for file in &manifest.provider_files {
         if previous.is_some_and(|previous| previous >= file.path.as_str())
             || !valid_provider_path(&file.path)
-            || !valid_digest(&file.sha256)
+            || !is_lower_sha256_hex(&file.sha256)
             || file.size > PROFILE_RESPONSE_MAX_BYTES as u64
         {
             return Err(BundleIngressError::Invalid);
@@ -472,13 +473,6 @@ fn valid_provider_path(value: &str) -> bool {
         && path
             .components()
             .all(|component| matches!(component, Component::Normal(_)))
-}
-
-fn valid_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn sha256_hex(content: &[u8]) -> String {

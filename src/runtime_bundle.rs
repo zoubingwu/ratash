@@ -10,6 +10,7 @@ use crate::constants::{
     EFFECTIVE_CONFIGURATION_MAX_BYTES, MIHOMO_BINARY_MAX_BYTES, PROFILE_RESPONSE_MAX_BYTES,
 };
 use crate::core::RuntimeBundle;
+use crate::digest::is_lower_sha256_hex;
 use crate::domain::RuntimeGeneration;
 use crate::service::{RuntimeManifestFileV1, RuntimeManifestV1};
 
@@ -457,8 +458,8 @@ impl RuntimeBundleStager {
         let compiler_policy_sha256 = compiler_policy_sha256.into();
         if !root.is_absolute()
             || !binary.is_absolute()
-            || !valid_digest(&binary_sha256)
-            || !valid_digest(&compiler_policy_sha256)
+            || !is_lower_sha256_hex(&binary_sha256)
+            || !is_lower_sha256_hex(&compiler_policy_sha256)
         {
             return Err(RuntimeBundleStageError::new(
                 RuntimeBundleStageErrorKind::InvalidPolicy,
@@ -912,13 +913,6 @@ fn read_limited(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
         ));
     }
     Ok(content)
-}
-
-fn valid_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 #[cfg(test)]

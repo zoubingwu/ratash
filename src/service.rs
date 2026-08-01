@@ -37,9 +37,10 @@ use crate::core::{
     ForwardedCoreLog, ForwardedCoreLogBatch, ManagedCoreHandle, OwnerSession, OwnerSessionProof,
     OwnerSessionRequest, RuntimeBundle, StopCoreResult,
 };
+use crate::digest::is_lower_sha256_hex;
 use crate::domain::CoreInstanceGeneration;
 
-use bundle::{valid_digest, verify_runtime_bundle};
+use bundle::verify_runtime_bundle;
 use error::{
     map_readiness_error, map_reload_error, map_spawn_error, map_stop_error,
     map_tun_preflight_error, service_error,
@@ -251,8 +252,8 @@ impl PrivilegedCoreRuntimeService {
             || config.restart_limit == 0
             || config.log_capacity == 0
             || config.max_log_line_bytes == 0
-            || !valid_digest(&config.compiler_policy_sha256)
-            || !valid_digest(&config.mihomo_binary_sha256)
+            || !is_lower_sha256_hex(&config.compiler_policy_sha256)
+            || !is_lower_sha256_hex(&config.mihomo_binary_sha256)
         {
             return Err(service_error(
                 CoreRuntimeErrorKind::InvalidBundle,
