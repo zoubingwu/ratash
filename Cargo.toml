@@ -12,6 +12,10 @@ path = "src/lib.rs"
 name = "hopash"
 path = "src/main.rs"
 
+[features]
+default = []
+local-unsigned = []
+
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }

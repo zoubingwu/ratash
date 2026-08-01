@@ -176,6 +176,13 @@ impl CoreServiceInvocation {
 #[derive(Clone, Debug)]
 struct InstalledHopashPeerAuthorizer {
     executable: PathBuf,
+    identity: InstalledFileIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InstalledFileIdentity {
+    device: u64,
+    inode: u64,
 }
 
 struct BundledConfigurationPolicy {
@@ -224,8 +231,10 @@ impl InstalledHopashPeerAuthorizer {
                 "the installed Hopash executable path is not canonical",
             ));
         }
+        #[cfg(feature = "local-unsigned")]
+        validate_local_install_ancestors(&executable)?;
 
-        let requirement = developer_id_requirement()?;
+        let requirement = installed_code_requirement()?;
         let url = CFURL::from_path(&executable, false).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -234,10 +243,16 @@ impl InstalledHopashPeerAuthorizer {
         })?;
         let code =
             SecStaticCode::from_path(&url, CodeSigningFlags::NONE).map_err(peer_signature_error)?;
-        code.check_validity(code_validation_flags(), &requirement)
+        code.check_validity(static_code_validation_flags(), &requirement)
             .map_err(peer_signature_error)?;
 
-        Ok(Self { executable })
+        Ok(Self {
+            executable,
+            identity: InstalledFileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+        })
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -273,10 +288,10 @@ impl CoreServicePeerAuthorizer for InstalledHopashPeerAuthorizer {
         attributes.set_pid(pid);
         attributes.set_audit_token(token_data.as_concrete_TypeRef());
 
-        let requirement = developer_id_requirement()?;
+        let requirement = installed_code_requirement()?;
         let code = SecCode::copy_guest_with_attribues(None, &attributes, CodeSigningFlags::NONE)
             .map_err(peer_signature_error)?;
-        code.check_validity(code_validation_flags(), &requirement)
+        code.check_validity(dynamic_code_validation_flags(), &requirement)
             .map_err(peer_signature_error)?;
         let executable = code
             .path(CodeSigningFlags::NONE)
@@ -294,6 +309,18 @@ impl CoreServicePeerAuthorizer for InstalledHopashPeerAuthorizer {
                 "the Core service peer executable path is unauthorized",
             ));
         }
+        let metadata = fs::symlink_metadata(&self.executable).map_err(peer_signature_error)?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != 0
+            || metadata.permissions().mode() & 0o022 != 0
+            || metadata.dev() != self.identity.device
+            || metadata.ino() != self.identity.inode
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the installed Hopash executable changed after service startup",
+            ));
+        }
         Ok(())
     }
 
@@ -306,16 +333,47 @@ impl CoreServicePeerAuthorizer for InstalledHopashPeerAuthorizer {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn code_validation_flags() -> CodeSigningFlags {
-    CodeSigningFlags::STRICT_VALIDATE
-        | CodeSigningFlags::CHECK_ALL_ARCHITECTURES
-        | CodeSigningFlags::CHECK_TRUSTED_ANCHORS
-        | CodeSigningFlags::NO_NETWORK_ACCESS
+#[cfg(all(target_os = "macos", feature = "local-unsigned"))]
+fn validate_local_install_ancestors(executable: &Path) -> io::Result<()> {
+    for ancestor in executable.ancestors().skip(1) {
+        let metadata = fs::symlink_metadata(ancestor).map_err(peer_signature_error)?;
+        if !metadata.is_dir() || metadata.uid() != 0 || metadata.permissions().mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the installed Hopash path has unsafe ancestor permissions",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn developer_id_requirement() -> io::Result<SecRequirement> {
+fn dynamic_code_validation_flags() -> CodeSigningFlags {
+    let flags = CodeSigningFlags::STRICT_VALIDATE | CodeSigningFlags::NO_NETWORK_ACCESS;
+    #[cfg(feature = "local-unsigned")]
+    {
+        flags
+    }
+    #[cfg(not(feature = "local-unsigned"))]
+    {
+        flags | CodeSigningFlags::CHECK_TRUSTED_ANCHORS
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn static_code_validation_flags() -> CodeSigningFlags {
+    dynamic_code_validation_flags() | CodeSigningFlags::CHECK_ALL_ARCHITECTURES
+}
+
+#[cfg(all(target_os = "macos", feature = "local-unsigned"))]
+fn installed_code_requirement() -> io::Result<SecRequirement> {
+    format!("identifier \"{HOPASH_CODE_IDENTIFIER}\"")
+        .parse()
+        .map_err(peer_signature_error)
+}
+
+#[cfg(all(target_os = "macos", not(feature = "local-unsigned")))]
+fn installed_code_requirement() -> io::Result<SecRequirement> {
     format!(
         "anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate 1[field.1.2.840.113635.100.6.2.6] exists and identifier \"{HOPASH_CODE_IDENTIFIER}\""
     )

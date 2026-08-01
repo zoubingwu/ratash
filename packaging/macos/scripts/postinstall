@@ -5,6 +5,7 @@ SERVICE_LABEL='io.hopash.core-runtime'
 SERVICE_PLIST='/Library/LaunchDaemons/io.hopash.core-runtime.plist'
 SERVICE_EXECUTABLE='/Library/PrivilegedHelperTools/io.hopash.core-runtime'
 SERVICE_ROOT='/Library/Application Support/Hopash RS'
+CLI_EXECUTABLE='/usr/local/bin/hopash'
 
 owner_uid=${HOPASH_OWNER_UID:-}
 if [ -z "$owner_uid" ]; then
@@ -21,8 +22,8 @@ if [ "$owner_uid" -eq 0 ]; then
     exit 1
 fi
 
-/bin/chmod 0755 "$SERVICE_EXECUTABLE" "$SERVICE_ROOT/bin/mihomo"
-/usr/sbin/chown root:wheel "$SERVICE_EXECUTABLE" "$SERVICE_ROOT/bin/mihomo"
+/bin/chmod 0755 "$CLI_EXECUTABLE" "$SERVICE_EXECUTABLE" "$SERVICE_ROOT/bin/mihomo"
+/usr/sbin/chown root:wheel "$CLI_EXECUTABLE" "$SERVICE_EXECUTABLE" "$SERVICE_ROOT/bin/mihomo"
 /bin/chmod 0644 "$SERVICE_PLIST"
 /usr/sbin/chown root:wheel "$SERVICE_PLIST"
 /usr/bin/sed -i '' "s/@OWNER_UID@/$owner_uid/g" "$SERVICE_PLIST"

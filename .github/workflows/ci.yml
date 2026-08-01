@@ -74,6 +74,8 @@ jobs:
           components: clippy,rustfmt
       - name: Run the macOS contract suite
         run: cargo test --locked --all-targets
+      - name: Run the local unsigned macOS contract suite
+        run: cargo test --locked --all-targets --no-default-features --features local-unsigned
       - name: Build the release executable
         run: cargo build --locked --release --target "${{ matrix.target }}"
       - name: Exercise a representative cold CLI start

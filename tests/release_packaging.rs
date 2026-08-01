@@ -406,6 +406,7 @@ fn release_metadata_names_every_required_resource_measurement() {
 fn package_scripts_are_valid_posix_shell() {
     for script in [
         "scripts/package-macos.sh",
+        "scripts/package-local-macos.sh",
         "scripts/capture-release-benchmarks-macos.sh",
         "scripts/macos-release-resource-probe.sh",
         "packaging/macos/scripts/postinstall",
@@ -494,6 +495,8 @@ fn readme_stays_user_facing_and_documents_the_installed_workflow() {
         "hopash start",
         "hopash status",
         "hopash help agent",
+        "package-local-macos.sh",
+        "local-unsigned",
     ] {
         assert!(readme.contains(required), "README is missing {required}");
     }

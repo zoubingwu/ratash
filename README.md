@@ -10,6 +10,28 @@ Hopash RS is in pre-release development for macOS. Tagged releases pass the full
 
 ## Installation
 
+### Personal package
+
+Build a complete package from a source checkout without an Apple Developer account:
+
+```sh
+./scripts/package-local-macos.sh --output dist
+```
+
+The script builds Hopash RS with the `local-unsigned` trust policy, downloads and verifies the pinned Mihomo Core, adds an ad-hoc code identity, and creates one installer plus its SHA-256 file. The resulting package requires no signing credentials. macOS may show a developer warning; approve the package in **System Settings > Privacy & Security** when prompted.
+
+The personal trust policy requires `/usr/local` and `/usr/local/bin` to be root-owned and protected from group and other writes.
+
+Copy the matching `*-local-unsigned.pkg` and `.pkg.sha256` files to the target Mac. Verify and install them from the download directory:
+
+```sh
+PACKAGE='hopash-0.1.0-aarch64-apple-darwin-local-unsigned.pkg'
+shasum -a 256 -c "$PACKAGE.sha256"
+sudo env HOPASH_OWNER_UID="$(id -u)" /usr/sbin/installer -allowUntrusted -pkg "$PACKAGE" -target /
+```
+
+### Signed release package
+
 Download the `.pkg` and matching `.pkg.sha256` file for your Mac from [GitHub Releases](../../releases/latest):
 
 - Apple Silicon: `hopash-0.1.0-aarch64-apple-darwin.pkg`

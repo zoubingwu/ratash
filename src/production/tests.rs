@@ -15,6 +15,30 @@ fn core_process_controller_startup_errors_preserve_kind_and_hide_diagnostics() {
     );
 }
 
+#[cfg(all(target_os = "macos", feature = "local-unsigned"))]
+#[test]
+fn local_unsigned_validation_flags_keep_static_options_off_running_code() {
+    assert!(!dynamic_code_validation_flags().contains(CodeSigningFlags::CHECK_ALL_ARCHITECTURES));
+    assert!(static_code_validation_flags().contains(CodeSigningFlags::CHECK_ALL_ARCHITECTURES));
+}
+
+#[cfg(all(
+    target_os = "macos",
+    target_arch = "aarch64",
+    feature = "local-unsigned"
+))]
+#[test]
+fn local_unsigned_dynamic_code_policy_accepts_running_code() {
+    let code = SecCode::for_self(CodeSigningFlags::NONE)
+        .expect("the test process should have a dynamic code object");
+    let requirement: SecRequirement = "true"
+        .parse()
+        .expect("the unconditional code requirement should parse");
+
+    code.check_validity(dynamic_code_validation_flags(), &requirement)
+        .expect("the local unsigned dynamic code policy should be valid for running code");
+}
+
 #[derive(Default)]
 struct TestShutdownSignal {
     requested: AtomicBool,

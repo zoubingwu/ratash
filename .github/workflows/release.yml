@@ -49,7 +49,7 @@ jobs:
       - name: Enforce the approved resource benchmark gate
         run: cargo run --locked --release --example release-benchmark -- validate fixtures/release/benchmark-metadata-v1.json --require-approved
       - name: Build Hopash RS
-        run: cargo build --locked --release --target "${{ matrix.target }}"
+        run: cargo build --locked --release --no-default-features --target "${{ matrix.target }}"
       - name: Download and verify the pinned Mihomo Core
         shell: bash
         run: |
