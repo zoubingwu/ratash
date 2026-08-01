@@ -334,24 +334,27 @@ fn main_ipc_shutdown_deadline_does_not_join_a_blocked_handler() {
 #[test]
 fn idle_control_server_uses_a_handler_free_fast_shutdown_wake() {
     let directory = TestDirectory::new("idle-shutdown");
-    let socket = directory.socket("control.sock");
-    let handler = Arc::new(CountingHandler::default());
-    let mut server = ShutdownIpcServer::start(
-        &socket,
-        Arc::clone(&handler),
-        Arc::new(AllowPeer),
-        Duration::from_secs(1),
-    )
-    .expect("the shutdown IPC server should start");
+    for iteration in 0..256 {
+        let socket = directory.socket(&format!("control-{iteration}.sock"));
+        let handler = Arc::new(CountingHandler::default());
+        let mut server = ShutdownIpcServer::start(
+            &socket,
+            Arc::clone(&handler),
+            Arc::new(AllowPeer),
+            Duration::from_secs(1),
+        )
+        .expect("the shutdown IPC server should start");
 
-    thread::sleep(Duration::from_millis(100));
-    assert_eq!(handler.calls.load(Ordering::Acquire), 0);
-    let started = Instant::now();
-    server.shutdown().expect("the idle server should stop");
+        assert_eq!(handler.calls.load(Ordering::Acquire), 0);
+        let started = Instant::now();
+        server
+            .shutdown()
+            .unwrap_or_else(|error| panic!("idle shutdown iteration {iteration} failed: {error}"));
 
-    assert!(started.elapsed() < Duration::from_millis(250));
-    assert_eq!(handler.calls.load(Ordering::Acquire), 0);
-    assert!(!socket.exists());
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(handler.calls.load(Ordering::Acquire), 0);
+        assert!(!socket.exists());
+    }
 }
 
 #[test]

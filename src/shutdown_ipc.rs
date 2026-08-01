@@ -525,7 +525,11 @@ fn wake_accept_loop(path: &Path, identity: SocketIdentity, timeout: Duration) ->
     let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
     socket.connect_timeout(&SockAddr::unix(path)?, timeout)?;
     let stream = UnixStream::from(socket);
-    stream.shutdown(Shutdown::Both)
+    match stream.shutdown(Shutdown::Both) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn frame_error(error: crate::ipc::FrameError) -> io::Error {
