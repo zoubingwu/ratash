@@ -47,11 +47,7 @@ jobs:
           cargo test --locked --all-targets
           cargo run --locked --example generate-release-assets -- --check
       - name: Enforce the approved resource benchmark gate
-        run: |
-          jq -e '
-            .status == "approved" and
-            ([.measurements[] | select(type != "number" or . < 0)] | length) == 0
-          ' fixtures/release/benchmark-metadata-v1.json >/dev/null
+        run: cargo run --locked --release --example release-benchmark -- validate fixtures/release/benchmark-metadata-v1.json --require-approved
       - name: Build Hopash RS
         run: cargo build --locked --release --target "${{ matrix.target }}"
       - name: Download and verify the pinned Mihomo Core
@@ -146,6 +142,9 @@ jobs:
             '. + {target: $target} | .measurements.wrapper_binary_bytes = $wrapper_binary_bytes' \
             fixtures/release/benchmark-metadata-v1.json \
             >"dist/benchmark-metadata-${{ matrix.target }}.json"
+          target/release/examples/release-benchmark validate \
+            "dist/benchmark-metadata-${{ matrix.target }}.json" \
+            --require-approved
           cp fixtures/release/product-contract-v1.json dist/
           cp packaging/macos/package-contract-v1.json dist/
       - name: Upload the release bundle

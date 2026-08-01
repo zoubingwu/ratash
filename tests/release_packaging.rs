@@ -269,10 +269,54 @@ fn release_metadata_names_every_required_resource_measurement() {
         serde_json::from_str(BENCHMARK_METADATA).expect("benchmark metadata should be valid JSON");
 
     assert_eq!(metadata["schema_version"], 1);
+    assert_eq!(
+        metadata["measurement_environment"]["runner"],
+        "dedicated macOS 15 arm64 release runner"
+    );
+    assert_eq!(
+        metadata["measurement_environment"]["runner_profile"]["architecture"],
+        "aarch64"
+    );
     assert_eq!(metadata["workloads"]["profiles"], 100);
     assert_eq!(metadata["workloads"]["active_nodes"], 10_000);
     assert_eq!(metadata["workloads"]["local_rules"], 20_000);
+    assert_eq!(metadata["workloads"]["application_seam_scale"], true);
     assert_eq!(metadata["workloads"]["tui_duration_seconds"], 1_800);
+    assert_eq!(
+        metadata["measurement_environment"]["idle_observation_seconds"],
+        60
+    );
+    assert_eq!(
+        metadata["measurement_environment"]["telemetry_observation_seconds"],
+        1_800
+    );
+    assert_eq!(
+        metadata["measurement_environment"]["tui_observation_seconds"],
+        1_800
+    );
+    assert_eq!(
+        metadata["measurement_environment"]["rss_sample_interval_seconds"],
+        1
+    );
+    assert_eq!(
+        metadata["measurement_environment"]["rss_curve_names"],
+        serde_json::json!([
+            "supervisor_rss_bytes",
+            "privileged_service_rss_bytes",
+            "combined_background_rss_bytes",
+            "telemetry_rss_bytes",
+            "tui_rss_bytes"
+        ])
+    );
+    assert_eq!(
+        metadata["workload_generator"]["name"],
+        "hopash-release-workload"
+    );
+    assert_eq!(metadata["workload_generator"]["version"], 1);
+    assert_eq!(
+        metadata["workload_generator"]["seed"],
+        5_210_471_535_391_298_131_u64
+    );
     assert_eq!(
         metadata["versioned_defaults"]["core_restart_limit"],
         CORE_RESTART_LIMIT
@@ -298,23 +342,7 @@ fn release_metadata_names_every_required_resource_measurement() {
         .as_str()
         .expect("benchmark status should be a string");
     assert!(matches!(status, "capture_required" | "approved"));
-    let measurements = metadata["measurements"]
-        .as_object()
-        .expect("measurements should be an object");
-    match status {
-        "capture_required" => {
-            assert!(measurements.values().all(serde_json::Value::is_null));
-        }
-        "approved" => {
-            assert!(
-                measurements
-                    .values()
-                    .all(|value| { value.as_f64().is_some_and(|measurement| measurement >= 0.0) })
-            );
-        }
-        _ => unreachable!("the benchmark status was validated above"),
-    }
-    for measurement in [
+    let measurement_names = [
         "wrapper_binary_bytes",
         "one_shot_cli_cold_start_ms",
         "supervisor_cold_start_ms",
@@ -336,11 +364,41 @@ fn release_metadata_names_every_required_resource_measurement() {
         "tui_cold_start_ms",
         "tui_idle_rss_bytes",
         "tui_peak_memory_bytes",
+    ];
+    for field in [
+        "measurements",
+        "baseline_measurements",
+        "thresholds",
+        "regression_budgets_percent",
     ] {
-        assert!(
-            measurements.get(measurement).is_some(),
-            "benchmark metadata is missing {measurement}"
-        );
+        let values = metadata[field]
+            .as_object()
+            .unwrap_or_else(|| panic!("{field} should be an object"));
+        assert_eq!(values.len(), measurement_names.len());
+        for measurement in measurement_names {
+            assert!(
+                values.get(measurement).is_some(),
+                "{field} is missing {measurement}"
+            );
+        }
+        match status {
+            "capture_required" => {
+                assert!(values.values().all(serde_json::Value::is_null));
+            }
+            "approved" => {
+                assert!(values.values().all(|value| {
+                    value
+                        .as_f64()
+                        .is_some_and(|measurement| measurement.is_finite() && measurement >= 0.0)
+                }));
+            }
+            _ => unreachable!("the benchmark status was validated above"),
+        }
+    }
+    match status {
+        "capture_required" => assert!(metadata["approved_capture"].is_null()),
+        "approved" => assert!(metadata["approved_capture"].is_object()),
+        _ => unreachable!("the benchmark status was validated above"),
     }
 }
 
@@ -348,6 +406,8 @@ fn release_metadata_names_every_required_resource_measurement() {
 fn package_scripts_are_valid_posix_shell() {
     for script in [
         "scripts/package-macos.sh",
+        "scripts/capture-release-benchmarks-macos.sh",
+        "scripts/macos-release-resource-probe.sh",
         "packaging/macos/scripts/postinstall",
         "packaging/macos/uninstall.sh",
     ] {
@@ -362,6 +422,27 @@ fn package_scripts_are_valid_posix_shell() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[test]
+fn benchmark_capture_scripts_enforce_provenance_and_complete_wakeup_samples() {
+    let capture = fs::read_to_string(project_path("scripts/capture-release-benchmarks-macos.sh"))
+        .expect("benchmark capture script should be readable");
+    assert!(capture.contains("git status --porcelain --untracked-files=all"));
+    assert!(capture.contains("clean Git working tree and index"));
+    assert!(capture.contains("kill -TERM \"$active_collector\""));
+    assert!(capture.contains("wait \"$active_collector\""));
+    assert!(capture.contains("trap 'interrupt_and_exit 130' INT"));
+
+    let probe = fs::read_to_string(project_path("scripts/macos-release-resource-probe.sh"))
+        .expect("resource probe should be readable");
+    assert!(probe.contains("if (!(pid in seen)) missing = 1"));
+    assert!(probe.contains("did not report every requested process"));
+
+    let ci = fs::read_to_string(project_path(".github/workflows/ci.yml"))
+        .expect("CI workflow should be readable");
+    assert!(ci.contains("Rust 1.88.0 macOS compatibility"));
+    assert!(ci.contains("runs-on: macos-15"));
 }
 
 #[test]

@@ -2,20 +2,43 @@
   "schema_version": 1,
   "status": "capture_required",
   "measurement_environment": {
-    "runner": "github-hosted macOS 15",
+    "runner": "dedicated macOS 15 arm64 release runner",
+    "runner_profile": {
+      "architecture": "aarch64",
+      "hardware_model": null,
+      "cpu_model": null,
+      "logical_cpu_count": null,
+      "memory_bytes": null,
+      "os_version": null
+    },
     "samples": 10,
     "warmup_samples": 2,
     "summary_statistic": "median",
     "idle_observation_seconds": 60,
-    "tui_observation_seconds": 1800
+    "telemetry_observation_seconds": 1800,
+    "tui_observation_seconds": 1800,
+    "rss_sample_interval_seconds": 1,
+    "rss_curve_names": [
+      "supervisor_rss_bytes",
+      "privileged_service_rss_bytes",
+      "combined_background_rss_bytes",
+      "telemetry_rss_bytes",
+      "tui_rss_bytes"
+    ]
   },
   "workloads": {
     "profiles": 100,
     "active_nodes": 10000,
     "local_rules": 20000,
+    "application_seam_scale": true,
     "sustained_core_logs": true,
     "sustained_traffic_samples": true,
     "tui_duration_seconds": 1800
+  },
+  "workload_generator": {
+    "name": "hopash-release-workload",
+    "version": 1,
+    "seed": 5210471535391298131
   },
   "versioned_defaults": {
     "core_restart_limit": 3,
@@ -45,5 +68,75 @@
     "tui_cold_start_ms": null,
     "tui_idle_rss_bytes": null,
     "tui_peak_memory_bytes": null
-  }
+  },
+  "baseline_measurements": {
+    "wrapper_binary_bytes": null,
+    "one_shot_cli_cold_start_ms": null,
+    "supervisor_cold_start_ms": null,
+    "privileged_service_cold_start_ms": null,
+    "combined_cold_start_ms": null,
+    "supervisor_idle_rss_bytes": null,
+    "privileged_service_idle_rss_bytes": null,
+    "combined_idle_rss_bytes": null,
+    "idle_wakeups_per_second": null,
+    "probe_peak_memory_bytes": null,
+    "probe_peak_concurrency": null,
+    "probe_first_pass_ms": null,
+    "probe_stale_ratio": null,
+    "rule_parse_20000_ms": null,
+    "rule_filter_20000_ms": null,
+    "rule_single_mutation_20000_ms": null,
+    "telemetry_sustained_cpu_percent": null,
+    "telemetry_peak_memory_bytes": null,
+    "tui_cold_start_ms": null,
+    "tui_idle_rss_bytes": null,
+    "tui_peak_memory_bytes": null
+  },
+  "thresholds": {
+    "wrapper_binary_bytes": null,
+    "one_shot_cli_cold_start_ms": null,
+    "supervisor_cold_start_ms": null,
+    "privileged_service_cold_start_ms": null,
+    "combined_cold_start_ms": null,
+    "supervisor_idle_rss_bytes": null,
+    "privileged_service_idle_rss_bytes": null,
+    "combined_idle_rss_bytes": null,
+    "idle_wakeups_per_second": null,
+    "probe_peak_memory_bytes": null,
+    "probe_peak_concurrency": null,
+    "probe_first_pass_ms": null,
+    "probe_stale_ratio": null,
+    "rule_parse_20000_ms": null,
+    "rule_filter_20000_ms": null,
+    "rule_single_mutation_20000_ms": null,
+    "telemetry_sustained_cpu_percent": null,
+    "telemetry_peak_memory_bytes": null,
+    "tui_cold_start_ms": null,
+    "tui_idle_rss_bytes": null,
+    "tui_peak_memory_bytes": null
+  },
+  "regression_budgets_percent": {
+    "wrapper_binary_bytes": null,
+    "one_shot_cli_cold_start_ms": null,
+    "supervisor_cold_start_ms": null,
+    "privileged_service_cold_start_ms": null,
+    "combined_cold_start_ms": null,
+    "supervisor_idle_rss_bytes": null,
+    "privileged_service_idle_rss_bytes": null,
+    "combined_idle_rss_bytes": null,
+    "idle_wakeups_per_second": null,
+    "probe_peak_memory_bytes": null,
+    "probe_peak_concurrency": null,
+    "probe_first_pass_ms": null,
+    "probe_stale_ratio": null,
+    "rule_parse_20000_ms": null,
+    "rule_filter_20000_ms": null,
+    "rule_single_mutation_20000_ms": null,
+    "telemetry_sustained_cpu_percent": null,
+    "telemetry_peak_memory_bytes": null,
+    "tui_cold_start_ms": null,
+    "tui_idle_rss_bytes": null,
+    "tui_peak_memory_bytes": null
+  },
+  "approved_capture": null
 }

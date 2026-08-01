@@ -13,6 +13,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  msrv:
+    name: Rust 1.88.0 compatibility
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+      - name: Install the minimum Rust toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Check all targets with the minimum Rust version
+        run: cargo check --locked --all-targets
+
+  msrv-macos:
+    name: Rust 1.88.0 macOS compatibility
+    runs-on: macos-15
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+      - name: Install the minimum Rust toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Check all macOS targets with the minimum Rust version
+        run: cargo check --locked --all-targets
+
   quality:
     name: Format, lint, and test
     runs-on: ubuntu-24.04
@@ -65,6 +87,16 @@ jobs:
         uses: actions/checkout@v4
       - name: Install the stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+      - name: Check deterministic release benchmark tooling
+        run: |
+          cargo build --locked --release --bin hopash --example release-benchmark
+          CARGO_TARGET_DIR="$RUNNER_TEMP/hopash-benchmark-fixture-target" \
+          RUSTFLAGS='-C debug-assertions=yes' \
+            cargo build --locked --release --bin hopash
+          target/release/examples/release-benchmark smoke \
+            fixtures/release/benchmark-metadata-v1.json \
+            "$GITHUB_WORKSPACE/target/release/hopash" \
+            "$RUNNER_TEMP/hopash-benchmark-fixture-target/release/hopash"
       - name: Check 10,000-Node Probe Queue bounds
         run: cargo test --locked --release --test scheduler probe_workers_and_node_membership_remain_bounded_at_ten_thousand_nodes -- --exact
       - name: Check the 20,000-rule boundary
