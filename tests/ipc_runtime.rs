@@ -12,14 +12,18 @@ use hopash::application::{
     ApplicationClient, ApplicationError, ApplicationErrorDetails, ApplicationOperation,
     ApplicationOutput, ApplicationService, LatencyFreshness, LatencyListOutcome,
     LatencyProbeStatus, LatencyShowOutcome, LatencySummary, LifecycleAction, LifecycleOutcome,
-    LogGap, LogMetadata, PolicyTargetValidation, ProfileListOutcome, ProfileMutationAction,
-    ProfileMutationOutcome, ProfileRefreshState, ProfileSummary, ProxyAvailability,
-    ProxyGroupSummary, ProxyListOutcome, ProxyMemberKind, ProxyNodeRow, ProxyNodeSource,
-    ProxySelectionOutcome, RecoveryOutcome, RecoveryStatus, RuleListOutcome, RuleMutationAction,
-    RuleMutationOutcome, RulePlacement, RuleSummary, RuntimeApplyFailureStage, RuntimeApplyOutcome,
-    RuntimeApplyStatus, SelectorCandidate, SelectorIdentity, SelectorKind,
+    LogGap, LogMetadata, PolicyTargetValidation, ProfileListOutcome, ProfileListPageOutcome,
+    ProfileMutationAction, ProfileMutationOutcome, ProfileRefreshState, ProfileSummary,
+    ProxyAvailability, ProxyGroupSummary, ProxyListOutcome, ProxyListPageOutcome, ProxyMemberKind,
+    ProxyNodeRow, ProxyNodeSource, ProxySelectionOutcome, RecoveryOutcome, RecoveryStatus,
+    RuleListOutcome, RuleListPageOutcome, RuleMutationAction, RuleMutationOutcome, RulePlacement,
+    RuleSummary, RuntimeApplyFailureStage, RuntimeApplyOutcome, RuntimeApplyStatus,
+    SelectorCandidate, SelectorIdentity, SelectorKind,
 };
-use hopash::constants::IPC_FRAME_MAX_BYTES;
+use hopash::constants::{
+    IPC_LIST_PAGE_SIZE, IPC_REQUEST_FRAME_MAX_BYTES, LOCAL_RULE_COUNT_MAX, MAX_ACTIVE_NODES,
+    PROFILE_COUNT_MAX,
+};
 use hopash::domain::{
     CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus, LocalRuleSetRevision, NodeRecordId,
     ProbeGeneration, ProfileId, ProxyGroupId, RuntimeApplyPhase, RuntimeApplySnapshot,
@@ -101,6 +105,155 @@ impl ApplicationClient for QueuedClient {
             .expect("fixture result queue should remain available")
             .pop_front()
             .expect("fixture should provide one result per request")
+    }
+}
+
+struct PagedRuleClient {
+    rules: Vec<RuleSummary>,
+    calls: AtomicUsize,
+    largest_page: AtomicUsize,
+}
+
+impl PagedRuleClient {
+    fn new(rules: Vec<RuleSummary>) -> Self {
+        Self {
+            rules,
+            calls: AtomicUsize::new(0),
+            largest_page: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ApplicationClient for PagedRuleClient {
+    fn execute(
+        &self,
+        operation: ApplicationOperation,
+    ) -> Result<ApplicationOutput, ApplicationError> {
+        let ApplicationOperation::RuleListPage { offset } = operation else {
+            panic!("paged fixture received an unexpected operation");
+        };
+        let end = offset
+            .saturating_add(IPC_LIST_PAGE_SIZE)
+            .min(self.rules.len());
+        let rules = self.rules.get(offset..end).unwrap_or_default().to_vec();
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.largest_page.fetch_max(rules.len(), Ordering::Relaxed);
+        Ok(ApplicationOutput::RulePage(RuleListPageOutcome {
+            initialized: true,
+            revision: Some(LocalRuleSetRevision(20_000)),
+            total: self.rules.len(),
+            offset,
+            rules,
+        }))
+    }
+}
+
+struct PagedProfileClient {
+    profiles: Vec<ProfileSummary>,
+    calls: AtomicUsize,
+    largest_page: AtomicUsize,
+}
+
+impl PagedProfileClient {
+    fn new(profiles: Vec<ProfileSummary>) -> Self {
+        Self {
+            profiles,
+            calls: AtomicUsize::new(0),
+            largest_page: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ApplicationClient for PagedProfileClient {
+    fn execute(
+        &self,
+        operation: ApplicationOperation,
+    ) -> Result<ApplicationOutput, ApplicationError> {
+        let ApplicationOperation::ProfileListPage { offset } = operation else {
+            panic!("paged Profile fixture received an unexpected operation");
+        };
+        let end = offset
+            .saturating_add(IPC_LIST_PAGE_SIZE)
+            .min(self.profiles.len());
+        let profiles = self.profiles.get(offset..end).unwrap_or_default().to_vec();
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.largest_page
+            .fetch_max(profiles.len(), Ordering::Relaxed);
+        Ok(ApplicationOutput::ProfilePage(ProfileListPageOutcome {
+            snapshot_id: 41,
+            total: self.profiles.len(),
+            offset,
+            profiles,
+        }))
+    }
+}
+
+struct PagedProxyClient {
+    group: ProxyGroupSummary,
+    groups: Vec<ProxyGroupSummary>,
+    nodes: Vec<ProxyNodeRow>,
+    calls: AtomicUsize,
+    largest_page: AtomicUsize,
+}
+
+impl PagedProxyClient {
+    fn new(
+        group: ProxyGroupSummary,
+        groups: Vec<ProxyGroupSummary>,
+        nodes: Vec<ProxyNodeRow>,
+    ) -> Self {
+        Self {
+            group,
+            groups,
+            nodes,
+            calls: AtomicUsize::new(0),
+            largest_page: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ApplicationClient for PagedProxyClient {
+    fn execute(
+        &self,
+        operation: ApplicationOperation,
+    ) -> Result<ApplicationOutput, ApplicationError> {
+        let ApplicationOperation::ProxyListPage {
+            groups_offset,
+            nodes_offset,
+            ..
+        } = operation
+        else {
+            panic!("paged Proxy fixture received an unexpected operation");
+        };
+        let groups_end = groups_offset
+            .saturating_add(IPC_LIST_PAGE_SIZE)
+            .min(self.groups.len());
+        let nodes_end = nodes_offset
+            .saturating_add(IPC_LIST_PAGE_SIZE)
+            .min(self.nodes.len());
+        let groups = self
+            .groups
+            .get(groups_offset..groups_end)
+            .unwrap_or_default()
+            .to_vec();
+        let nodes = self
+            .nodes
+            .get(nodes_offset..nodes_end)
+            .unwrap_or_default()
+            .to_vec();
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.largest_page
+            .fetch_max(groups.len().max(nodes.len()), Ordering::Relaxed);
+        Ok(ApplicationOutput::ProxyPage(ProxyListPageOutcome {
+            snapshot_id: 73,
+            group: self.group.clone(),
+            groups_total: self.groups.len(),
+            groups_offset,
+            groups,
+            nodes_total: self.nodes.len(),
+            nodes_offset,
+            nodes,
+        }))
     }
 }
 
@@ -334,6 +487,344 @@ fn every_one_shot_application_output_round_trips_with_typed_values() {
     }
 
     server.shutdown().expect("server should stop cleanly");
+}
+
+#[test]
+fn twenty_thousand_rule_list_round_trips_through_bounded_ipc_pages() {
+    let socket = TempSocket::new("twenty-thousand-rules");
+    let rules = (0..LOCAL_RULE_COUNT_MAX)
+        .map(release_scale_rule)
+        .collect::<Vec<_>>();
+    let application = Arc::new(PagedRuleClient::new(rules.clone()));
+    let mut server = IpcServer::start(
+        socket.path(),
+        Arc::clone(&application),
+        Arc::new(AllowPeer),
+        test_server_config(),
+    )
+    .expect("server should start");
+
+    let output = IpcClient::new(socket.path())
+        .execute(ApplicationOperation::RuleList)
+        .expect("the release-scale Rule List should round trip");
+
+    assert_eq!(
+        output,
+        ApplicationOutput::Rules(RuleListOutcome {
+            initialized: true,
+            revision: Some(LocalRuleSetRevision(20_000)),
+            rules,
+        })
+    );
+    assert_eq!(
+        application.calls.load(Ordering::Relaxed),
+        LOCAL_RULE_COUNT_MAX.div_ceil(IPC_LIST_PAGE_SIZE)
+    );
+    assert_eq!(
+        application.largest_page.load(Ordering::Relaxed),
+        IPC_LIST_PAGE_SIZE
+    );
+    server.shutdown().expect("server should stop cleanly");
+}
+
+#[test]
+fn one_thousand_long_profile_summaries_round_trip_through_bounded_ipc_pages() {
+    let socket = TempSocket::new("one-thousand-profiles");
+    let subscription_url =
+        SubscriptionUrl::parse(&format!("https://example.com/{}", "a".repeat(8_000)))
+            .expect("release-scale Subscription URL should be valid");
+    let profiles = (0..PROFILE_COUNT_MAX)
+        .map(|index| release_scale_profile(index, &subscription_url))
+        .collect::<Vec<_>>();
+    let application = Arc::new(PagedProfileClient::new(profiles.clone()));
+    let mut server = IpcServer::start(
+        socket.path(),
+        Arc::clone(&application),
+        Arc::new(AllowPeer),
+        test_server_config(),
+    )
+    .expect("server should start");
+
+    let output = IpcClient::new(socket.path())
+        .execute(ApplicationOperation::ProfileList)
+        .expect("the release-scale Profile List should round trip");
+
+    assert_eq!(
+        output,
+        ApplicationOutput::Profiles(ProfileListOutcome { profiles })
+    );
+    assert_eq!(
+        application.calls.load(Ordering::Relaxed),
+        PROFILE_COUNT_MAX.div_ceil(IPC_LIST_PAGE_SIZE)
+    );
+    assert_eq!(
+        application.largest_page.load(Ordering::Relaxed),
+        IPC_LIST_PAGE_SIZE
+    );
+    server.shutdown().expect("server should stop cleanly");
+}
+
+#[test]
+fn ten_thousand_proxy_nodes_round_trip_through_bounded_ipc_pages() {
+    let socket = TempSocket::new("ten-thousand-nodes");
+    let group = release_scale_proxy_group();
+    let groups = vec![group.clone()];
+    let nodes = (0..MAX_ACTIVE_NODES)
+        .map(release_scale_proxy_node)
+        .collect::<Vec<_>>();
+    let application = Arc::new(PagedProxyClient::new(
+        group.clone(),
+        groups.clone(),
+        nodes.clone(),
+    ));
+    let mut server = IpcServer::start(
+        socket.path(),
+        Arc::clone(&application),
+        Arc::new(AllowPeer),
+        test_server_config(),
+    )
+    .expect("server should start");
+
+    let output = IpcClient::new(socket.path())
+        .execute(ApplicationOperation::ProxyList {
+            group: group.id.as_str().to_owned(),
+        })
+        .expect("the release-scale Proxy List should round trip");
+
+    assert_eq!(
+        output,
+        ApplicationOutput::Proxies(ProxyListOutcome {
+            group,
+            groups,
+            nodes,
+        })
+    );
+    assert_eq!(
+        application.calls.load(Ordering::Relaxed),
+        MAX_ACTIVE_NODES.div_ceil(IPC_LIST_PAGE_SIZE)
+    );
+    assert_eq!(
+        application.largest_page.load(Ordering::Relaxed),
+        IPC_LIST_PAGE_SIZE
+    );
+    server.shutdown().expect("server should stop cleanly");
+}
+
+#[test]
+fn rule_list_rejects_revision_changes_between_pages() {
+    let socket = TempSocket::new("rule-revision-change");
+    let first = rule_page(0, IPC_LIST_PAGE_SIZE + 1, 8);
+    let second = RuleListPageOutcome {
+        initialized: true,
+        revision: Some(LocalRuleSetRevision(9)),
+        total: IPC_LIST_PAGE_SIZE + 1,
+        offset: IPC_LIST_PAGE_SIZE,
+        rules: vec![release_scale_rule(IPC_LIST_PAGE_SIZE)],
+    };
+    let mut server = IpcServer::start(
+        socket.path(),
+        Arc::new(QueuedClient::new(vec![
+            Ok(ApplicationOutput::RulePage(first)),
+            Ok(ApplicationOutput::RulePage(second)),
+        ])),
+        Arc::new(AllowPeer),
+        test_server_config(),
+    )
+    .expect("server should start");
+
+    let error = IpcClient::new(socket.path())
+        .execute(ApplicationOperation::RuleList)
+        .expect_err("a mixed-revision Rule List should be rejected");
+
+    assert_eq!(error.code, ErrorCode::ProtocolMismatch);
+    server.shutdown().expect("server should stop cleanly");
+}
+
+#[test]
+fn rule_list_rejects_hostile_page_bounds() {
+    let socket = TempSocket::new("rule-page-bounds");
+    let page = RuleListPageOutcome {
+        initialized: true,
+        revision: Some(LocalRuleSetRevision(8)),
+        total: LOCAL_RULE_COUNT_MAX + 1,
+        offset: 1,
+        rules: Vec::new(),
+    };
+    let mut server = IpcServer::start(
+        socket.path(),
+        Arc::new(QueuedClient::new(vec![Ok(ApplicationOutput::RulePage(
+            page,
+        ))])),
+        Arc::new(AllowPeer),
+        test_server_config(),
+    )
+    .expect("server should start");
+
+    let error = IpcClient::new(socket.path())
+        .execute(ApplicationOperation::RuleList)
+        .expect_err("hostile Rule List page bounds should be rejected");
+
+    assert_eq!(error.code, ErrorCode::ProtocolMismatch);
+    server.shutdown().expect("server should stop cleanly");
+}
+
+#[test]
+fn profile_list_rejects_snapshot_changes_between_pages() {
+    let socket = TempSocket::new("profile-snapshot-change");
+    let url = SubscriptionUrl::parse("https://example.com/profile.yaml").unwrap();
+    let profiles = (0..IPC_LIST_PAGE_SIZE + 1)
+        .map(|index| release_scale_profile(index, &url))
+        .collect::<Vec<_>>();
+    let first = ProfileListPageOutcome {
+        snapshot_id: 1,
+        total: profiles.len(),
+        offset: 0,
+        profiles: profiles[..IPC_LIST_PAGE_SIZE].to_vec(),
+    };
+    let second = ProfileListPageOutcome {
+        snapshot_id: 2,
+        total: profiles.len(),
+        offset: IPC_LIST_PAGE_SIZE,
+        profiles: profiles[IPC_LIST_PAGE_SIZE..].to_vec(),
+    };
+    let mut server = IpcServer::start(
+        socket.path(),
+        Arc::new(QueuedClient::new(vec![
+            Ok(ApplicationOutput::ProfilePage(first)),
+            Ok(ApplicationOutput::ProfilePage(second)),
+        ])),
+        Arc::new(AllowPeer),
+        test_server_config(),
+    )
+    .expect("server should start");
+
+    let error = IpcClient::new(socket.path())
+        .execute(ApplicationOperation::ProfileList)
+        .expect_err("a mixed-snapshot Profile List should be rejected");
+
+    assert_eq!(error.code, ErrorCode::ProtocolMismatch);
+    server.shutdown().expect("server should stop cleanly");
+}
+
+#[test]
+fn proxy_list_rejects_snapshot_changes_between_pages() {
+    let socket = TempSocket::new("proxy-snapshot-change");
+    let group = release_scale_proxy_group();
+    let nodes = (0..IPC_LIST_PAGE_SIZE + 1)
+        .map(release_scale_proxy_node)
+        .collect::<Vec<_>>();
+    let first = ProxyListPageOutcome {
+        snapshot_id: 1,
+        group: group.clone(),
+        groups_total: 1,
+        groups_offset: 0,
+        groups: vec![group.clone()],
+        nodes_total: nodes.len(),
+        nodes_offset: 0,
+        nodes: nodes[..IPC_LIST_PAGE_SIZE].to_vec(),
+    };
+    let second = ProxyListPageOutcome {
+        snapshot_id: 2,
+        group: group.clone(),
+        groups_total: 1,
+        groups_offset: 1,
+        groups: Vec::new(),
+        nodes_total: nodes.len(),
+        nodes_offset: IPC_LIST_PAGE_SIZE,
+        nodes: nodes[IPC_LIST_PAGE_SIZE..].to_vec(),
+    };
+    let mut server = IpcServer::start(
+        socket.path(),
+        Arc::new(QueuedClient::new(vec![
+            Ok(ApplicationOutput::ProxyPage(first)),
+            Ok(ApplicationOutput::ProxyPage(second)),
+        ])),
+        Arc::new(AllowPeer),
+        test_server_config(),
+    )
+    .expect("server should start");
+
+    let error = IpcClient::new(socket.path())
+        .execute(ApplicationOperation::ProxyList {
+            group: group.id.as_str().to_owned(),
+        })
+        .expect_err("a mixed-snapshot Proxy List should be rejected");
+
+    assert_eq!(error.code, ErrorCode::ProtocolMismatch);
+    server.shutdown().expect("server should stop cleanly");
+}
+
+fn release_scale_rule(index: usize) -> RuleSummary {
+    RuleSummary {
+        index,
+        rule_string: format!("DOMAIN-SUFFIX,rule-{index:05}.release-scale.example.invalid,PROXY"),
+        rule_type: "DOMAIN-SUFFIX".to_owned(),
+        payload: Some(format!("rule-{index:05}.release-scale.example.invalid")),
+        policy_target: "PROXY".to_owned(),
+        params: Vec::new(),
+        policy_target_validation: PolicyTargetValidation::Valid,
+    }
+}
+
+fn rule_page(offset: usize, total: usize, revision: u64) -> RuleListPageOutcome {
+    let end = offset.saturating_add(IPC_LIST_PAGE_SIZE).min(total);
+    RuleListPageOutcome {
+        initialized: true,
+        revision: Some(LocalRuleSetRevision(revision)),
+        total,
+        offset,
+        rules: (offset..end).map(release_scale_rule).collect(),
+    }
+}
+
+fn release_scale_profile(index: usize, subscription_url: &SubscriptionUrl) -> ProfileSummary {
+    ProfileSummary {
+        id: ProfileId::new(),
+        name: format!("release-scale-profile-{index:04}-{}", "n".repeat(48)),
+        subscription_url: subscription_url.clone(),
+        active: index == 0,
+        refresh_state: ProfileRefreshState::Fresh,
+        last_success_at_unix_ms: 10,
+        next_refresh_at_unix_ms: 20,
+        last_error: None,
+    }
+}
+
+fn release_scale_proxy_group() -> ProxyGroupSummary {
+    let selected = release_scale_proxy_node(0);
+    ProxyGroupSummary {
+        id: ProxyGroupId::for_name("Release Scale"),
+        name: "Release Scale".to_owned(),
+        proxy_type: "Selector".to_owned(),
+        selectable: true,
+        selected_node: Some(SelectorIdentity {
+            id: selected
+                .id
+                .as_ref()
+                .expect("fixture Node should have an ID")
+                .as_str()
+                .to_owned(),
+            name: selected.name,
+        }),
+    }
+}
+
+fn release_scale_proxy_node(index: usize) -> ProxyNodeRow {
+    let name = format!("release-scale-node-{index:05}");
+    ProxyNodeRow {
+        id: Some(NodeRecordId::for_core(&name)),
+        name,
+        member_kind: ProxyMemberKind::Node,
+        source: Some(ProxyNodeSource::Core),
+        candidate_ids: Vec::new(),
+        proxy_type: Some("Shadowsocks".to_owned()),
+        availability: ProxyAvailability::Available,
+        selected: index == 0,
+        delay_ms: Some(20),
+        sampled_at_unix_ms: Some(10),
+        freshness: LatencyFreshness::Fresh,
+        probe_status: LatencyProbeStatus::Succeeded,
+    }
 }
 
 #[test]
@@ -693,7 +1184,8 @@ fn malformed_and_oversized_frames_receive_bounded_protocol_failures() {
     oversized
         .set_read_timeout(Some(Duration::from_secs(1)))
         .expect("fixture timeout should configure");
-    let length = u32::try_from(IPC_FRAME_MAX_BYTES + 1).expect("frame limit should fit u32");
+    let length =
+        u32::try_from(IPC_REQUEST_FRAME_MAX_BYTES + 1).expect("request frame limit should fit u32");
     oversized
         .write_all(&length.to_be_bytes())
         .expect("oversized header should write");

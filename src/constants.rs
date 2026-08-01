@@ -48,9 +48,11 @@ pub const YAML_MAX_DEPTH: usize = 64;
 pub const RULE_STRING_MAX_BYTES: usize = 16 * 1024;
 pub const LOCAL_RULE_SET_MAX_BYTES: usize = 32 * 1024 * 1024;
 pub const LOCAL_RULE_COUNT_MAX: usize = 20_000;
-pub const IPC_FRAME_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const CORE_LOG_LINE_MAX_BYTES: usize = 64 * 1024;
-pub const JSON_OUTPUT_MAX_BYTES: usize = 64 * 1024 * 1024;
+pub const JSON_OUTPUT_MAX_BYTES: usize = 128 * 1024 * 1024;
+pub const IPC_FRAME_MAX_BYTES: usize = JSON_OUTPUT_MAX_BYTES + 4 * 1024 * 1024;
+pub const IPC_REQUEST_FRAME_MAX_BYTES: usize = 256 * 1024;
+pub const IPC_LIST_PAGE_SIZE: usize = 128;
 
 pub const MINIMUM_TERMINAL_WIDTH: u16 = 80;
 pub const MINIMUM_TERMINAL_HEIGHT: u16 = 24;

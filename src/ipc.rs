@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::application::{
     ApplicationError, ApplicationOperation, RulePlacement as ApplicationRulePlacement,
 };
-use crate::constants::IPC_FRAME_MAX_BYTES;
+use crate::constants::{
+    IPC_FRAME_MAX_BYTES, LOCAL_RULE_COUNT_MAX, MAX_ACTIVE_NODES, PROFILE_COUNT_MAX,
+};
 use crate::domain::{InvalidSubscriptionUrl, SubscriptionUrl};
 use crate::error::ErrorCode;
 use crate::telemetry::{CoreLogRecord, LogLevel, LogSource, LogTail};
@@ -74,13 +76,16 @@ pub enum RequestOperation {
     SubscribeStatus(StatusSubscriptionPayload),
     ProfileAdd(ProfileAddPayload),
     ProfileList(EmptyPayload),
+    ProfileListPage(ProfileListPagePayload),
     ProfileUse(ProfileSelectorPayload),
     ProfileRemove(ProfileSelectorPayload),
     ProxyList(ProxyListPayload),
+    ProxyListPage(ProxyListPagePayload),
     ProxySelect(ProxySelectPayload),
     LatencyList(EmptyPayload),
     LatencyShow(NodeSelectorPayload),
     RuleList(EmptyPayload),
+    RuleListPage(RuleListPagePayload),
     RuleAdd(RuleAddPayload),
     RuleReplace(RuleReplacePayload),
     RuleRemove(RuleSelectorPayload),
@@ -100,23 +105,32 @@ impl RequestOperation {
             Self::ProfileAdd(payload) => ApplicationOperation::ProfileAdd {
                 subscription_url: payload.subscription_url()?,
             },
-            Self::ProfileList(_) => ApplicationOperation::ProfileList,
+            Self::ProfileList(_) => ApplicationOperation::ProfileListPage { offset: 0 },
+            Self::ProfileListPage(payload) => ApplicationOperation::ProfileListPage {
+                offset: payload.offset()?,
+            },
             Self::ProfileUse(payload) => ApplicationOperation::ProfileUse {
                 profile: payload.profile,
             },
             Self::ProfileRemove(payload) => ApplicationOperation::ProfileRemove {
                 profile: payload.profile,
             },
-            Self::ProxyList(payload) => ApplicationOperation::ProxyList {
+            Self::ProxyList(payload) => ApplicationOperation::ProxyListPage {
                 group: payload.group,
+                groups_offset: 0,
+                nodes_offset: 0,
             },
+            Self::ProxyListPage(payload) => payload.into_application_operation()?,
             Self::ProxySelect(payload) => ApplicationOperation::ProxySelect {
                 group: payload.group,
                 node: payload.node,
             },
             Self::LatencyList(_) => ApplicationOperation::LatencyList,
             Self::LatencyShow(payload) => ApplicationOperation::LatencyShow { node: payload.node },
-            Self::RuleList(_) => ApplicationOperation::RuleList,
+            Self::RuleList(_) => ApplicationOperation::RuleListPage { offset: 0 },
+            Self::RuleListPage(payload) => ApplicationOperation::RuleListPage {
+                offset: payload.offset()?,
+            },
             Self::RuleAdd(payload) => ApplicationOperation::RuleAdd {
                 rule: payload.rule,
                 placement: payload.placement.into(),
@@ -172,10 +186,40 @@ pub struct ProfileSelectorPayload {
     pub profile: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileListPagePayload {
+    pub offset: usize,
+}
+
+impl ProfileListPagePayload {
+    fn offset(self) -> Result<usize, OperationConversionError> {
+        bounded_page_offset(self.offset, PROFILE_COUNT_MAX)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyListPayload {
     pub group: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyListPagePayload {
+    pub group: String,
+    pub groups_offset: usize,
+    pub nodes_offset: usize,
+}
+
+impl ProxyListPagePayload {
+    fn into_application_operation(self) -> Result<ApplicationOperation, OperationConversionError> {
+        Ok(ApplicationOperation::ProxyListPage {
+            group: self.group,
+            groups_offset: bounded_page_offset(self.groups_offset, MAX_ACTIVE_NODES)?,
+            nodes_offset: bounded_page_offset(self.nodes_offset, MAX_ACTIVE_NODES)?,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -231,6 +275,24 @@ pub struct RuleSelectorPayload {
     pub rule: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleListPagePayload {
+    pub offset: usize,
+}
+
+impl RuleListPagePayload {
+    fn offset(self) -> Result<usize, OperationConversionError> {
+        bounded_page_offset(self.offset, LOCAL_RULE_COUNT_MAX)
+    }
+}
+
+fn bounded_page_offset(offset: usize, maximum: usize) -> Result<usize, OperationConversionError> {
+    (offset <= maximum)
+        .then_some(offset)
+        .ok_or(OperationConversionError::InvalidListPageOffset)
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StatusSubscriptionPayload {
@@ -252,6 +314,7 @@ pub struct LogTailPayload {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OperationConversionError {
     InvalidSubscriptionUrl,
+    InvalidListPageOffset,
     StreamingOperation,
 }
 
@@ -530,12 +593,20 @@ where
     R: Read,
     T: DeserializeOwned,
 {
+    read_frame_with_limit(reader, IPC_FRAME_MAX_BYTES)
+}
+
+pub fn read_frame_with_limit<R, T>(reader: &mut R, limit: usize) -> Result<T, FrameError>
+where
+    R: Read,
+    T: DeserializeOwned,
+{
     let mut header = [0_u8; 4];
     reader.read_exact(&mut header).map_err(FrameError::Io)?;
     let length = u32::from_be_bytes(header) as usize;
-    if length > IPC_FRAME_MAX_BYTES {
+    if length > limit {
         return Err(FrameError::FrameTooLarge {
-            limit: IPC_FRAME_MAX_BYTES,
+            limit,
             actual: length,
         });
     }

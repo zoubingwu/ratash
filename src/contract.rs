@@ -183,12 +183,21 @@ impl From<ApplicationOutput> for ApplicationOutputViewV1 {
             ApplicationOutput::Status(status) => Self::Status(status.into()),
             ApplicationOutput::Lifecycle(outcome) => Self::Lifecycle(outcome.into()),
             ApplicationOutput::Profiles(outcome) => Self::Profiles(outcome.into()),
+            ApplicationOutput::ProfilePage(_) => {
+                unreachable!("Profile List pages are internal to the IPC transport")
+            }
             ApplicationOutput::ProfileMutation(outcome) => Self::ProfileMutation(outcome.into()),
             ApplicationOutput::Proxies(outcome) => Self::Proxies(outcome.into()),
+            ApplicationOutput::ProxyPage(_) => {
+                unreachable!("Proxy List pages are internal to the IPC transport")
+            }
             ApplicationOutput::ProxySelection(outcome) => Self::ProxySelection(outcome.into()),
             ApplicationOutput::Latencies(outcome) => Self::Latencies(outcome.into()),
             ApplicationOutput::Latency(outcome) => Self::Latency(outcome.into()),
             ApplicationOutput::Rules(outcome) => Self::Rules(outcome.into()),
+            ApplicationOutput::RulePage(_) => {
+                unreachable!("Rule List pages are internal to the IPC transport")
+            }
             ApplicationOutput::RuleMutation(outcome) => Self::RuleMutation(outcome.into()),
             ApplicationOutput::LogMetadata(metadata) => Self::LogMetadata(metadata.into()),
         }

@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Condvar;
@@ -9,11 +11,12 @@ use crate::application::{
     ApplicationClient, ApplicationError, ApplicationErrorDetails, ApplicationOperation,
     ApplicationOutput, Clock, LatencyFreshness as ApplicationLatencyFreshness, LatencyListOutcome,
     LatencyProbeStatus as ApplicationLatencyProbeStatus, LatencyShowOutcome, LatencySummary,
-    PolicyTargetValidation, ProfileListOutcome, ProfileMutationAction, ProfileMutationOutcome,
-    ProfileRefreshFailure, ProfileRefreshStage, ProfileRefreshState, ProfileSummary,
-    ProxyAvailability, ProxyGroupSummary, ProxyListOutcome, ProxyMemberKind, ProxyNodeRow,
-    ProxyNodeSource, ProxySelectionOutcome, RecoveryOutcome as ApplicationRecoveryOutcome,
-    RecoveryStatus, RuleListOutcome, RuleMutationAction, RuleMutationOutcome,
+    PolicyTargetValidation, ProfileListOutcome, ProfileListPageOutcome, ProfileMutationAction,
+    ProfileMutationOutcome, ProfileRefreshFailure, ProfileRefreshStage, ProfileRefreshState,
+    ProfileSummary, ProxyAvailability, ProxyGroupSummary, ProxyListOutcome, ProxyListPageOutcome,
+    ProxyMemberKind, ProxyNodeRow, ProxyNodeSource, ProxySelectionOutcome,
+    RecoveryOutcome as ApplicationRecoveryOutcome, RecoveryStatus, RuleListOutcome,
+    RuleListPageOutcome, RuleMutationAction, RuleMutationOutcome,
     RulePlacement as ApplicationRulePlacement, RuleSummary, RuntimeApplyFailureDetails,
     RuntimeApplyFailureStage, RuntimeApplyOutcome, RuntimeApplyStatus, SelectorCandidate,
     SelectorIdentity, SelectorKind,
@@ -22,9 +25,9 @@ use crate::config::{
     AuthoritativeConfig, ConfigCompiler, ConfigError, CoreConfigValidator, EffectiveConfiguration,
 };
 use crate::constants::{
-    CORE_LOG_LINE_MAX_BYTES, LOG_CAPACITY, PROBE_TIMEOUT, PROBE_URL, PROFILE_COUNT_MAX,
-    PROFILE_REFRESH_INTERVAL, RULE_STRING_MAX_BYTES, SELECTION_RESTORE_ATTEMPT_LIMIT,
-    TRAFFIC_SERIES_CAPACITY, YAML_MAX_DEPTH,
+    CORE_LOG_LINE_MAX_BYTES, IPC_LIST_PAGE_SIZE, LOG_CAPACITY, PROBE_TIMEOUT, PROBE_URL,
+    PROFILE_COUNT_MAX, PROFILE_REFRESH_INTERVAL, RULE_STRING_MAX_BYTES,
+    SELECTION_RESTORE_ATTEMPT_LIMIT, TRAFFIC_SERIES_CAPACITY, YAML_MAX_DEPTH,
 };
 use crate::core::{
     Availability, CoreRuntime, CoreRuntimeDiagnosticCategory as RuntimeDiagnosticCategory,
@@ -1384,6 +1387,23 @@ impl Supervisor {
         }))
     }
 
+    fn profile_list_page(&self, offset: usize) -> Result<ApplicationOutput, ApplicationError> {
+        let state = self.state.lock().map_err(|_| internal_error())?;
+        let total = state.profiles.len();
+        Ok(ApplicationOutput::ProfilePage(ProfileListPageOutcome {
+            snapshot_id: profile_list_snapshot_id(&state.profiles),
+            total,
+            offset,
+            profiles: state
+                .profiles
+                .profiles()
+                .skip(offset)
+                .take(IPC_LIST_PAGE_SIZE)
+                .map(|profile| profile_summary(profile, state.profiles.active_profile_id()))
+                .collect(),
+        }))
+    }
+
     fn profile_use(&self, selector: &str) -> Result<ApplicationOutput, ApplicationError> {
         let completion = {
             let mut queue = self
@@ -1507,6 +1527,50 @@ impl Supervisor {
         }))
     }
 
+    fn proxy_list_page(
+        &self,
+        group_selector: &str,
+        groups_offset: usize,
+        nodes_offset: usize,
+    ) -> Result<ApplicationOutput, ApplicationError> {
+        let mut state = self.state.lock().map_err(|_| internal_error())?;
+        let (core, view) = self.load_proxy_view(&mut state)?;
+        ensure_telemetry(&mut state, core.instance_generation)?;
+        let group = resolve_proxy_group(&view, group_selector)?;
+        let observations = probe_observations_page(
+            &state,
+            group,
+            nodes_offset,
+            IPC_LIST_PAGE_SIZE,
+            self.clock.now_unix_ms(),
+        );
+        let (nodes_total, rows) = view
+            .node_rows_page(&group.name, &observations, nodes_offset, IPC_LIST_PAGE_SIZE)
+            .map_err(map_selection_error)?;
+        let groups_total = view
+            .groups
+            .iter()
+            .filter(|group| group.selectable && !group.core_internal)
+            .count();
+        Ok(ApplicationOutput::ProxyPage(ProxyListPageOutcome {
+            snapshot_id: proxy_list_snapshot_id(&view, core.instance_generation),
+            group: proxy_group_summary(&view, group),
+            groups_total,
+            groups_offset,
+            groups: view
+                .groups
+                .iter()
+                .filter(|group| group.selectable && !group.core_internal)
+                .skip(groups_offset)
+                .take(IPC_LIST_PAGE_SIZE)
+                .map(|group| proxy_group_summary(&view, group))
+                .collect(),
+            nodes_total,
+            nodes_offset,
+            nodes: rows.into_iter().map(proxy_row).collect(),
+        }))
+    }
+
     fn proxy_select(
         &self,
         group_selector: &str,
@@ -1625,23 +1689,27 @@ impl Supervisor {
         let state = self.state.lock().map_err(|_| internal_error())?;
         let list = state.local_rules.list().map_err(|_| invalid_rule_error())?;
         let initialized = list.initialized;
-        let rules = list
-            .entries
-            .into_iter()
-            .map(|entry| RuleSummary {
-                index: entry.index,
-                rule_string: entry.rule.as_str().to_owned(),
-                rule_type: entry.parsed.rule_type.as_str().to_owned(),
-                payload: entry.parsed.payload.map(str::to_owned),
-                policy_target: entry.parsed.policy_target.to_owned(),
-                params: entry.parsed.params.into_iter().map(str::to_owned).collect(),
-                policy_target_validation: PolicyTargetValidation::Valid,
-            })
-            .collect();
+        let rules = list.entries.into_iter().map(rule_summary).collect();
         Ok(ApplicationOutput::Rules(RuleListOutcome {
             initialized,
             revision: initialized.then_some(state.local_rules.revision()),
             rules,
+        }))
+    }
+
+    fn rule_list_page(&self, offset: usize) -> Result<ApplicationOutput, ApplicationError> {
+        let state = self.state.lock().map_err(|_| internal_error())?;
+        let page = state
+            .local_rules
+            .list_page(offset, IPC_LIST_PAGE_SIZE)
+            .map_err(|_| invalid_rule_error())?;
+        let initialized = page.initialized;
+        Ok(ApplicationOutput::RulePage(RuleListPageOutcome {
+            initialized,
+            revision: initialized.then_some(state.local_rules.revision()),
+            total: page.total,
+            offset: page.offset,
+            rules: page.entries.into_iter().map(rule_summary).collect(),
         }))
     }
 
@@ -2013,13 +2081,20 @@ impl ApplicationClient for Supervisor {
                 self.profile_add(subscription_url)
             }
             ApplicationOperation::ProfileList => self.profile_list(),
+            ApplicationOperation::ProfileListPage { offset } => self.profile_list_page(offset),
             ApplicationOperation::ProfileUse { profile } => self.profile_use(&profile),
             ApplicationOperation::ProfileRemove { profile } => self.profile_remove(&profile),
             ApplicationOperation::ProxyList { group } => self.proxy_list(&group),
+            ApplicationOperation::ProxyListPage {
+                group,
+                groups_offset,
+                nodes_offset,
+            } => self.proxy_list_page(&group, groups_offset, nodes_offset),
             ApplicationOperation::ProxySelect { group, node } => self.proxy_select(&group, &node),
             ApplicationOperation::LatencyList => self.latency_list(),
             ApplicationOperation::LatencyShow { node } => self.latency_show(&node),
             ApplicationOperation::RuleList => self.rule_list(),
+            ApplicationOperation::RuleListPage { offset } => self.rule_list_page(offset),
             ApplicationOperation::RuleAdd { rule, placement } => {
                 let placement = map_rule_placement(placement)?;
                 self.rule_mutation(RuleMutation::Add { rule, placement })
@@ -2168,6 +2243,29 @@ fn profile_summary(profile: &Profile, active: Option<ProfileId>) -> ProfileSumma
     }
 }
 
+fn profile_list_snapshot_id(profiles: &ProfileCatalog) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    profiles.len().hash(&mut hasher);
+    profiles.active_profile_id().hash(&mut hasher);
+    for profile in profiles.profiles() {
+        profile.id.hash(&mut hasher);
+        profile.name.hash(&mut hasher);
+        profile.subscription_url.expose().as_str().hash(&mut hasher);
+        profile.revision.0.hash(&mut hasher);
+        profile.last_success_at_unix_ms.hash(&mut hasher);
+        profile.next_refresh_at_unix_ms.hash(&mut hasher);
+        match &profile.last_error {
+            Some(failure) => {
+                1_u8.hash(&mut hasher);
+                std::mem::discriminant(&failure.stage).hash(&mut hasher);
+                failure.safe_message.hash(&mut hasher);
+            }
+            None => 0_u8.hash(&mut hasher),
+        }
+    }
+    hasher.finish()
+}
+
 fn effective_group_order(profiles: &ProfileCatalog) -> Result<Vec<String>, ApplicationError> {
     let active = profiles
         .active_profile_id()
@@ -2268,6 +2366,105 @@ fn probe_observations(
                 })
         })
         .collect()
+}
+
+fn probe_observations_page(
+    state: &SupervisorState,
+    group: &crate::core::ProxyGroup,
+    offset: usize,
+    limit: usize,
+    now_unix_ms: u64,
+) -> BTreeMap<NodeRecordId, ProbeObservation> {
+    let end = offset.saturating_add(limit).min(group.members.len());
+    group
+        .members
+        .get(offset..end)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|member| match member {
+            crate::core::ProxyMember::Node { record_id, .. } => state
+                .probes
+                .node_snapshot(record_id, now_unix_ms)
+                .map(|snapshot| {
+                    (
+                        record_id.clone(),
+                        ProbeObservation {
+                            sample: snapshot.sample,
+                            status: match snapshot.status {
+                                ProbeStatus::NotSampled => CoreProbeStatus::NotSampled,
+                                ProbeStatus::Queued => CoreProbeStatus::Queued,
+                                ProbeStatus::InFlight => CoreProbeStatus::InFlight,
+                                ProbeStatus::Available => CoreProbeStatus::Succeeded,
+                                ProbeStatus::TimedOut | ProbeStatus::Unavailable => {
+                                    CoreProbeStatus::Failed
+                                }
+                            },
+                        },
+                    )
+                }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn proxy_list_snapshot_id(view: &ProxyView, generation: CoreInstanceGeneration) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    generation.hash(&mut hasher);
+    view.schema_version.hash(&mut hasher);
+    std::mem::discriminant(&view.order_source).hash(&mut hasher);
+    std::mem::discriminant(&view.provider_state).hash(&mut hasher);
+    for group in &view.groups {
+        group.id.hash(&mut hasher);
+        group.name.hash(&mut hasher);
+        group.proxy_type.hash(&mut hasher);
+        std::mem::discriminant(&group.availability).hash(&mut hasher);
+        group.selectable.hash(&mut hasher);
+        group.core_internal.hash(&mut hasher);
+        group.selected_name.hash(&mut hasher);
+        for member in &group.members {
+            std::mem::discriminant(member).hash(&mut hasher);
+            match member {
+                crate::core::ProxyMember::Group { name } => name.hash(&mut hasher),
+                crate::core::ProxyMember::Node {
+                    name,
+                    record_id,
+                    availability,
+                } => {
+                    name.hash(&mut hasher);
+                    record_id.hash(&mut hasher);
+                    std::mem::discriminant(availability).hash(&mut hasher);
+                }
+                crate::core::ProxyMember::Unresolved {
+                    name,
+                    reason,
+                    candidate_ids,
+                } => {
+                    name.hash(&mut hasher);
+                    std::mem::discriminant(reason).hash(&mut hasher);
+                    candidate_ids.hash(&mut hasher);
+                }
+            }
+        }
+    }
+    for (record_id, node) in &view.nodes {
+        record_id.hash(&mut hasher);
+        node.name.hash(&mut hasher);
+        node.proxy_type.hash(&mut hasher);
+        std::mem::discriminant(&node.availability).hash(&mut hasher);
+        node.core_internal.hash(&mut hasher);
+        std::mem::discriminant(&node.source).hash(&mut hasher);
+        match &node.source {
+            crate::core::NodeSource::Core { proxy_name } => proxy_name.hash(&mut hasher),
+            crate::core::NodeSource::Provider {
+                provider_name,
+                proxy_name,
+            } => {
+                provider_name.hash(&mut hasher);
+                proxy_name.hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
 }
 
 fn proxy_group_summary(view: &ProxyView, group: &crate::core::ProxyGroup) -> ProxyGroupSummary {
@@ -2381,6 +2578,18 @@ fn latency_summary(
             }
         },
         probe_generation: generation,
+    }
+}
+
+fn rule_summary(entry: crate::rule::RuleListEntry<'_>) -> RuleSummary {
+    RuleSummary {
+        index: entry.index,
+        rule_string: entry.rule.as_str().to_owned(),
+        rule_type: entry.parsed.rule_type.as_str().to_owned(),
+        payload: entry.parsed.payload.map(str::to_owned),
+        policy_target: entry.parsed.policy_target.to_owned(),
+        params: entry.parsed.params.into_iter().map(str::to_owned).collect(),
+        policy_target_validation: PolicyTargetValidation::Valid,
     }
 }
 

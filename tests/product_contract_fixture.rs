@@ -99,6 +99,7 @@ fn release_fixture_freezes_capacities_and_input_boundaries() {
         ("rule_string", RULE_STRING_MAX_BYTES),
         ("local_rule_set", LOCAL_RULE_SET_MAX_BYTES),
         ("ipc_frame", IPC_FRAME_MAX_BYTES),
+        ("ipc_request_frame", IPC_REQUEST_FRAME_MAX_BYTES),
         ("core_log_line", CORE_LOG_LINE_MAX_BYTES),
         ("json_output", JSON_OUTPUT_MAX_BYTES),
     ] {
@@ -106,6 +107,10 @@ fn release_fixture_freezes_capacities_and_input_boundaries() {
     }
 
     assert_eq!(contract["other_limits"]["yaml_depth"], YAML_MAX_DEPTH);
+    assert_eq!(
+        contract["other_limits"]["ipc_list_page"],
+        IPC_LIST_PAGE_SIZE
+    );
     assert_eq!(
         contract["other_limits"]["minimum_terminal_width"],
         MINIMUM_TERMINAL_WIDTH

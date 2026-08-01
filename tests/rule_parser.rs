@@ -261,6 +261,24 @@ fn initialized_rule_set_lists_rules_in_effective_order_with_zero_based_indexes()
 }
 
 #[test]
+fn initialized_rule_set_parses_only_the_requested_page() {
+    let rules = LocalRuleSet::initialized(vec![
+        RuleString::new("DOMAIN,first.example,DIRECT", 1024).unwrap(),
+        RuleString::new("BROKEN", 1024).unwrap(),
+        RuleString::new("MATCH,DIRECT", 1024).unwrap(),
+    ]);
+
+    let page = rules.list_page(2, 1).unwrap();
+
+    assert!(page.initialized);
+    assert_eq!(page.total, 3);
+    assert_eq!(page.offset, 2);
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].index, 2);
+    assert_eq!(page.entries[0].rule.as_str(), "MATCH,DIRECT");
+}
+
+#[test]
 fn mutation_rejects_an_uninitialized_rule_set() {
     let mut rules = LocalRuleSet::uninitialized();
     let rule = RuleString::new("MATCH,DIRECT", 1024).unwrap();

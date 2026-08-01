@@ -59,12 +59,14 @@
     "profile_response": 16777216,
     "rule_string": 16384,
     "local_rule_set": 33554432,
-    "ipc_frame": 4194304,
+    "ipc_frame": 138412032,
+    "ipc_request_frame": 262144,
     "core_log_line": 65536,
-    "json_output": 67108864
+    "json_output": 134217728
   },
   "other_limits": {
     "yaml_depth": 64,
+    "ipc_list_page": 128,
     "minimum_terminal_width": 80,
     "minimum_terminal_height": 24
   },

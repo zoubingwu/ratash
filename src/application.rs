@@ -143,6 +143,10 @@ pub enum ApplicationOperation {
         subscription_url: SubscriptionUrl,
     },
     ProfileList,
+    #[doc(hidden)]
+    ProfileListPage {
+        offset: usize,
+    },
     ProfileUse {
         profile: String,
     },
@@ -151,6 +155,12 @@ pub enum ApplicationOperation {
     },
     ProxyList {
         group: String,
+    },
+    #[doc(hidden)]
+    ProxyListPage {
+        group: String,
+        groups_offset: usize,
+        nodes_offset: usize,
     },
     ProxySelect {
         group: String,
@@ -161,6 +171,10 @@ pub enum ApplicationOperation {
         node: String,
     },
     RuleList,
+    #[doc(hidden)]
+    RuleListPage {
+        offset: usize,
+    },
     RuleAdd {
         rule: String,
         placement: RulePlacement,
@@ -233,6 +247,15 @@ pub struct ProfileListOutcome {
     pub profiles: Vec<ProfileSummary>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct ProfileListPageOutcome {
+    pub snapshot_id: u64,
+    pub total: usize,
+    pub offset: usize,
+    pub profiles: Vec<ProfileSummary>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProfileMutationAction {
     Added,
@@ -297,6 +320,19 @@ pub struct ProxyGroupSummary {
 pub struct ProxyListOutcome {
     pub group: ProxyGroupSummary,
     pub groups: Vec<ProxyGroupSummary>,
+    pub nodes: Vec<ProxyNodeRow>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct ProxyListPageOutcome {
+    pub snapshot_id: u64,
+    pub group: ProxyGroupSummary,
+    pub groups_total: usize,
+    pub groups_offset: usize,
+    pub groups: Vec<ProxyGroupSummary>,
+    pub nodes_total: usize,
+    pub nodes_offset: usize,
     pub nodes: Vec<ProxyNodeRow>,
 }
 
@@ -376,6 +412,16 @@ pub struct RuleSummary {
 pub struct RuleListOutcome {
     pub initialized: bool,
     pub revision: Option<LocalRuleSetRevision>,
+    pub rules: Vec<RuleSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct RuleListPageOutcome {
+    pub initialized: bool,
+    pub revision: Option<LocalRuleSetRevision>,
+    pub total: usize,
+    pub offset: usize,
     pub rules: Vec<RuleSummary>,
 }
 
@@ -508,12 +554,18 @@ pub enum ApplicationOutput {
     Status(StatusSnapshot),
     Lifecycle(LifecycleOutcome),
     Profiles(ProfileListOutcome),
+    #[doc(hidden)]
+    ProfilePage(ProfileListPageOutcome),
     ProfileMutation(ProfileMutationOutcome),
     Proxies(ProxyListOutcome),
+    #[doc(hidden)]
+    ProxyPage(ProxyListPageOutcome),
     ProxySelection(ProxySelectionOutcome),
     Latencies(LatencyListOutcome),
     Latency(LatencyShowOutcome),
     Rules(RuleListOutcome),
+    #[doc(hidden)]
+    RulePage(RuleListPageOutcome),
     RuleMutation(RuleMutationOutcome),
     LogMetadata(LogMetadata),
 }

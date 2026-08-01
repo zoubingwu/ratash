@@ -13,10 +13,11 @@ use hopash::ipc::{
     AcceptError, CorrelationError, EmptyPayload, FrameError, IPC_PROTOCOL_VERSION, IpcError,
     IpcRequest, IpcResponse, LogStreamItem, LogSubscriber, LogSubscriptionPayload, LogTailPayload,
     LogTailV1, NodeSelectorPayload, PeerAuthorizationError, PeerAuthorizer, ProfileAddPayload,
-    ProfileSelectorPayload, ProxyListPayload, ProxySelectPayload, RequestId, RequestOperation,
-    RuleAddPayload, RulePlacement, RuleReplacePayload, RuleSelectorPayload, StatusStreamItem,
-    StatusSubscriber, StatusSubscriptionPayload, SubscriberPublishStatus, accept_authorized,
-    bind_private_listener, read_frame, write_frame,
+    ProfileListPagePayload, ProfileSelectorPayload, ProxyListPagePayload, ProxyListPayload,
+    ProxySelectPayload, RequestId, RequestOperation, RuleAddPayload, RuleListPagePayload,
+    RulePlacement, RuleReplacePayload, RuleSelectorPayload, StatusStreamItem, StatusSubscriber,
+    StatusSubscriptionPayload, SubscriberPublishStatus, accept_authorized, bind_private_listener,
+    read_frame, write_frame,
 };
 use hopash::telemetry::{CoreLogRecord, LogBuffer, LogLevel, LogSource};
 
@@ -36,6 +37,7 @@ fn request_dtos_round_trip_every_remote_cli_operation() {
         }),
         RequestOperation::ProfileAdd(ProfileAddPayload::new(&subscription_url)),
         RequestOperation::ProfileList(empty()),
+        RequestOperation::ProfileListPage(ProfileListPagePayload { offset: 128 }),
         RequestOperation::ProfileUse(ProfileSelectorPayload {
             profile: "work".to_owned(),
         }),
@@ -44,6 +46,11 @@ fn request_dtos_round_trip_every_remote_cli_operation() {
         }),
         RequestOperation::ProxyList(ProxyListPayload {
             group: "Automatic".to_owned(),
+        }),
+        RequestOperation::ProxyListPage(ProxyListPagePayload {
+            group: "Automatic".to_owned(),
+            groups_offset: 128,
+            nodes_offset: 256,
         }),
         RequestOperation::ProxySelect(ProxySelectPayload {
             group: "Automatic".to_owned(),
@@ -54,6 +61,7 @@ fn request_dtos_round_trip_every_remote_cli_operation() {
             node: "Tokyo".to_owned(),
         }),
         RequestOperation::RuleList(empty()),
+        RequestOperation::RuleListPage(RuleListPagePayload { offset: 128 }),
         RequestOperation::RuleAdd(RuleAddPayload {
             rule: "DOMAIN,example.com,DIRECT".to_owned(),
             placement: RulePlacement::Before("MATCH,Proxy".to_owned()),

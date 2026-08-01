@@ -22,18 +22,20 @@ use crate::application::{
     ApplicationClient, ApplicationError, ApplicationErrorDetails, ApplicationOperation,
     ApplicationOutput, LatencyFreshness, LatencyListOutcome, LatencyProbeStatus,
     LatencyShowOutcome, LatencySummary, LifecycleAction, LifecycleOutcome, LogGap, LogMetadata,
-    PolicyTargetValidation, ProfileListOutcome, ProfileMutationAction, ProfileMutationOutcome,
-    ProfileRefreshFailure, ProfileRefreshStage, ProfileRefreshState, ProfileSummary,
-    ProxyAvailability, ProxyGroupSummary, ProxyListOutcome, ProxyMemberKind, ProxyNodeRow,
-    ProxyNodeSource, ProxySelectionOutcome, RecoveryOutcome, RecoveryStatus, RuleListOutcome,
-    RuleMutationAction, RuleMutationOutcome, RulePlacement as ApplicationRulePlacement,
-    RuleSummary, RuntimeApplyFailureDetails, RuntimeApplyFailureStage, RuntimeApplyOutcome,
-    RuntimeApplyStatus, SelectorCandidate, SelectorIdentity, SelectorKind,
+    PolicyTargetValidation, ProfileListOutcome, ProfileListPageOutcome, ProfileMutationAction,
+    ProfileMutationOutcome, ProfileRefreshFailure, ProfileRefreshStage, ProfileRefreshState,
+    ProfileSummary, ProxyAvailability, ProxyGroupSummary, ProxyListOutcome, ProxyListPageOutcome,
+    ProxyMemberKind, ProxyNodeRow, ProxyNodeSource, ProxySelectionOutcome, RecoveryOutcome,
+    RecoveryStatus, RuleListOutcome, RuleListPageOutcome, RuleMutationAction, RuleMutationOutcome,
+    RulePlacement as ApplicationRulePlacement, RuleSummary, RuntimeApplyFailureDetails,
+    RuntimeApplyFailureStage, RuntimeApplyOutcome, RuntimeApplyStatus, SelectorCandidate,
+    SelectorIdentity, SelectorKind,
 };
 use crate::constants::{
-    CORE_LOG_LINE_MAX_BYTES, IPC_FRAME_MAX_BYTES, IPC_PROFILE_ADD_TIMEOUT, IPC_REQUEST_TIMEOUT,
-    IPC_RUNTIME_MUTATION_TIMEOUT, LOG_CAPACITY, LOG_SUBSCRIBER_CAPACITY,
-    STATUS_SUBSCRIBER_CAPACITY,
+    CORE_LOG_LINE_MAX_BYTES, IPC_FRAME_MAX_BYTES, IPC_LIST_PAGE_SIZE, IPC_PROFILE_ADD_TIMEOUT,
+    IPC_REQUEST_FRAME_MAX_BYTES, IPC_REQUEST_TIMEOUT, IPC_RUNTIME_MUTATION_TIMEOUT,
+    LOCAL_RULE_COUNT_MAX, LOG_CAPACITY, LOG_SUBSCRIBER_CAPACITY, MAX_ACTIVE_NODES,
+    PROFILE_COUNT_MAX, STATUS_SUBSCRIBER_CAPACITY,
 };
 use crate::domain::{
     ActiveProfileSummary, ApplyState, CoreDiagnosticCategory, CoreInstanceGeneration,
@@ -48,10 +50,11 @@ use crate::ipc::{
     EmptyPayload, IpcError, IpcRequest, IpcResponse, IpcStreamFrame, IpcStreamPayload,
     LogStreamItem, LogSubscriber, LogSubscriptionPayload, LogTailPayload, LogTailV1,
     NodeSelectorPayload, OperationConversionError, PeerAuthorizationError, PeerAuthorizer,
-    ProfileAddPayload, ProfileSelectorPayload, ProxyListPayload, ProxySelectPayload, RequestId,
-    RequestOperation, RuleAddPayload, RulePlacement, RuleReplacePayload, RuleSelectorPayload,
-    StatusStreamItem, StatusSubscriber, StatusSubscriptionPayload, bind_private_listener,
-    read_frame, write_frame,
+    ProfileAddPayload, ProfileListPagePayload, ProfileSelectorPayload, ProxyListPagePayload,
+    ProxySelectPayload, RequestId, RequestOperation, RuleAddPayload, RuleListPagePayload,
+    RulePlacement, RuleReplacePayload, RuleSelectorPayload, StatusStreamItem, StatusSubscriber,
+    StatusSubscriptionPayload, bind_private_listener, read_frame, read_frame_with_limit,
+    write_frame,
 };
 use crate::telemetry::{CoreLogRecord, LogTail};
 
@@ -1069,6 +1072,20 @@ impl ApplicationClient for IpcClient {
         &self,
         operation: ApplicationOperation,
     ) -> Result<ApplicationOutput, ApplicationError> {
+        match operation {
+            ApplicationOperation::ProfileList => self.execute_profile_list(),
+            ApplicationOperation::ProxyList { group } => self.execute_proxy_list(group),
+            ApplicationOperation::RuleList => self.execute_rule_list(),
+            operation => self.execute_once(operation),
+        }
+    }
+}
+
+impl IpcClient {
+    fn execute_once(
+        &self,
+        operation: ApplicationOperation,
+    ) -> Result<ApplicationOutput, ApplicationError> {
         let expected_output = ExpectedOutput::for_operation(&operation);
         let response_timeout = self.response_timeout(&operation);
         let request_id = self.request_id();
@@ -1103,6 +1120,242 @@ impl ApplicationClient for IpcClient {
             ))
         }
     }
+
+    fn execute_rule_list(&self) -> Result<ApplicationOutput, ApplicationError> {
+        let mut offset = 0;
+        let mut metadata = None;
+        let mut rules = Vec::new();
+        loop {
+            let output = self.execute_once(ApplicationOperation::RuleListPage { offset })?;
+            let page = match output {
+                ApplicationOutput::RulePage(page) => page,
+                ApplicationOutput::Rules(outcome) if offset == 0 => {
+                    validate_complete_rule_list(&outcome)?;
+                    return Ok(ApplicationOutput::Rules(outcome));
+                }
+                _ => {
+                    return Err(protocol_error("The IPC Rule List page response is invalid"));
+                }
+            };
+            validate_rule_page(&page, offset)?;
+
+            let page_metadata = (page.initialized, page.revision, page.total);
+            match metadata {
+                None => {
+                    rules.reserve(page.total);
+                    metadata = Some(page_metadata);
+                }
+                Some(expected) if expected != page_metadata => {
+                    return Err(protocol_error(
+                        "The IPC Rule List changed while pages were being read",
+                    ));
+                }
+                Some(_) => {}
+            }
+
+            rules.extend(page.rules);
+            offset = rules.len();
+            if offset == page.total {
+                return Ok(ApplicationOutput::Rules(RuleListOutcome {
+                    initialized: page.initialized,
+                    revision: page.revision,
+                    rules,
+                }));
+            }
+        }
+    }
+
+    fn execute_profile_list(&self) -> Result<ApplicationOutput, ApplicationError> {
+        let mut offset = 0;
+        let mut metadata = None;
+        let mut profiles = Vec::new();
+        loop {
+            let output = self.execute_once(ApplicationOperation::ProfileListPage { offset })?;
+            let page = match output {
+                ApplicationOutput::ProfilePage(page) => page,
+                ApplicationOutput::Profiles(outcome) if offset == 0 => {
+                    if outcome.profiles.len() > PROFILE_COUNT_MAX {
+                        return Err(protocol_error("The IPC Profile List response is invalid"));
+                    }
+                    return Ok(ApplicationOutput::Profiles(outcome));
+                }
+                _ => {
+                    return Err(protocol_error(
+                        "The IPC Profile List page response is invalid",
+                    ));
+                }
+            };
+            validate_profile_page(&page, offset)?;
+            let page_metadata = (page.snapshot_id, page.total);
+            match metadata {
+                None => {
+                    profiles.reserve(page.total);
+                    metadata = Some(page_metadata);
+                }
+                Some(expected) if expected != page_metadata => {
+                    return Err(protocol_error(
+                        "The IPC Profile List changed while pages were being read",
+                    ));
+                }
+                Some(_) => {}
+            }
+            profiles.extend(page.profiles);
+            offset = profiles.len();
+            if offset == page.total {
+                return Ok(ApplicationOutput::Profiles(ProfileListOutcome { profiles }));
+            }
+        }
+    }
+
+    fn execute_proxy_list(&self, group: String) -> Result<ApplicationOutput, ApplicationError> {
+        let mut groups_offset = 0;
+        let mut nodes_offset = 0;
+        let mut metadata = None;
+        let mut groups = Vec::new();
+        let mut nodes = Vec::new();
+        loop {
+            let output = self.execute_once(ApplicationOperation::ProxyListPage {
+                group: group.clone(),
+                groups_offset,
+                nodes_offset,
+            })?;
+            let page = match output {
+                ApplicationOutput::ProxyPage(page) => page,
+                ApplicationOutput::Proxies(outcome) if groups_offset == 0 && nodes_offset == 0 => {
+                    validate_complete_proxy_list(&outcome)?;
+                    return Ok(ApplicationOutput::Proxies(outcome));
+                }
+                _ => {
+                    return Err(protocol_error(
+                        "The IPC Proxy List page response is invalid",
+                    ));
+                }
+            };
+            validate_proxy_page(&page, groups_offset, nodes_offset)?;
+            let page_metadata = (
+                page.snapshot_id,
+                page.group.clone(),
+                page.groups_total,
+                page.nodes_total,
+            );
+            match &metadata {
+                None => {
+                    groups.reserve(page.groups_total);
+                    nodes.reserve(page.nodes_total);
+                    metadata = Some(page_metadata);
+                }
+                Some(expected) if expected != &page_metadata => {
+                    return Err(protocol_error(
+                        "The IPC Proxy List changed while pages were being read",
+                    ));
+                }
+                Some(_) => {}
+            }
+            groups.extend(page.groups);
+            nodes.extend(page.nodes);
+            groups_offset = groups.len();
+            nodes_offset = nodes.len();
+            if groups_offset == page.groups_total && nodes_offset == page.nodes_total {
+                return Ok(ApplicationOutput::Proxies(ProxyListOutcome {
+                    group: page.group,
+                    groups,
+                    nodes,
+                }));
+            }
+        }
+    }
+}
+
+fn validate_profile_page(
+    page: &ProfileListPageOutcome,
+    expected_offset: usize,
+) -> Result<(), ApplicationError> {
+    if page.total > PROFILE_COUNT_MAX
+        || page.offset != expected_offset
+        || page
+            .total
+            .checked_sub(page.offset)
+            .map(|remaining| remaining.min(IPC_LIST_PAGE_SIZE))
+            != Some(page.profiles.len())
+    {
+        return Err(protocol_error(
+            "The IPC Profile List page response is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_complete_proxy_list(outcome: &ProxyListOutcome) -> Result<(), ApplicationError> {
+    if outcome.groups.len() > MAX_ACTIVE_NODES || outcome.nodes.len() > MAX_ACTIVE_NODES {
+        return Err(protocol_error("The IPC Proxy List response is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_proxy_page(
+    page: &ProxyListPageOutcome,
+    expected_groups_offset: usize,
+    expected_nodes_offset: usize,
+) -> Result<(), ApplicationError> {
+    let groups_len = page
+        .groups_total
+        .checked_sub(page.groups_offset)
+        .map(|remaining| remaining.min(IPC_LIST_PAGE_SIZE));
+    let nodes_len = page
+        .nodes_total
+        .checked_sub(page.nodes_offset)
+        .map(|remaining| remaining.min(IPC_LIST_PAGE_SIZE));
+    if page.groups_total > MAX_ACTIVE_NODES
+        || page.nodes_total > MAX_ACTIVE_NODES
+        || page.groups_offset != expected_groups_offset
+        || page.nodes_offset != expected_nodes_offset
+        || groups_len != Some(page.groups.len())
+        || nodes_len != Some(page.nodes.len())
+    {
+        return Err(protocol_error(
+            "The IPC Proxy List page response is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_complete_rule_list(outcome: &RuleListOutcome) -> Result<(), ApplicationError> {
+    if outcome.rules.len() > LOCAL_RULE_COUNT_MAX
+        || (!outcome.initialized && (!outcome.rules.is_empty() || outcome.revision.is_some()))
+        || (outcome.initialized && outcome.revision.is_none())
+        || outcome
+            .rules
+            .iter()
+            .enumerate()
+            .any(|(index, rule)| rule.index != index)
+    {
+        return Err(protocol_error("The IPC Rule List response is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_rule_page(
+    page: &RuleListPageOutcome,
+    expected_offset: usize,
+) -> Result<(), ApplicationError> {
+    let expected_len = page
+        .total
+        .checked_sub(page.offset)
+        .map(|remaining| remaining.min(IPC_LIST_PAGE_SIZE));
+    if page.total > LOCAL_RULE_COUNT_MAX
+        || page.offset != expected_offset
+        || expected_len != Some(page.rules.len())
+        || (!page.initialized && (page.total != 0 || page.revision.is_some()))
+        || (page.initialized && page.revision.is_none())
+        || page
+            .rules
+            .iter()
+            .enumerate()
+            .any(|(relative, rule)| rule.index != page.offset + relative)
+    {
+        return Err(protocol_error("The IPC Rule List page response is invalid"));
+    }
+    Ok(())
 }
 
 fn connect_error(_error: io::Error) -> ApplicationError {
@@ -1329,7 +1582,12 @@ fn request_operation(operation: ApplicationOperation) -> RequestOperation {
         ApplicationOperation::ProfileAdd { subscription_url } => {
             RequestOperation::ProfileAdd(ProfileAddPayload::new(&subscription_url))
         }
-        ApplicationOperation::ProfileList => RequestOperation::ProfileList(EmptyPayload {}),
+        ApplicationOperation::ProfileList => {
+            RequestOperation::ProfileListPage(ProfileListPagePayload { offset: 0 })
+        }
+        ApplicationOperation::ProfileListPage { offset } => {
+            RequestOperation::ProfileListPage(ProfileListPagePayload { offset })
+        }
         ApplicationOperation::ProfileUse { profile } => {
             RequestOperation::ProfileUse(ProfileSelectorPayload { profile })
         }
@@ -1337,8 +1595,21 @@ fn request_operation(operation: ApplicationOperation) -> RequestOperation {
             RequestOperation::ProfileRemove(ProfileSelectorPayload { profile })
         }
         ApplicationOperation::ProxyList { group } => {
-            RequestOperation::ProxyList(ProxyListPayload { group })
+            RequestOperation::ProxyListPage(ProxyListPagePayload {
+                group,
+                groups_offset: 0,
+                nodes_offset: 0,
+            })
         }
+        ApplicationOperation::ProxyListPage {
+            group,
+            groups_offset,
+            nodes_offset,
+        } => RequestOperation::ProxyListPage(ProxyListPagePayload {
+            group,
+            groups_offset,
+            nodes_offset,
+        }),
         ApplicationOperation::ProxySelect { group, node } => {
             RequestOperation::ProxySelect(ProxySelectPayload { group, node })
         }
@@ -1346,7 +1617,12 @@ fn request_operation(operation: ApplicationOperation) -> RequestOperation {
         ApplicationOperation::LatencyShow { node } => {
             RequestOperation::LatencyShow(NodeSelectorPayload { node })
         }
-        ApplicationOperation::RuleList => RequestOperation::RuleList(EmptyPayload {}),
+        ApplicationOperation::RuleList => {
+            RequestOperation::RuleListPage(RuleListPagePayload { offset: 0 })
+        }
+        ApplicationOperation::RuleListPage { offset } => {
+            RequestOperation::RuleListPage(RuleListPagePayload { offset })
+        }
         ApplicationOperation::RuleAdd { rule, placement } => {
             RequestOperation::RuleAdd(RuleAddPayload {
                 rule,
@@ -1835,21 +2111,22 @@ fn handle_connection(
     if stream.begin_read().is_err() {
         return;
     }
-    let request = match read_frame::<_, IpcRequest>(&mut stream) {
-        Ok(request) => request,
-        Err(_) => {
-            let response = IpcResponse::failure(
-                RequestId(0),
-                IpcError::new(
-                    ErrorCode::ProtocolMismatch,
-                    "The IPC request frame is invalid",
-                    false,
-                ),
-            );
-            write_response(&mut stream, &response);
-            return;
-        }
-    };
+    let request =
+        match read_frame_with_limit::<_, IpcRequest>(&mut stream, IPC_REQUEST_FRAME_MAX_BYTES) {
+            Ok(request) => request,
+            Err(_) => {
+                let response = IpcResponse::failure(
+                    RequestId(0),
+                    IpcError::new(
+                        ErrorCode::ProtocolMismatch,
+                        "The IPC request frame is invalid",
+                        false,
+                    ),
+                );
+                write_response(&mut stream, &response);
+                return;
+            }
+        };
     if let Err(response) = request.validate_protocol() {
         write_response(&mut stream, &response);
         return;
@@ -2093,6 +2370,11 @@ fn conversion_error(error: OperationConversionError) -> IpcError {
             "The Subscription URL is invalid",
             false,
         ),
+        OperationConversionError::InvalidListPageOffset => IpcError::new(
+            ErrorCode::ProtocolMismatch,
+            "The list page offset is invalid",
+            false,
+        ),
         OperationConversionError::StreamingOperation => IpcError::new(
             ErrorCode::OperationUnavailable,
             "This IPC endpoint handles one-shot operations only",
@@ -2122,12 +2404,15 @@ enum ExpectedOutput {
     Status,
     Lifecycle,
     Profiles,
+    ProfilePage,
     ProfileMutation,
     Proxies,
+    ProxyPage,
     ProxySelection,
     Latencies,
     Latency,
     Rules,
+    RulePage,
     RuleMutation,
 }
 
@@ -2142,11 +2427,14 @@ impl ExpectedOutput {
             | ApplicationOperation::ProfileUse { .. }
             | ApplicationOperation::ProfileRemove { .. } => Self::ProfileMutation,
             ApplicationOperation::ProfileList => Self::Profiles,
+            ApplicationOperation::ProfileListPage { .. } => Self::ProfilePage,
             ApplicationOperation::ProxyList { .. } => Self::Proxies,
+            ApplicationOperation::ProxyListPage { .. } => Self::ProxyPage,
             ApplicationOperation::ProxySelect { .. } => Self::ProxySelection,
             ApplicationOperation::LatencyList => Self::Latencies,
             ApplicationOperation::LatencyShow { .. } => Self::Latency,
             ApplicationOperation::RuleList => Self::Rules,
+            ApplicationOperation::RuleListPage { .. } => Self::RulePage,
             ApplicationOperation::RuleAdd { .. }
             | ApplicationOperation::RuleReplace { .. }
             | ApplicationOperation::RuleRemove { .. } => Self::RuleMutation,
@@ -2159,12 +2447,18 @@ impl ExpectedOutput {
             (Self::Status, ApplicationOutput::Status(_))
                 | (Self::Lifecycle, ApplicationOutput::Lifecycle(_))
                 | (Self::Profiles, ApplicationOutput::Profiles(_))
+                | (Self::ProfilePage, ApplicationOutput::ProfilePage(_))
+                | (Self::ProfilePage, ApplicationOutput::Profiles(_))
                 | (Self::ProfileMutation, ApplicationOutput::ProfileMutation(_))
                 | (Self::Proxies, ApplicationOutput::Proxies(_))
+                | (Self::ProxyPage, ApplicationOutput::ProxyPage(_))
+                | (Self::ProxyPage, ApplicationOutput::Proxies(_))
                 | (Self::ProxySelection, ApplicationOutput::ProxySelection(_))
                 | (Self::Latencies, ApplicationOutput::Latencies(_))
                 | (Self::Latency, ApplicationOutput::Latency(_))
                 | (Self::Rules, ApplicationOutput::Rules(_))
+                | (Self::RulePage, ApplicationOutput::RulePage(_))
+                | (Self::RulePage, ApplicationOutput::Rules(_))
                 | (Self::RuleMutation, ApplicationOutput::RuleMutation(_))
         )
     }
@@ -2205,12 +2499,15 @@ enum WireApplicationOutput {
     Status(WireStatusSnapshot),
     Lifecycle(WireLifecycleOutcome),
     Profiles(WireProfileListOutcome),
+    ProfilePage(WireProfileListPageOutcome),
     ProfileMutation(WireProfileMutationOutcome),
     Proxies(WireProxyListOutcome),
+    ProxyPage(WireProxyListPageOutcome),
     ProxySelection(WireProxySelectionOutcome),
     Latencies(WireLatencyListOutcome),
     Latency(WireLatencyShowOutcome),
     Rules(WireRuleListOutcome),
+    RulePage(WireRuleListPageOutcome),
     RuleMutation(WireRuleMutationOutcome),
     LogMetadata(WireLogMetadata),
 }
@@ -2223,14 +2520,17 @@ impl TryFrom<ApplicationOutput> for WireApplicationOutput {
             ApplicationOutput::Status(status) => Ok(Self::Status(status.into())),
             ApplicationOutput::Lifecycle(outcome) => Ok(Self::Lifecycle(outcome.into())),
             ApplicationOutput::Profiles(outcome) => Ok(Self::Profiles(outcome.into())),
+            ApplicationOutput::ProfilePage(outcome) => Ok(Self::ProfilePage(outcome.into())),
             ApplicationOutput::ProfileMutation(outcome) => {
                 Ok(Self::ProfileMutation(outcome.into()))
             }
             ApplicationOutput::Proxies(outcome) => Ok(Self::Proxies(outcome.into())),
+            ApplicationOutput::ProxyPage(outcome) => Ok(Self::ProxyPage(outcome.into())),
             ApplicationOutput::ProxySelection(outcome) => Ok(Self::ProxySelection(outcome.into())),
             ApplicationOutput::Latencies(outcome) => Ok(Self::Latencies(outcome.into())),
             ApplicationOutput::Latency(outcome) => Ok(Self::Latency(outcome.into())),
             ApplicationOutput::Rules(outcome) => Ok(Self::Rules(outcome.into())),
+            ApplicationOutput::RulePage(outcome) => Ok(Self::RulePage(outcome.into())),
             ApplicationOutput::RuleMutation(outcome) => Ok(Self::RuleMutation(outcome.into())),
             ApplicationOutput::LogMetadata(metadata) => Ok(Self::LogMetadata(metadata.into())),
         }
@@ -2251,11 +2551,17 @@ impl TryFrom<WireApplicationOutput> for ApplicationOutput {
             WireApplicationOutput::Profiles(outcome) => {
                 Ok(Self::Profiles(ProfileListOutcome::try_from(outcome)?))
             }
+            WireApplicationOutput::ProfilePage(outcome) => Ok(Self::ProfilePage(
+                ProfileListPageOutcome::try_from(outcome)?,
+            )),
             WireApplicationOutput::ProfileMutation(outcome) => Ok(Self::ProfileMutation(
                 ProfileMutationOutcome::try_from(outcome)?,
             )),
             WireApplicationOutput::Proxies(outcome) => {
                 Ok(Self::Proxies(ProxyListOutcome::try_from(outcome)?))
+            }
+            WireApplicationOutput::ProxyPage(outcome) => {
+                Ok(Self::ProxyPage(ProxyListPageOutcome::try_from(outcome)?))
             }
             WireApplicationOutput::ProxySelection(outcome) => {
                 Ok(Self::ProxySelection(outcome.try_into()?))
@@ -2267,6 +2573,7 @@ impl TryFrom<WireApplicationOutput> for ApplicationOutput {
                 Ok(Self::Latency(LatencyShowOutcome::try_from(outcome)?))
             }
             WireApplicationOutput::Rules(outcome) => Ok(Self::Rules(outcome.into())),
+            WireApplicationOutput::RulePage(outcome) => Ok(Self::RulePage(outcome.into())),
             WireApplicationOutput::RuleMutation(outcome) => Ok(Self::RuleMutation(outcome.into())),
             WireApplicationOutput::LogMetadata(metadata) => Ok(Self::LogMetadata(metadata.into())),
         }
@@ -2398,6 +2705,42 @@ impl TryFrom<WireProfileListOutcome> for ProfileListOutcome {
 
     fn try_from(value: WireProfileListOutcome) -> Result<Self, Self::Error> {
         Ok(Self {
+            profiles: value
+                .profiles
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct WireProfileListPageOutcome {
+    snapshot_id: u64,
+    total: usize,
+    offset: usize,
+    profiles: Vec<WireProfileSummary>,
+}
+
+impl From<ProfileListPageOutcome> for WireProfileListPageOutcome {
+    fn from(value: ProfileListPageOutcome) -> Self {
+        Self {
+            snapshot_id: value.snapshot_id,
+            total: value.total,
+            offset: value.offset,
+            profiles: value.profiles.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl TryFrom<WireProfileListPageOutcome> for ProfileListPageOutcome {
+    type Error = WireConversionError;
+
+    fn try_from(value: WireProfileListPageOutcome) -> Result<Self, Self::Error> {
+        Ok(Self {
+            snapshot_id: value.snapshot_id,
+            total: value.total,
+            offset: value.offset,
             profiles: value
                 .profiles
                 .into_iter()
@@ -2654,6 +2997,58 @@ impl TryFrom<WireProxyListOutcome> for ProxyListOutcome {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+struct WireProxyListPageOutcome {
+    snapshot_id: u64,
+    group: WireProxyGroupSummary,
+    groups_total: usize,
+    groups_offset: usize,
+    groups: Vec<WireProxyGroupSummary>,
+    nodes_total: usize,
+    nodes_offset: usize,
+    nodes: Vec<WireProxyNodeRow>,
+}
+
+impl From<ProxyListPageOutcome> for WireProxyListPageOutcome {
+    fn from(value: ProxyListPageOutcome) -> Self {
+        Self {
+            snapshot_id: value.snapshot_id,
+            group: value.group.into(),
+            groups_total: value.groups_total,
+            groups_offset: value.groups_offset,
+            groups: value.groups.into_iter().map(Into::into).collect(),
+            nodes_total: value.nodes_total,
+            nodes_offset: value.nodes_offset,
+            nodes: value.nodes.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl TryFrom<WireProxyListPageOutcome> for ProxyListPageOutcome {
+    type Error = WireConversionError;
+
+    fn try_from(value: WireProxyListPageOutcome) -> Result<Self, Self::Error> {
+        Ok(Self {
+            snapshot_id: value.snapshot_id,
+            group: value.group.try_into()?,
+            groups_total: value.groups_total,
+            groups_offset: value.groups_offset,
+            groups: value
+                .groups
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            nodes_total: value.nodes_total,
+            nodes_offset: value.nodes_offset,
+            nodes: value
+                .nodes
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 struct WireProxySelectionOutcome {
     group_id: String,
     group: String,
@@ -2849,6 +3244,39 @@ impl From<WireRuleListOutcome> for RuleListOutcome {
         Self {
             initialized: value.initialized,
             revision: value.revision.map(LocalRuleSetRevision),
+            rules: value.rules.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct WireRuleListPageOutcome {
+    initialized: bool,
+    revision: Option<u64>,
+    total: usize,
+    offset: usize,
+    rules: Vec<WireRuleSummary>,
+}
+
+impl From<RuleListPageOutcome> for WireRuleListPageOutcome {
+    fn from(value: RuleListPageOutcome) -> Self {
+        Self {
+            initialized: value.initialized,
+            revision: value.revision.map(|revision| revision.0),
+            total: value.total,
+            offset: value.offset,
+            rules: value.rules.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<WireRuleListPageOutcome> for RuleListPageOutcome {
+    fn from(value: WireRuleListPageOutcome) -> Self {
+        Self {
+            initialized: value.initialized,
+            revision: value.revision.map(LocalRuleSetRevision),
+            total: value.total,
+            offset: value.offset,
             rules: value.rules.into_iter().map(Into::into).collect(),
         }
     }

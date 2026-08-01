@@ -44,9 +44,16 @@ fn every_input_and_transport_boundary_has_a_positive_limit() {
         RULE_STRING_MAX_BYTES,
         LOCAL_RULE_SET_MAX_BYTES,
         IPC_FRAME_MAX_BYTES,
+        IPC_REQUEST_FRAME_MAX_BYTES,
         CORE_LOG_LINE_MAX_BYTES,
         JSON_OUTPUT_MAX_BYTES,
     ] {
         assert!(limit > 0);
+    }
+    const {
+        assert!(JSON_OUTPUT_MAX_BYTES >= LOCAL_RULE_SET_MAX_BYTES * 4);
+        assert!(IPC_FRAME_MAX_BYTES > JSON_OUTPUT_MAX_BYTES);
+        assert!(IPC_REQUEST_FRAME_MAX_BYTES < IPC_FRAME_MAX_BYTES);
+        assert!(IPC_LIST_PAGE_SIZE < LOCAL_RULE_COUNT_MAX);
     }
 }

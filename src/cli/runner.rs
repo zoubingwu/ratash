@@ -213,6 +213,9 @@ fn write_human_application_output(
             write_status(&outcome.status, stdout)
         }
         ApplicationOutput::Profiles(outcome) => write_profiles(&outcome.profiles, stdout),
+        ApplicationOutput::ProfilePage(_) => Err(io::Error::other(
+            "Profile List pages cannot be rendered as public command output",
+        )),
         ApplicationOutput::ProfileMutation(outcome) => {
             writeln!(
                 stdout,
@@ -232,6 +235,9 @@ fn write_human_application_output(
             Ok(())
         }
         ApplicationOutput::Proxies(outcome) => write_proxies(&outcome, stdout),
+        ApplicationOutput::ProxyPage(_) => Err(io::Error::other(
+            "Proxy List pages cannot be rendered as public command output",
+        )),
         ApplicationOutput::ProxySelection(outcome) => {
             writeln!(stdout, "Proxy Group: {}", terminal_safe(&outcome.group))?;
             writeln!(
@@ -261,6 +267,9 @@ fn write_human_application_output(
         }
         ApplicationOutput::Latency(outcome) => write_latency(&outcome.sample, stdout),
         ApplicationOutput::Rules(outcome) => write_rules(&outcome, stdout),
+        ApplicationOutput::RulePage(_) => Err(io::Error::other(
+            "Rule List pages cannot be rendered as public command output",
+        )),
         ApplicationOutput::RuleMutation(outcome) => {
             writeln!(
                 stdout,

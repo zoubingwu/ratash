@@ -1082,6 +1082,24 @@ fn first_profile_add_commits_rules_runtime_probes_and_reopens_from_persistence()
     );
     assert_eq!(rules.rules[0].rule_string, "MATCH,Main");
 
+    let ApplicationOutput::ProfilePage(profile_page) = supervisor
+        .execute(ApplicationOperation::ProfileListPage { offset: 0 })
+        .expect("the Profile page should be available")
+    else {
+        panic!("Profile page should return ProfilePage")
+    };
+    assert_eq!(profile_page.total, 1);
+    assert_eq!(profile_page.profiles.len(), 1);
+
+    let ApplicationOutput::RulePage(rule_page) = supervisor
+        .execute(ApplicationOperation::RuleListPage { offset: 0 })
+        .expect("the Rule page should be available")
+    else {
+        panic!("Rule page should return RulePage")
+    };
+    assert_eq!(rule_page.total, 1);
+    assert_eq!(rule_page.rules.len(), 1);
+
     let ApplicationOutput::Latencies(latencies) = supervisor
         .execute(ApplicationOperation::LatencyList)
         .expect("latencies should be available")
@@ -2198,6 +2216,21 @@ fn proxy_rows_preserve_group_and_unresolved_member_states() {
         .find(|row| row.name == "shared")
         .expect("the ambiguous row should remain");
     assert_eq!(ambiguous.candidate_ids, candidates);
+
+    let ApplicationOutput::ProxyPage(page) = supervisor
+        .execute(ApplicationOperation::ProxyListPage {
+            group: "Main".to_owned(),
+            groups_offset: 0,
+            nodes_offset: 0,
+        })
+        .expect("Proxy page should succeed")
+    else {
+        panic!("Proxy page should return ProxyPage")
+    };
+    assert_eq!(page.groups_total, proxies.groups.len());
+    assert_eq!(page.nodes_total, proxies.nodes.len());
+    assert_eq!(page.groups, proxies.groups);
+    assert_eq!(page.nodes, proxies.nodes);
 }
 
 #[test]

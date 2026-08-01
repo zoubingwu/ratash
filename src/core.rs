@@ -554,16 +554,31 @@ impl ProxyView {
         group_name: &str,
         probe_views: &BTreeMap<NodeRecordId, ProbeObservation>,
     ) -> Result<Vec<NodeRowV1>, SelectionError> {
+        self.node_rows_page(group_name, probe_views, 0, usize::MAX)
+            .map(|(_, rows)| rows)
+    }
+
+    pub fn node_rows_page(
+        &self,
+        group_name: &str,
+        probe_views: &BTreeMap<NodeRecordId, ProbeObservation>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(usize, Vec<NodeRowV1>), SelectionError> {
         let group = self
             .groups
             .iter()
             .find(|group| group.name == group_name)
             .ok_or_else(|| SelectionError::GroupMissing(group_name.to_owned()))?;
-        let mut rows = Vec::new();
-        for member in &group.members {
-            rows.push(self.node_row(group, member, probe_views));
-        }
-        Ok(rows)
+        let end = offset.saturating_add(limit).min(group.members.len());
+        let rows = group
+            .members
+            .get(offset..end)
+            .unwrap_or_default()
+            .iter()
+            .map(|member| self.node_row(group, member, probe_views))
+            .collect();
+        Ok((group.members.len(), rows))
     }
 
     fn node_row(

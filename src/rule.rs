@@ -450,25 +450,44 @@ impl LocalRuleSet {
     }
 
     pub fn list(&self) -> Result<RuleList<'_>, RuleParseError> {
+        let page = self.list_page(0, usize::MAX)?;
+        Ok(RuleList {
+            initialized: page.initialized,
+            entries: page.entries,
+        })
+    }
+
+    pub fn list_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<RuleListPage<'_>, RuleParseError> {
         match &self.rules {
-            None => Ok(RuleList {
+            None => Ok(RuleListPage {
                 initialized: false,
+                total: 0,
+                offset,
                 entries: Vec::new(),
             }),
             Some(rules) => {
+                let end = offset.saturating_add(limit).min(rules.len());
                 let entries = rules
+                    .get(offset..end)
+                    .unwrap_or_default()
                     .iter()
                     .enumerate()
-                    .map(|(index, rule)| {
+                    .map(|(relative_index, rule)| {
                         Ok(RuleListEntry {
-                            index,
+                            index: offset + relative_index,
                             rule,
                             parsed: parse_rule(rule)?,
                         })
                     })
                     .collect::<Result<Vec<_>, RuleParseError>>()?;
-                Ok(RuleList {
+                Ok(RuleListPage {
                     initialized: true,
+                    total: rules.len(),
+                    offset,
                     entries,
                 })
             }
@@ -600,6 +619,14 @@ impl Default for LocalRuleSet {
 #[derive(Debug, Eq, PartialEq)]
 pub struct RuleList<'a> {
     pub initialized: bool,
+    pub entries: Vec<RuleListEntry<'a>>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct RuleListPage<'a> {
+    pub initialized: bool,
+    pub total: usize,
+    pub offset: usize,
     pub entries: Vec<RuleListEntry<'a>>,
 }
 
