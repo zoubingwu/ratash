@@ -67,13 +67,11 @@ pub const MINIMUM_TERMINAL_HEIGHT: u16 = 24;
 const _: () = {
     assert!(
         IPC_REQUEST_TIMEOUT.as_millis()
-            >= CORE_SERVICE_REQUEST_TIMEOUT.as_millis()
-                + IPC_DEADLINE_LAYER_MARGIN.as_millis()
+            >= CORE_SERVICE_REQUEST_TIMEOUT.as_millis() + IPC_DEADLINE_LAYER_MARGIN.as_millis()
     );
     assert!(
         IPC_RUNTIME_MUTATION_TIMEOUT.as_millis()
-            >= CORE_SERVICE_MUTATION_TIMEOUT.as_millis()
-                + IPC_DEADLINE_LAYER_MARGIN.as_millis()
+            >= CORE_SERVICE_MUTATION_TIMEOUT.as_millis() + IPC_DEADLINE_LAYER_MARGIN.as_millis()
     );
     assert!(
         IPC_PROFILE_ADD_TIMEOUT.as_millis()
@@ -89,7 +87,6 @@ const _: () = {
     );
     assert!(
         DAEMON_SHUTDOWN_TIMEOUT.as_millis()
-            >= CORE_PROCESS_STOP_TIMEOUT.as_millis()
-                + IPC_DEADLINE_LAYER_MARGIN.as_millis()
+            >= CORE_PROCESS_STOP_TIMEOUT.as_millis() + IPC_DEADLINE_LAYER_MARGIN.as_millis()
     );
 };

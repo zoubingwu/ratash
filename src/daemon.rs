@@ -11,9 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::constants::{
-    DAEMON_POLL_INTERVAL, DAEMON_SHUTDOWN_TIMEOUT, DAEMON_STARTUP_TIMEOUT,
-};
+use crate::constants::{DAEMON_POLL_INTERVAL, DAEMON_SHUTDOWN_TIMEOUT, DAEMON_STARTUP_TIMEOUT};
 use crate::ipc::IPC_PROTOCOL_VERSION;
 use crate::lifecycle::{
     DirectoryLease, InstanceRecord, LeaseAcquisition, LeaseOwner, LifecycleError, ProcessIdentity,
