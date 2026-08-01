@@ -31,6 +31,44 @@ fn log_buffer_evicts_oldest_records_and_reports_resync_gaps() {
 }
 
 #[test]
+fn upstream_drops_advance_the_authoritative_sequence_and_report_gaps() {
+    let mut buffer = LogBuffer::new(8, 128).expect("fixture limits should be valid");
+    buffer
+        .push(10, LogLevel::Info, LogSource::CoreApi, "before-drop")
+        .expect("fixture record should fit");
+    buffer
+        .record_external_drop(3)
+        .expect("fixture sequence should have capacity");
+    buffer
+        .push(20, LogLevel::Warn, LogSource::Stderr, "after-drop")
+        .expect("fixture record should fit");
+
+    let tail = buffer.tail_after(Some(1));
+
+    assert_eq!(tail.dropped_total, 3);
+    assert!(tail.gap);
+    assert_eq!(tail.records[0].sequence(), 5);
+    assert_eq!(messages(&tail.records), ["after-drop"]);
+}
+
+#[test]
+fn upstream_drop_without_a_following_record_still_reports_a_gap() {
+    let mut buffer = LogBuffer::new(8, 128).expect("fixture limits should be valid");
+    buffer
+        .push(10, LogLevel::Info, LogSource::CoreApi, "before-drop")
+        .expect("fixture record should fit");
+    buffer
+        .record_external_drop(2)
+        .expect("fixture sequence should have capacity");
+
+    let tail = buffer.tail_after(Some(1));
+
+    assert_eq!(tail.dropped_total, 2);
+    assert!(tail.gap);
+    assert!(tail.records.is_empty());
+}
+
+#[test]
 fn log_queries_filter_by_level_time_and_content() {
     let mut buffer = LogBuffer::new(8, 128).expect("fixture limits should be valid");
     buffer
@@ -93,6 +131,28 @@ fn telemetry_accepts_only_the_current_core_generation() {
     assert_eq!(telemetry.connection_count(), None);
     assert_eq!(telemetry.latest_traffic(), None);
     assert_eq!(messages(&telemetry.logs().records()), ["ready"]);
+}
+
+#[test]
+fn telemetry_accepts_drop_counts_only_for_the_current_core_generation() {
+    let current = CoreInstanceGeneration(7);
+    let stale = CoreInstanceGeneration(6);
+    let mut telemetry =
+        TelemetryStore::new(current, 4, 32, 3).expect("fixture limits should be valid");
+
+    assert!(
+        !telemetry
+            .record_log_drop(stale, 9)
+            .expect("a stale generation is a normal discard")
+    );
+    assert!(
+        telemetry
+            .record_log_drop(current, 4)
+            .expect("the current generation should accept the drop count")
+    );
+
+    assert_eq!(telemetry.logs().dropped_total(), 4);
+    assert!(telemetry.logs().tail_after(Some(0)).gap);
 }
 
 #[test]

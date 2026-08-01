@@ -73,6 +73,14 @@ pub trait BackgroundApplication: Send + Sync {
         source: LogSource,
         message: String,
     ) -> Result<bool, ApplicationError>;
+
+    fn record_core_log_drop(
+        &self,
+        _generation: CoreInstanceGeneration,
+        _count: u64,
+    ) -> Result<bool, ApplicationError> {
+        Ok(false)
+    }
 }
 
 impl BackgroundApplication for Supervisor {
@@ -144,6 +152,14 @@ impl BackgroundApplication for Supervisor {
         message: String,
     ) -> Result<bool, ApplicationError> {
         Supervisor::publish_core_log(self, generation, timestamp_unix_ms, level, source, message)
+    }
+
+    fn record_core_log_drop(
+        &self,
+        generation: CoreInstanceGeneration,
+        count: u64,
+    ) -> Result<bool, ApplicationError> {
+        Supervisor::record_core_log_drop(self, generation, count)
     }
 }
 
@@ -637,12 +653,14 @@ fn run_stream<T: Send + 'static>(
     );
     let mut freshness = StreamFreshness::default();
     let mut published_state = PublishedStreamState::default();
+    let mut log_gap_open = false;
 
     while !shutdown.is_requested() {
         let managed_core = match application.managed_core() {
             Ok(Some(core)) => core,
             Ok(None) | Err(_) => {
                 if let Some(generation) = freshness.generation {
+                    record_log_gap_once(application.as_ref(), kind, generation, &mut log_gap_open);
                     publish_failure_state(
                         application.as_ref(),
                         kind,
@@ -664,6 +682,7 @@ fn run_stream<T: Send + 'static>(
         let generation = managed_core.instance_generation;
         if freshness.observe_generation(generation, clock.now_unix_ms()) {
             backoff.reset();
+            log_gap_open = false;
         }
         published_state.publish(
             application.as_ref(),
@@ -675,6 +694,7 @@ fn run_stream<T: Send + 'static>(
         let mut stream = match open(core.as_ref(), &managed_core) {
             Ok(stream) => stream,
             Err(error) => {
+                record_log_gap_once(application.as_ref(), kind, generation, &mut log_gap_open);
                 publish_failure_state(
                     application.as_ref(),
                     kind,
@@ -701,6 +721,7 @@ fn run_stream<T: Send + 'static>(
             let event = match stream.next_event() {
                 Ok(Some(event)) => event,
                 Ok(None) => {
+                    record_log_gap_once(application.as_ref(), kind, generation, &mut log_gap_open);
                     publish_failure_state(
                         application.as_ref(),
                         kind,
@@ -715,6 +736,7 @@ fn run_stream<T: Send + 'static>(
                     break;
                 }
                 Err(error) => {
+                    record_log_gap_once(application.as_ref(), kind, generation, &mut log_gap_open);
                     publish_failure_state(
                         application.as_ref(),
                         kind,
@@ -752,6 +774,9 @@ fn run_stream<T: Send + 'static>(
             let now = clock.now_unix_ms();
             match publish(application.as_ref(), generation, event.payload, now) {
                 Ok(true) => {
+                    if kind == TelemetryStream::Logs {
+                        log_gap_open = false;
+                    }
                     freshness.observe_event(now);
                     backoff.reset();
                     published_state.publish(
@@ -768,6 +793,22 @@ fn run_stream<T: Send + 'static>(
         if shutdown.wait(backoff.next_delay()) {
             return;
         }
+    }
+}
+
+fn record_log_gap_once(
+    application: &dyn BackgroundApplication,
+    kind: TelemetryStream,
+    generation: CoreInstanceGeneration,
+    gap_open: &mut bool,
+) {
+    if kind == TelemetryStream::Logs
+        && !*gap_open
+        && application
+            .record_core_log_drop(generation, 1)
+            .is_ok_and(|accepted| accepted)
+    {
+        *gap_open = true;
     }
 }
 

@@ -1342,6 +1342,7 @@ fn observer_loop(dependencies: ObserverDependencies, shutdown: Arc<WakeSignal>) 
     let mut broker_logs_seeded = false;
     let mut service_log_sequence = None;
     let mut service_dropped_before = 0_u64;
+    let mut pending_service_drops = 0_u64;
 
     while !shutdown.is_requested() {
         if let Ok(batch) = dependencies.core_runtime.logs(
@@ -1359,17 +1360,25 @@ fn observer_loop(dependencies: ObserverDependencies, shutdown: Arc<WakeSignal>) 
                     .supervisor
                     .execute(ApplicationOperation::GetStatus);
             }
-            if batch.dropped_before > service_dropped_before {
-                if let Some(core) = &current_core {
-                    let _ = dependencies.supervisor.publish_core_log(
-                        core.instance_generation,
-                        SystemClock.now_unix_ms(),
-                        LogLevel::Warn,
-                        LogSource::Stderr,
-                        "Privileged Core output was dropped before forwarding",
-                    );
-                }
-                service_dropped_before = batch.dropped_before;
+            pending_service_drops = pending_service_drops.saturating_add(dropped_sequence_delta(
+                &mut service_dropped_before,
+                batch.dropped_before,
+            ));
+            if pending_service_drops > 0
+                && let Some(core) = &current_core
+                && dependencies
+                    .supervisor
+                    .record_core_log_drop(core.instance_generation, pending_service_drops)
+                    .is_ok_and(|accepted| accepted)
+            {
+                pending_service_drops = 0;
+                let _ = dependencies.supervisor.publish_core_log(
+                    core.instance_generation,
+                    SystemClock.now_unix_ms(),
+                    LogLevel::Warn,
+                    LogSource::Stderr,
+                    "Privileged Core output was dropped before forwarding",
+                );
             }
             let mut consumed_batch = true;
             for record in batch.records {
@@ -1456,6 +1465,12 @@ fn observer_loop(dependencies: ObserverDependencies, shutdown: Arc<WakeSignal>) 
         }
         shutdown.wait(STATUS_SAMPLE_INTERVAL);
     }
+}
+
+fn dropped_sequence_delta(previous: &mut u64, current: u64) -> u64 {
+    let delta = current.saturating_sub(*previous);
+    *previous = current;
+    delta
 }
 
 fn update_instance_record(
@@ -1710,6 +1725,17 @@ fn run_log_signal_worker(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn forwarded_log_drop_sequence_reports_only_new_loss() {
+        let mut previous = 0;
+
+        assert_eq!(dropped_sequence_delta(&mut previous, 7), 7);
+        assert_eq!(dropped_sequence_delta(&mut previous, 7), 0);
+        assert_eq!(dropped_sequence_delta(&mut previous, 11), 4);
+        assert_eq!(dropped_sequence_delta(&mut previous, 3), 0);
+        assert_eq!(previous, 3);
+    }
 
     #[derive(Default)]
     struct TestShutdownSignal {

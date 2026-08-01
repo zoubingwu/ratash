@@ -177,6 +177,18 @@ impl LogBuffer {
         Ok(sequence)
     }
 
+    pub fn record_external_drop(&mut self, count: u64) -> Result<(), TelemetryError> {
+        if count == 0 {
+            return Ok(());
+        }
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(count)
+            .ok_or(TelemetryError::SequenceExhausted)?;
+        self.dropped_total = self.dropped_total.saturating_add(count);
+        Ok(())
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.records.len()
@@ -206,17 +218,14 @@ impl LogBuffer {
     pub fn tail_after(&self, after_sequence: Option<u64>) -> LogTail {
         let earliest_sequence = self.records.front().map(CoreLogRecord::sequence);
         let latest_sequence = self.records.back().map(CoreLogRecord::sequence);
-        let gap = after_sequence
-            .zip(earliest_sequence)
-            .is_some_and(|(after, earliest)| {
-                after.checked_add(1).is_some_and(|next| next < earliest)
-            });
         let records = self
             .records
             .iter()
             .filter(|record| after_sequence.is_none_or(|after| record.sequence() > after))
             .cloned()
-            .collect();
+            .collect::<Vec<_>>();
+        let gap = after_sequence
+            .is_some_and(|after| sequence_has_gap(after, &records, self.next_sequence));
         LogTail {
             records,
             dropped_total: self.dropped_total,
@@ -328,6 +337,18 @@ impl TelemetryStore {
         Ok(true)
     }
 
+    pub fn record_log_drop(
+        &mut self,
+        generation: CoreInstanceGeneration,
+        count: u64,
+    ) -> Result<bool, TelemetryError> {
+        if generation != self.core_generation {
+            return Ok(false);
+        }
+        self.logs.record_external_drop(count)?;
+        Ok(true)
+    }
+
     #[must_use]
     pub fn logs(&self) -> &LogBuffer {
         &self.logs
@@ -347,4 +368,17 @@ impl TelemetryStore {
     pub fn connection_count(&self) -> Option<u64> {
         self.connection_count
     }
+}
+
+fn sequence_has_gap(after: u64, records: &[CoreLogRecord], next_sequence: u64) -> bool {
+    let Some(mut expected) = after.checked_add(1) else {
+        return false;
+    };
+    for record in records {
+        if record.sequence() > expected {
+            return true;
+        }
+        expected = record.sequence().saturating_add(1);
+    }
+    next_sequence > expected
 }

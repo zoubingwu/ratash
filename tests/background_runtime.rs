@@ -95,6 +95,7 @@ struct Observed {
     traffic: Vec<(CoreInstanceGeneration, TrafficSample)>,
     connections: Vec<(CoreInstanceGeneration, u64)>,
     logs: Vec<(CoreInstanceGeneration, LogLevel, LogSource, String)>,
+    log_drops: Vec<(CoreInstanceGeneration, u64)>,
     stream_states: Vec<(CoreInstanceGeneration, TelemetryStream, StreamState)>,
 }
 
@@ -189,6 +190,12 @@ impl HarnessApplication {
             !observed.traffic.is_empty()
                 && !observed.connections.is_empty()
                 && !observed.logs.is_empty()
+        }));
+    }
+
+    fn wait_for_log_gap(&self) {
+        drop(wait_for(&self.observed, &self.changed, |observed| {
+            !observed.log_drops.is_empty()
         }));
     }
 
@@ -356,6 +363,20 @@ impl BackgroundApplication for HarnessApplication {
         }
         let mut observed = self.observed.lock().expect("observations should lock");
         observed.logs.push((generation, level, source, message));
+        self.changed.notify_all();
+        Ok(true)
+    }
+
+    fn record_core_log_drop(
+        &self,
+        generation: CoreInstanceGeneration,
+        count: u64,
+    ) -> Result<bool, ApplicationError> {
+        if generation.0 != self.managed_generation.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let mut observed = self.observed.lock().expect("observations should lock");
+        observed.log_drops.push((generation, count));
         self.changed.notify_all();
         Ok(true)
     }
@@ -730,6 +751,28 @@ fn telemetry_streams_publish_fresh_generation_scoped_values() {
     drop(observed);
 
     runtime.shutdown().expect("background runtime should stop");
+}
+
+#[test]
+fn a_log_stream_disconnect_records_one_gap_for_the_reconnect_episode() {
+    let generation = CoreInstanceGeneration(6);
+    let clock = Arc::new(FixedClock::new(10_000));
+    let application = Arc::new(HarnessApplication::for_streams(
+        Arc::clone(&clock),
+        generation,
+    ));
+    let core = Arc::new(HarnessCore::for_streams(generation));
+    let mut runtime = start_runtime(&application, &core, &clock);
+
+    application.wait_for_telemetry();
+    application.wait_for_log_gap();
+    runtime.shutdown().expect("background runtime should stop");
+
+    let observed = application
+        .observed
+        .lock()
+        .expect("observations should lock");
+    assert_eq!(observed.log_drops, vec![(generation, 1)]);
 }
 
 #[test]

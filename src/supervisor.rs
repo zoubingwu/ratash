@@ -1129,6 +1129,20 @@ impl Supervisor {
         }
     }
 
+    pub fn record_core_log_drop(
+        &self,
+        generation: CoreInstanceGeneration,
+        count: u64,
+    ) -> Result<bool, ApplicationError> {
+        let mut state = self.state.lock().map_err(|_| internal_error())?;
+        match state.telemetry.as_mut() {
+            Some(telemetry) => telemetry
+                .record_log_drop(generation, count)
+                .map_err(|_| internal_error()),
+            None => Ok(false),
+        }
+    }
+
     pub fn core_log_tail(&self, after_sequence: Option<u64>) -> Result<LogTail, ApplicationError> {
         let state = self.state.lock().map_err(|_| internal_error())?;
         Ok(state
