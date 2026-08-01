@@ -1278,6 +1278,29 @@ impl<'a> StatusInterfaceRuntime<'a> {
                 request_id,
                 connection_generation,
                 ..
+            }
+            | command @ Command::AddRule {
+                request_id,
+                connection_generation,
+                ..
+            }
+            | command @ Command::ReplaceRule {
+                request_id,
+                connection_generation,
+                ..
+            }
+            | command @ Command::RemoveRule {
+                request_id,
+                connection_generation,
+                ..
+            }
+            | command @ Command::RestartSupervisor {
+                request_id,
+                connection_generation,
+            }
+            | command @ Command::StopSupervisor {
+                request_id,
+                connection_generation,
             } => {
                 if connection_generation != self.state.connection.generation
                     || self.state.connection.status != ConnectionStatus::Connected
@@ -1319,6 +1342,30 @@ impl<'a> StatusInterfaceRuntime<'a> {
                     self.inbox.push(
                         EventSource::CommandResult,
                         UiEvent::ProxyGroupLoaded {
+                            request_id,
+                            connection_generation,
+                            result: Err(message),
+                        },
+                    );
+                }
+            }
+            command @ Command::FetchRules {
+                request_id,
+                connection_generation,
+            } => {
+                let result = if connection_generation != self.state.connection.generation
+                    || self.state.connection.status != ConnectionStatus::Connected
+                {
+                    Some("The Supervisor connection is unavailable".to_owned())
+                } else if self.dispatcher.submit(command).is_err() {
+                    Some("The command queue is full".to_owned())
+                } else {
+                    None
+                };
+                if let Some(message) = result {
+                    self.inbox.push(
+                        EventSource::CommandResult,
+                        UiEvent::RulesLoaded {
                             request_id,
                             connection_generation,
                             result: Err(message),

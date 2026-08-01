@@ -7,29 +7,32 @@ use std::time::Duration;
 
 use hopash::application::{
     ApplicationClient, ApplicationError, ApplicationOperation, ApplicationOutput, LatencyFreshness,
-    LatencyProbeStatus, ProfileListOutcome, ProxyAvailability, ProxyGroupSummary, ProxyListOutcome,
-    ProxyMemberKind, ProxyNodeRow,
+    LatencyProbeStatus, LifecycleAction, LifecycleOutcome, PolicyTargetValidation,
+    ProfileListOutcome, ProxyAvailability, ProxyGroupSummary, ProxyListOutcome, ProxyMemberKind,
+    ProxyNodeRow, RecoveryOutcome, RecoveryStatus, RuleListOutcome, RuleMutationAction,
+    RuleMutationOutcome, RulePlacement, RuleSummary, RuntimeApplyOutcome, RuntimeApplyStatus,
 };
 use hopash::constants::LOG_CAPACITY;
 use hopash::domain::{
-    ActiveProfileSummary, ApplyState, CoreLifecycle, CoreStatus, NodeRecordId, ProbeQueueStatus,
-    ProfileId, ProxyGroupId, RuntimeApplySnapshot, SampleState, StatusSnapshot, StreamHealthSet,
-    StreamState, SupervisorLifecycle, SupervisorStatus, TrafficSample, TunStatus,
+    ActiveProfileSummary, ApplyState, CoreLifecycle, CoreStatus, LocalRuleSetRevision,
+    NodeRecordId, ProbeQueueStatus, ProfileId, ProxyGroupId, RuntimeApplySnapshot, SampleState,
+    StatusSnapshot, StreamHealthSet, StreamState, SupervisorLifecycle, SupervisorStatus,
+    TrafficSample, TunStatus,
 };
 use hopash::ipc::RequestId;
 use hopash::tui::{
     Command, FullViewSnapshot, KeyInput, MutationSuccess, ProfileRow, ProxyGroupRow,
-    ProxyGroupSnapshot, ProxyRow, TerminalAction, TerminalControl, TerminalInput, UiEvent,
-    UiIntent, ViewLogRecord,
+    ProxyGroupSnapshot, ProxyRow, RuleListSnapshot, RuleRow, TerminalAction, TerminalControl,
+    TerminalInput, UiEvent, UiIntent, ViewLogRecord,
 };
 use hopash::tui_runtime::{
-    ApplicationSnapshotSource, BackgroundCommandDispatcher, BoundedReconnectTimer,
-    CancellationToken, CommandDispatchError, CommandDispatcher, DispatchedEvent,
-    FullSnapshotSource, LogTail, NoShutdownSignal, RatatuiStatusRenderer, ReconnectTiming,
-    RenderedFrame, RuntimeClock, RuntimeWaiter, RuntimeWaker, ShutdownSignal, StatusInterfaceError,
-    StatusInterfaceErrorKind, StatusInterfacePorts, StatusInterfaceRuntime, StatusInterfaceSources,
-    StatusLogEvent, StatusLogEventSource, StatusRenderer, TerminalEventSource, UiCommandExecutor,
-    bootstrap_status_interface, run_with_terminal_session,
+    ApplicationCommandExecutor, ApplicationSnapshotSource, BackgroundCommandDispatcher,
+    BoundedReconnectTimer, CancellationToken, CommandDispatchError, CommandDispatcher,
+    DispatchedEvent, FullSnapshotSource, LogTail, NoShutdownSignal, RatatuiStatusRenderer,
+    ReconnectTiming, RenderedFrame, RuntimeClock, RuntimeWaiter, RuntimeWaker, ShutdownSignal,
+    StatusInterfaceError, StatusInterfaceErrorKind, StatusInterfacePorts, StatusInterfaceRuntime,
+    StatusInterfaceSources, StatusLogEvent, StatusLogEventSource, StatusRenderer,
+    TerminalEventSource, UiCommandExecutor, bootstrap_status_interface, run_with_terminal_session,
 };
 use ratatui::backend::TestBackend;
 
@@ -189,6 +192,36 @@ fn application_snapshot_adapter_loads_proxy_groups_on_demand() {
             })
             .collect::<Vec<_>>(),
         vec!["Automatic", "Manual"]
+    );
+}
+
+#[test]
+fn application_snapshot_adapter_loads_rules_on_demand() {
+    let client = Arc::new(SnapshotClient::default());
+    let events = Arc::new(FakeEvents::default());
+    let source = ApplicationSnapshotSource::new(client.clone(), events);
+
+    let rules = source
+        .fetch_rules(8, &CancellationToken::default())
+        .expect("Local Rule Set should load on demand");
+
+    assert!(rules.initialized);
+    assert_eq!(rules.revision, Some(LocalRuleSetRevision(9)));
+    assert_eq!(rules.rows.len(), 1);
+    assert_eq!(rules.rows[0].rule_type, "DOMAIN-SUFFIX");
+    assert_eq!(rules.rows[0].payload.as_deref(), Some("example.com"));
+    assert_eq!(rules.rows[0].policy_target, "PROXY");
+    assert_eq!(
+        rules.rows[0].policy_target_validation,
+        PolicyTargetValidation::Valid
+    );
+    assert_eq!(
+        client
+            .operations
+            .lock()
+            .expect("operation lock should be available")
+            .last(),
+        Some(&ApplicationOperation::RuleList)
     );
 }
 
@@ -1002,6 +1035,163 @@ fn background_dispatcher_loads_one_proxy_group_without_a_full_snapshot() {
 }
 
 #[test]
+fn background_dispatcher_preserves_rule_request_identity() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let sources = StatusInterfaceSources {
+        snapshots: Arc::new(FakeSnapshots {
+            snapshot: snapshot(0),
+            order: Arc::clone(&order),
+            fail: false,
+        }),
+        events: Arc::new(FakeEvents::default()),
+        commands: Arc::new(ImmediateCommands),
+    };
+    let mut dispatcher =
+        BackgroundCommandDispatcher::new(sources).expect("fixture command workers should start");
+    let waker = RuntimeWaker::default();
+    dispatcher.install_waker(waker.clone());
+    let checkpoint = waker.checkpoint();
+
+    dispatcher
+        .submit(Command::FetchRules {
+            request_id: RequestId(95),
+            connection_generation: 6,
+        })
+        .expect("Rule request should enter the bounded queue");
+    waker.wait(checkpoint, Some(Duration::from_secs(1)));
+
+    assert!(matches!(
+        dispatcher
+            .try_next()
+            .expect("result queue should remain open")
+            .expect("Rule result should be published")
+            .event,
+        UiEvent::RulesLoaded {
+            request_id: RequestId(95),
+            connection_generation: 6,
+            result: Ok(RuleListSnapshot {
+                initialized: true,
+                ..
+            }),
+        }
+    ));
+    assert_eq!(
+        order
+            .lock()
+            .expect("order lock should be available")
+            .as_slice(),
+        ["rules"]
+    );
+    dispatcher.shutdown();
+}
+
+#[test]
+fn background_dispatcher_maps_mutations_to_application_operations() {
+    let operations = Arc::new(Mutex::new(Vec::new()));
+    let sources = StatusInterfaceSources {
+        snapshots: Arc::new(FakeSnapshots::successful(snapshot(0))),
+        events: Arc::new(FakeEvents::default()),
+        commands: Arc::new(RecordingRuleCommands {
+            operations: Arc::clone(&operations),
+        }),
+    };
+    let mut dispatcher =
+        BackgroundCommandDispatcher::new(sources).expect("fixture command workers should start");
+    let waker = RuntimeWaker::default();
+    dispatcher.install_waker(waker.clone());
+    let commands = [
+        Command::AddRule {
+            request_id: RequestId(201),
+            connection_generation: 6,
+            rule: "DOMAIN,one.example,DIRECT".to_owned(),
+        },
+        Command::ReplaceRule {
+            request_id: RequestId(202),
+            connection_generation: 6,
+            old_rule: "DOMAIN,one.example,DIRECT".to_owned(),
+            new_rule: "DOMAIN,two.example,DIRECT".to_owned(),
+        },
+        Command::RemoveRule {
+            request_id: RequestId(203),
+            connection_generation: 6,
+            rule: "DOMAIN,two.example,DIRECT".to_owned(),
+        },
+        Command::RestartSupervisor {
+            request_id: RequestId(204),
+            connection_generation: 6,
+        },
+        Command::StopSupervisor {
+            request_id: RequestId(205),
+            connection_generation: 6,
+        },
+    ];
+
+    for command in commands {
+        let checkpoint = waker.checkpoint();
+        dispatcher
+            .submit(command)
+            .expect("Rule mutation should enter the bounded queue");
+        waker.wait(checkpoint, Some(Duration::from_secs(1)));
+        assert!(matches!(
+            dispatcher
+                .try_next()
+                .expect("result queue should remain open")
+                .expect("Rule mutation should publish an acknowledgement")
+                .event,
+            UiEvent::CommandResult { result: Ok(_), .. }
+        ));
+    }
+
+    assert_eq!(
+        operations
+            .lock()
+            .expect("operation lock should be available")
+            .as_slice(),
+        [
+            ApplicationOperation::RuleAdd {
+                rule: "DOMAIN,one.example,DIRECT".to_owned(),
+                placement: RulePlacement::Append,
+            },
+            ApplicationOperation::RuleReplace {
+                old_rule: "DOMAIN,one.example,DIRECT".to_owned(),
+                new_rule: "DOMAIN,two.example,DIRECT".to_owned(),
+            },
+            ApplicationOperation::RuleRemove {
+                rule: "DOMAIN,two.example,DIRECT".to_owned(),
+            },
+            ApplicationOperation::Restart,
+            ApplicationOperation::Stop,
+        ]
+    );
+    dispatcher.shutdown();
+}
+
+#[test]
+fn application_command_executor_accepts_rule_and_lifecycle_outcomes() {
+    let executor = ApplicationCommandExecutor::new(Arc::new(MutationOutputClient));
+    let cancellation = CancellationToken::default();
+
+    assert_eq!(
+        executor
+            .execute(
+                ApplicationOperation::RuleAdd {
+                    rule: "DOMAIN,example.com,DIRECT".to_owned(),
+                    placement: RulePlacement::Append,
+                },
+                &cancellation,
+            )
+            .expect("Rule mutation output should be accepted"),
+        "Rule added"
+    );
+    assert_eq!(
+        executor
+            .execute(ApplicationOperation::Restart, &cancellation)
+            .expect("lifecycle output should be accepted"),
+        "Supervisor restarted"
+    );
+}
+
+#[test]
 fn shutdown_signal_exits_and_restores_every_terminal_mode() {
     let events = Arc::new(FakeEvents::default());
     let mut dispatcher = RecordingDispatcher::default();
@@ -1220,6 +1410,29 @@ impl FullSnapshotSource for FakeSnapshots {
             proxies: self.snapshot.proxies.clone(),
         })
     }
+
+    fn fetch_rules(
+        &self,
+        _connection_generation: u64,
+        _cancellation: &CancellationToken,
+    ) -> Result<RuleListSnapshot, StatusInterfaceError> {
+        self.order
+            .lock()
+            .expect("order lock should be available")
+            .push("rules");
+        Ok(RuleListSnapshot {
+            initialized: true,
+            revision: Some(LocalRuleSetRevision(3)),
+            rows: vec![RuleRow {
+                index: 0,
+                rule_string: "MATCH,DIRECT".to_owned(),
+                rule_type: "MATCH".to_owned(),
+                payload: None,
+                policy_target: "DIRECT".to_owned(),
+                policy_target_validation: PolicyTargetValidation::Valid,
+            }],
+        })
+    }
 }
 
 #[derive(Default)]
@@ -1366,6 +1579,60 @@ impl UiCommandExecutor for ImmediateCommands {
     }
 }
 
+struct MutationOutputClient;
+
+impl ApplicationClient for MutationOutputClient {
+    fn execute(
+        &self,
+        operation: ApplicationOperation,
+    ) -> Result<ApplicationOutput, ApplicationError> {
+        match operation {
+            ApplicationOperation::RuleAdd { rule, .. } => {
+                Ok(ApplicationOutput::RuleMutation(RuleMutationOutcome {
+                    action: RuleMutationAction::Added,
+                    changed_rule: rule,
+                    previous_rule: None,
+                    resulting_position: Some(0),
+                    runtime_apply: RuntimeApplyOutcome {
+                        status: RuntimeApplyStatus::Applied,
+                        candidate_generation: Some(hopash::domain::RuntimeGeneration(2)),
+                        committed_generation: Some(hopash::domain::RuntimeGeneration(2)),
+                        recovery: RecoveryOutcome {
+                            status: RecoveryStatus::NotRequired,
+                            restored_generation: None,
+                            message: None,
+                        },
+                    },
+                }))
+            }
+            ApplicationOperation::Restart => Ok(ApplicationOutput::Lifecycle(LifecycleOutcome {
+                action: LifecycleAction::Restart,
+                changed: true,
+                status: status(55),
+            })),
+            _ => panic!("unexpected fixture operation"),
+        }
+    }
+}
+
+struct RecordingRuleCommands {
+    operations: Arc<Mutex<Vec<ApplicationOperation>>>,
+}
+
+impl UiCommandExecutor for RecordingRuleCommands {
+    fn execute(
+        &self,
+        operation: ApplicationOperation,
+        _cancellation: &CancellationToken,
+    ) -> Result<String, StatusInterfaceError> {
+        self.operations
+            .lock()
+            .expect("operation lock should be available")
+            .push(operation);
+        Ok("done".to_owned())
+    }
+}
+
 struct OrderedCommands {
     order: Arc<Mutex<Vec<&'static str>>>,
 }
@@ -1405,6 +1672,19 @@ impl ApplicationClient for SnapshotClient {
                     profiles: Vec::new(),
                 }))
             }
+            ApplicationOperation::RuleList => Ok(ApplicationOutput::Rules(RuleListOutcome {
+                initialized: true,
+                revision: Some(LocalRuleSetRevision(9)),
+                rules: vec![RuleSummary {
+                    index: 0,
+                    rule_string: "DOMAIN-SUFFIX,example.com,PROXY".to_owned(),
+                    rule_type: "DOMAIN-SUFFIX".to_owned(),
+                    payload: Some("example.com".to_owned()),
+                    policy_target: "PROXY".to_owned(),
+                    params: Vec::new(),
+                    policy_target_validation: PolicyTargetValidation::Valid,
+                }],
+            })),
             _ => panic!("snapshot fixture received an unexpected operation"),
         }
     }

@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crate::application::{
-    ApplicationClient, ApplicationOperation, ApplicationOutput, ProfileMutationAction,
+    ApplicationClient, ApplicationOperation, ApplicationOutput, LifecycleAction,
+    ProfileMutationAction, RuleMutationAction, RulePlacement,
 };
 use crate::cancellation::CancellationToken;
 use crate::domain::{NodeRecordId, ProxyGroupId};
@@ -77,6 +78,18 @@ where
                 "Selected {}",
                 outcome.selected_node.name
             ))),
+            ApplicationOutput::RuleMutation(outcome) => Ok(match outcome.action {
+                RuleMutationAction::Added => "Rule added",
+                RuleMutationAction::Replaced => "Rule replaced",
+                RuleMutationAction::Removed => "Rule removed",
+            }
+            .to_owned()),
+            ApplicationOutput::Lifecycle(outcome) => Ok(match outcome.action {
+                LifecycleAction::Start => "Supervisor started",
+                LifecycleAction::Stop => "Supervisor stopped",
+                LifecycleAction::Restart => "Supervisor restarted",
+            }
+            .to_owned()),
             _ => Err(StatusInterfaceError::new(
                 StatusInterfaceErrorKind::Command,
                 "The application returned an unexpected command result",
@@ -475,7 +488,13 @@ fn complete_mutation(
 fn is_mutation_command(command: &Command) -> bool {
     matches!(
         command,
-        Command::ActivateProfile { .. } | Command::SelectNode { .. }
+        Command::ActivateProfile { .. }
+            | Command::SelectNode { .. }
+            | Command::AddRule { .. }
+            | Command::ReplaceRule { .. }
+            | Command::RemoveRule { .. }
+            | Command::RestartSupervisor { .. }
+            | Command::StopSupervisor { .. }
     )
 }
 
@@ -560,6 +579,82 @@ fn execute_work(
                 },
             }
         }
+        Command::FetchRules {
+            request_id,
+            connection_generation,
+        } => {
+            let result = snapshots
+                .fetch_rules(*connection_generation, &work.cancellation)
+                .map_err(|error| short_terminal_text(&error.to_string()));
+            DispatchedEvent {
+                source: EventSource::CommandResult,
+                event: UiEvent::RulesLoaded {
+                    request_id: *request_id,
+                    connection_generation: *connection_generation,
+                    result,
+                },
+            }
+        }
+        Command::AddRule {
+            request_id,
+            connection_generation,
+            rule,
+        } => mutation_result(
+            *request_id,
+            *connection_generation,
+            ApplicationOperation::RuleAdd {
+                rule: rule.clone(),
+                placement: RulePlacement::Append,
+            },
+            &work.cancellation,
+            commands,
+        ),
+        Command::ReplaceRule {
+            request_id,
+            connection_generation,
+            old_rule,
+            new_rule,
+        } => mutation_result(
+            *request_id,
+            *connection_generation,
+            ApplicationOperation::RuleReplace {
+                old_rule: old_rule.clone(),
+                new_rule: new_rule.clone(),
+            },
+            &work.cancellation,
+            commands,
+        ),
+        Command::RemoveRule {
+            request_id,
+            connection_generation,
+            rule,
+        } => mutation_result(
+            *request_id,
+            *connection_generation,
+            ApplicationOperation::RuleRemove { rule: rule.clone() },
+            &work.cancellation,
+            commands,
+        ),
+        Command::RestartSupervisor {
+            request_id,
+            connection_generation,
+        } => mutation_result(
+            *request_id,
+            *connection_generation,
+            ApplicationOperation::Restart,
+            &work.cancellation,
+            commands,
+        ),
+        Command::StopSupervisor {
+            request_id,
+            connection_generation,
+        } => mutation_result(
+            *request_id,
+            *connection_generation,
+            ApplicationOperation::Stop,
+            &work.cancellation,
+            commands,
+        ),
         Command::FetchLogTail {
             connection_generation,
             after_sequence,
@@ -681,6 +776,12 @@ fn command_request_id(command: &Command) -> Option<RequestId> {
         Command::ActivateProfile { request_id, .. }
         | Command::SelectNode { request_id, .. }
         | Command::FetchProxyGroup { request_id, .. }
+        | Command::FetchRules { request_id, .. }
+        | Command::AddRule { request_id, .. }
+        | Command::ReplaceRule { request_id, .. }
+        | Command::RemoveRule { request_id, .. }
+        | Command::RestartSupervisor { request_id, .. }
+        | Command::StopSupervisor { request_id, .. }
         | Command::Cancel { request_id } => Some(*request_id),
         Command::Connect { .. }
         | Command::ScheduleReconnect { .. }

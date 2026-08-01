@@ -81,24 +81,28 @@ fn real_pty_interaction_covers_resize_keyboard_mouse_and_restoration() {
     let mut interactive = PtySession::spawn_with_size("interactive", SMALL_PTY_SIZE);
     interactive.wait_for_text("Required:");
     interactive.resize(RESIZED_PTY_SIZE);
-    interactive.wait_for_text("Connection:");
-    interactive.write_input(b"3");
-    interactive.wait_for_text("Profiles (2)");
+    interactive.wait_for_text("CONNECTED");
+    interactive.write_input(b"p");
+    interactive.wait_for_text("PROFILES (2)");
     interactive.write_input(b"\r");
     interactive.wait_for_text("HOPASH_PTY_COMMAND profile_use");
+    interactive.wait_for_text("Success: done");
     interactive.write_input(b"2");
     interactive.wait_for_text("Nodes (2)");
-    interactive.write_input(b"\x1b[<0;2;11M\x1b[<0;2;11m");
+    interactive.write_input(b"\x1b[<0;25;7M\x1b[<0;25;7m");
     interactive.wait_for_text("HOPASH_PTY_COMMAND proxy_select");
-    interactive.write_input(b"\x1b[<0;39;2M\x1b[<0;39;2m");
-    interactive.wait_for_text(" Follow  ");
+    interactive.write_input(b"5");
+    interactive.wait_for_text("LOGS");
+    interactive.write_input(b"\x1b[<0;52;4M\x1b[<0;52;4m");
+    interactive.wait_for_text("following");
     interactive.write_input(b"q");
     let interactive_output = interactive.finish();
     assert_terminal_restored(&interactive_output, "interactive");
     assert_output_contains(&interactive_output, b"size=100x30", "resized terminal size");
+    let separator = "─".repeat(100);
     assert_output_contains(
         &interactive_output,
-        b"\x1b[2;100H",
+        separator.as_bytes(),
         "100-column Status Interface frame",
     );
 }
@@ -131,7 +135,7 @@ fn real_pty_sigterm_interrupts_a_stalled_foreground_command() {
 #[test]
 fn real_pty_panic_restores_terminal_modes() {
     let mut panic_session = PtySession::spawn("panic");
-    panic_session.wait_for_text("Connection:");
+    panic_session.wait_for_text("UP");
     let panic_output = panic_session.finish();
     assert_terminal_restored(&panic_output, "panic");
 }
@@ -186,7 +190,7 @@ fn real_pty_repeated_cleanup_emits_each_restoration_once() {
 
 fn assert_signal_restoration(scenario: &str, signal: Signal) {
     let mut session = PtySession::spawn(scenario);
-    session.wait_for_text("Connection:");
+    session.wait_for_text("UP");
     session.signal(signal);
     let output = session.finish();
     assert_terminal_restored(&output, scenario);
@@ -194,14 +198,14 @@ fn assert_signal_restoration(scenario: &str, signal: Signal) {
 
 fn assert_stalled_command_restoration(scenario: &str, signal: Option<Signal>) {
     let mut session = PtySession::spawn(scenario);
-    session.wait_for_text("Connection:");
-    session.write_input(b"3\r");
+    session.wait_for_text("UP");
+    session.write_input(b"p\r");
     session.wait_for_text("HOPASH_PTY_COMMAND stalled");
     let started = Instant::now();
     if let Some(signal) = signal {
         session.signal(signal);
     } else {
-        session.write_input(b"q");
+        session.write_input(b"qq");
     }
     let output = session.finish();
     assert!(

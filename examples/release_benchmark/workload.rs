@@ -152,7 +152,8 @@ fn write_tui_events(path: &Path, scale: WorkloadScale) -> Result<(), Box<dyn Err
     let mut output = new_buffered_file(path)?;
     let frames = scale.telemetry_seconds * scale.tui_frames_per_second;
     for frame in 0..frames {
-        let page = ["overview", "proxies", "profiles", "logs"][usize::try_from((frame / 240) % 4)?];
+        let page = ["overview", "proxies", "connections", "rules", "logs"]
+            [usize::try_from((frame / 240) % 5)?];
         write_json_line(
             &mut output,
             &json!({

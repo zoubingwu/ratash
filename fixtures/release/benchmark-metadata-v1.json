@@ -37,7 +37,7 @@
   },
   "workload_generator": {
     "name": "hopash-release-workload",
-    "version": 1,
+    "version": 2,
     "seed": 5210471535391298131
   },
   "versioned_defaults": {

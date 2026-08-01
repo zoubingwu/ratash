@@ -45,7 +45,8 @@ pub(super) fn parse_page(value: &str) -> Result<Page, Box<dyn Error>> {
     match value {
         "overview" => Ok(Page::Overview),
         "proxies" => Ok(Page::Proxies),
-        "profiles" => Ok(Page::Profiles),
+        "connections" => Ok(Page::Connections),
+        "rules" => Ok(Page::Rules),
         "logs" => Ok(Page::Logs),
         _ => Err(invalid("TUI event page is unsupported")),
     }

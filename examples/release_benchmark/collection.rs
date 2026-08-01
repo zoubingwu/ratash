@@ -14,6 +14,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use serde_json::{Map, Value, json};
 
+use hopash::application::PolicyTargetValidation;
 use hopash::constants::{
     CORE_LOG_LINE_MAX_BYTES, LOG_CAPACITY, PROBE_WORKER_COUNT, TRAFFIC_SERIES_CAPACITY,
 };
@@ -25,7 +26,7 @@ use hopash::lifecycle::{InstanceRecord, StatePaths};
 use hopash::rule::{LocalRuleSet, RuleSetLimits};
 use hopash::scheduler::{ProbeCompletion, ProbeOutcome, ProbeScheduler};
 use hopash::telemetry::{LogSource, TelemetryStore};
-use hopash::tui::{AppState, ProfileRow, ViewLogRecord, render_buffer};
+use hopash::tui::{AppState, ProfileRow, RuleRow, ViewLogRecord, render_buffer};
 use hopash::tui_runtime::ProcessSignalSource;
 
 use super::metadata::{validate_metadata, validate_metadata_file};
@@ -443,12 +444,24 @@ fn collect_product_metrics(
     )?;
     let rule_parse_ms = elapsed_ms(rule_parse_start);
     let rule_filter_start = Instant::now();
-    let matching_rules = rules
-        .list()?
+    let listed_rules = rules.list()?;
+    let matching_rules = listed_rules
         .entries
-        .into_iter()
+        .iter()
         .filter(|entry| entry.rule.as_str().contains(&rule_needle))
         .count();
+    let rule_rows = listed_rules
+        .entries
+        .into_iter()
+        .map(|entry| RuleRow {
+            index: entry.index,
+            rule_string: entry.rule.as_str().to_owned(),
+            rule_type: entry.parsed.rule_type.as_str().to_owned(),
+            payload: entry.parsed.payload.map(str::to_owned),
+            policy_target: entry.parsed.policy_target.to_owned(),
+            policy_target_validation: PolicyTargetValidation::Valid,
+        })
+        .collect();
     let rule_filter_ms = elapsed_ms(rule_filter_start);
     if matching_rules != 1 {
         return Err(invalid(
@@ -468,6 +481,9 @@ fn collect_product_metrics(
     )?;
     let mut state = AppState::new();
     state.profiles.rows = profile_rows;
+    state.rules.initialized = true;
+    state.rules.revision = Some(LocalRuleSetRevision(1));
+    state.rules.rows = rule_rows;
     let area = Rect::new(0, 0, 120, 40);
     let mut buffer = Buffer::empty(area);
     let _ = render_buffer(&state, area, &mut buffer);

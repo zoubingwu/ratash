@@ -5,10 +5,14 @@ use std::sync::Arc;
 use crate::application::{
     ApplicationClient, ApplicationError, ApplicationOperation, ApplicationOutput,
     ProfileRefreshState, ProxyAvailability, ProxyGroupSummary, ProxyListOutcome, ProxyMemberKind,
+    RuleListOutcome,
 };
 use crate::cancellation::CancellationToken;
 use crate::constants::MAX_ACTIVE_NODES;
-use crate::tui::{FullViewSnapshot, ProfileRow, ProxyGroupRow, ProxyGroupSnapshot, ProxyRow};
+use crate::tui::{
+    FullViewSnapshot, ProfileRow, ProxyGroupRow, ProxyGroupSnapshot, ProxyRow, RuleListSnapshot,
+    RuleRow,
+};
 
 use super::{
     LogTail, StatusInterfaceError, StatusInterfaceErrorKind, StatusLogEventSource,
@@ -39,6 +43,17 @@ pub trait FullSnapshotSource: Send + Sync {
         Err(StatusInterfaceError::new(
             StatusInterfaceErrorKind::InvalidConfiguration,
             "The snapshot source does not support Proxy Group loading",
+        ))
+    }
+
+    fn fetch_rules(
+        &self,
+        _connection_generation: u64,
+        _cancellation: &CancellationToken,
+    ) -> Result<RuleListSnapshot, StatusInterfaceError> {
+        Err(StatusInterfaceError::new(
+            StatusInterfaceErrorKind::InvalidConfiguration,
+            "The snapshot source does not support Rule loading",
         ))
     }
 }
@@ -178,6 +193,41 @@ where
             ApplicationOutput::Proxies(outcome) => Ok(proxy_group_snapshot(outcome)),
             _ => Err(unexpected_snapshot_output("Proxy list")),
         }
+    }
+
+    fn fetch_rules(
+        &self,
+        _connection_generation: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<RuleListSnapshot, StatusInterfaceError> {
+        check_snapshot_cancellation(cancellation)?;
+        match self
+            .client
+            .execute_cancellable(ApplicationOperation::RuleList, cancellation)
+            .map_err(snapshot_application_error)?
+        {
+            ApplicationOutput::Rules(outcome) => Ok(rule_list_snapshot(outcome)),
+            _ => Err(unexpected_snapshot_output("Rule list")),
+        }
+    }
+}
+
+fn rule_list_snapshot(outcome: RuleListOutcome) -> RuleListSnapshot {
+    RuleListSnapshot {
+        initialized: outcome.initialized,
+        revision: outcome.revision,
+        rows: outcome
+            .rules
+            .into_iter()
+            .map(|rule| RuleRow {
+                index: rule.index,
+                rule_string: rule.rule_string,
+                rule_type: rule.rule_type,
+                payload: rule.payload,
+                policy_target: rule.policy_target,
+                policy_target_validation: rule.policy_target_validation,
+            })
+            .collect(),
     }
 }
 

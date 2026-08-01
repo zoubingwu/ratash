@@ -312,7 +312,7 @@ fn release_metadata_names_every_required_resource_measurement() {
         metadata["workload_generator"]["name"],
         "hopash-release-workload"
     );
-    assert_eq!(metadata["workload_generator"]["version"], 1);
+    assert_eq!(metadata["workload_generator"]["version"], 2);
     assert_eq!(
         metadata["workload_generator"]["seed"],
         5_210_471_535_391_298_131_u64

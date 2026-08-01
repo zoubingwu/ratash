@@ -36,7 +36,7 @@ use metadata::validate_metadata_file;
 use workload::generate_workload;
 
 const CAPTURE_TOOL_VERSION: u64 = 1;
-const WORKLOAD_GENERATOR_VERSION: u64 = 1;
+const WORKLOAD_GENERATOR_VERSION: u64 = 2;
 const WORKLOAD_SEED: u64 = 0x484f_5041_5348_5253;
 const CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVICE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
