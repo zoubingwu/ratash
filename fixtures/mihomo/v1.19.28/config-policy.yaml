@@ -23,6 +23,7 @@ top-level:
   external-ui: { kind: managed-drop }
   external-ui-name: { kind: managed-drop }
   external-ui-url: { kind: managed-drop }
+  geo-auto-update: { kind: managed-replace }
   inbound-mptcp: { kind: managed-drop }
   inbound-tfo: { kind: managed-drop }
   interface-name: { kind: managed-drop }

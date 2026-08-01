@@ -164,6 +164,20 @@ fn resolver_reconstructs_only_the_matching_staged_generation() {
             .resolve(&transaction(RuntimeGeneration(8)))
             .is_err()
     );
+    let manifest_path = staged.generation_root.join("manifest.json");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    let legacy_policy = sha256_hex(b"hopash-config-policy-v3");
+    let legacy_manifest = manifest.replace(compiler.compiler_policy_sha256(), &legacy_policy);
+    assert_ne!(legacy_manifest, manifest);
+    let mut manifest_permissions = fs::metadata(&manifest_path).unwrap().permissions();
+    manifest_permissions.set_mode(0o600);
+    fs::set_permissions(&manifest_path, manifest_permissions).unwrap();
+    fs::write(manifest_path, legacy_manifest).unwrap();
+    assert!(
+        resolver
+            .resolve(&transaction(RuntimeGeneration(7)))
+            .is_err()
+    );
 
     fs::remove_dir_all(root).unwrap();
 }

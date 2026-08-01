@@ -517,6 +517,7 @@ redir-port: 7892
 tproxy-port: 7893
 mixed-port: 7890
 tunnels: [unsafe-tunnel]
+geo-auto-update: true
 dns:
   enable: true
   listen: 0.0.0.0:53
@@ -563,6 +564,7 @@ dns:
     assert_eq!(document["dns"].get("listen"), None);
     assert_eq!(document["external-controller-unix"], "/tmp/owned.sock");
     assert_eq!(document["secret"], "owned-secret");
+    assert_eq!(document["geo-auto-update"], false);
 
     std::fs::remove_dir_all(staging_root).expect("the staging fixture should be removed");
 }
@@ -634,6 +636,64 @@ fn persisted_configuration_validation_recompiles_with_its_session_values() {
             .expect_err("a changed managed field should fail integrity validation"),
         ConfigError::PersistedConfigurationInvalid
     );
+
+    std::fs::remove_dir_all(staging_root).expect("the staging fixture should be removed");
+}
+
+#[test]
+fn persisted_configuration_validation_accepts_the_canonical_v3_geo_policy() {
+    let staging_root = temporary_root("persisted-v3-geo-policy");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
+    let base_snapshot = snapshot("rules: [MATCH,DIRECT]\n");
+    let rules = vec!["MATCH,DIRECT".to_owned()];
+    let configuration = compiler
+        .compile(
+            &base_snapshot,
+            &rules,
+            &AuthoritativeConfig::new("/tmp/old-core.sock", "old-session-secret"),
+            &staging_root,
+        )
+        .expect("the fixture configuration should compile");
+    let legacy = configuration.yaml().replace("geo-auto-update: false\n", "");
+    assert_ne!(legacy, configuration.yaml());
+
+    compiler
+        .validate_persisted(&base_snapshot, &rules, legacy.as_bytes(), &staging_root)
+        .expect("the canonical v3 configuration should remain authenticatable");
+
+    let unsafe_legacy = legacy.replace("mode: rule", "geo-auto-update: true\nmode: rule");
+    assert_eq!(
+        compiler
+            .validate_persisted(
+                &base_snapshot,
+                &rules,
+                unsafe_legacy.as_bytes(),
+                &staging_root,
+            )
+            .expect_err("an explicit legacy Geo-data update must fail integrity validation"),
+        ConfigError::PersistedConfigurationInvalid
+    );
+
+    let updating_snapshot = snapshot("geo-auto-update: true\nrules: [MATCH,DIRECT]\n");
+    let updating_configuration = compiler
+        .compile(
+            &updating_snapshot,
+            &rules,
+            &AuthoritativeConfig::new("/tmp/old-core.sock", "old-session-secret"),
+            &staging_root,
+        )
+        .expect("the managed Geo-data update policy should compile");
+    let updating_legacy = updating_configuration
+        .yaml()
+        .replace("geo-auto-update: false", "geo-auto-update: true");
+    compiler
+        .validate_persisted(
+            &updating_snapshot,
+            &rules,
+            updating_legacy.as_bytes(),
+            &staging_root,
+        )
+        .expect("a canonical v3 true value should migrate to the managed false value");
 
     std::fs::remove_dir_all(staging_root).expect("the staging fixture should be removed");
 }
@@ -1000,6 +1060,13 @@ fn privileged_validation_rejects_forged_runtime_authority_and_provider_manifest(
         .expect("TUN should be a mapping")
         .insert("enable".into(), false.into());
     forgeries.push(forged_tun);
+
+    let mut forged_geo_update = original.clone();
+    forged_geo_update
+        .as_mapping_mut()
+        .expect("the candidate should be a mapping")
+        .insert("geo-auto-update".into(), true.into());
+    forgeries.push(forged_geo_update);
 
     let mut forged_dns_fallback = original.clone();
     forged_dns_fallback["dns"]

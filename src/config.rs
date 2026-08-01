@@ -11,7 +11,7 @@ use url::Url;
 
 const BUNDLED_POLICY: &str = include_str!("../fixtures/mihomo/v1.19.28/config-policy.yaml");
 pub const BUNDLED_CORE_VERSION: &str = "v1.19.28";
-const COMPILER_POLICY_REVISION: &str = "hopash-config-policy-v3";
+const COMPILER_POLICY_REVISION: &str = "hopash-config-policy-v4";
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct AuthoritativeConfig {
@@ -409,6 +409,7 @@ impl ConfigCompiler {
         );
         document.insert("mode".into(), "rule".into());
         document.insert("allow-lan".into(), false.into());
+        document.insert("geo-auto-update".into(), false.into());
         document.insert(
             "external-controller-unix".into(),
             authoritative.controller_unix.clone().into(),
@@ -499,10 +500,32 @@ impl ConfigCompiler {
             .ok_or(ConfigError::PersistedConfigurationInvalid)?;
         let authoritative = AuthoritativeConfig::new(controller_unix, secret);
         let expected = self.compile(snapshot, rules, &authoritative, staging_root)?;
-        if expected.yaml().as_bytes() != persisted {
+        if expected.yaml().as_bytes() == persisted {
+            return Ok(());
+        }
+
+        let legacy: Value = serde_yaml_ng::from_str(expected.yaml())
+            .map_err(|_| ConfigError::PersistedConfigurationInvalid)?;
+        let Value::Mapping(mut legacy) = legacy else {
+            return Err(ConfigError::PersistedConfigurationInvalid);
+        };
+        if legacy.remove("geo-auto-update") != Some(Value::Bool(false)) {
             return Err(ConfigError::PersistedConfigurationInvalid);
         }
-        Ok(())
+        match snapshot.document().get("geo-auto-update") {
+            Some(value @ Value::Bool(_)) => {
+                legacy.insert("geo-auto-update".into(), value.clone());
+            }
+            Some(_) => return Err(ConfigError::PersistedConfigurationInvalid),
+            None => {}
+        }
+        let legacy = serde_yaml_ng::to_string(&canonicalize(Value::Mapping(legacy)))
+            .map_err(|_| ConfigError::SerializationFailed)?;
+        if legacy.as_bytes() == persisted {
+            Ok(())
+        } else {
+            Err(ConfigError::PersistedConfigurationInvalid)
+        }
     }
 
     pub fn validate_privileged_candidate(
@@ -522,6 +545,7 @@ impl ConfigCompiler {
 
         if document.get("mode").and_then(Value::as_str) != Some("rule")
             || document.get("allow-lan").and_then(Value::as_bool) != Some(false)
+            || document.get("geo-auto-update").and_then(Value::as_bool) != Some(false)
             || document
                 .get("external-controller-unix")
                 .and_then(Value::as_str)

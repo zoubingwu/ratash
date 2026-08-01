@@ -1327,6 +1327,80 @@ fn status_publishes_probe_queue_overload_metrics() {
 }
 
 #[test]
+fn startup_migrates_the_committed_v3_geo_policy_through_a_new_runtime_generation() {
+    let harness = Harness::new("startup-v3-geo-policy");
+    harness.queue_profile("Primary", "node-a");
+    let supervisor = harness.open();
+    add_profile(&supervisor, "https://example.test/primary.yaml");
+    drop(supervisor);
+
+    let limits = hopash::profile::SnapshotLimits::new(
+        hopash::constants::PROFILE_RESPONSE_MAX_BYTES,
+        hopash::constants::YAML_MAX_DEPTH,
+    );
+    let hydrated = harness
+        .state_store
+        .load_committed(limits, hopash::rule::RuleSetLimits::product())
+        .expect("the current state should load")
+        .expect("the current state should be committed");
+    let active_profile_id = hydrated
+        .profiles
+        .active_profile_id()
+        .expect("the Active Profile should remain selected");
+    let legacy_configuration = String::from_utf8(hydrated.effective_configuration.clone())
+        .expect("the Effective Configuration should be UTF-8")
+        .replace("geo-auto-update: false\n", "");
+    let legacy = harness
+        .state_store
+        .stage_candidate(AuthoritativeState {
+            profiles: &hydrated.profiles,
+            local_rules: &hydrated.local_rules,
+            effective_configuration: legacy_configuration.as_bytes(),
+            runtime_generation: hydrated.runtime_generation,
+        })
+        .expect("the v3 state should stage");
+    let prepared = harness
+        .state_store
+        .persistence()
+        .prepare(&legacy)
+        .expect("the v3 state should prepare");
+    harness
+        .state_store
+        .persistence()
+        .commit_prepared(&prepared)
+        .expect("the v3 state should commit");
+    harness
+        .state_store
+        .persistence()
+        .clear_prepared(&prepared)
+        .expect("the v3 journal should clear");
+
+    let restarted = harness.open();
+    let migrated = harness
+        .state_store
+        .load_committed(limits, hopash::rule::RuleSetLimits::product())
+        .expect("the migrated state should load")
+        .expect("the migrated state should be committed");
+
+    assert_eq!(
+        migrated.profiles.active_profile_id(),
+        Some(active_profile_id)
+    );
+    assert_eq!(migrated.local_rules, hydrated.local_rules);
+    assert_eq!(migrated.runtime_generation, RuntimeGeneration(2));
+    assert!(
+        String::from_utf8(migrated.effective_configuration)
+            .expect("the migrated Effective Configuration should be UTF-8")
+            .contains("geo-auto-update: false")
+    );
+    assert_eq!(harness.transactions.apply_count.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        get_status(&restarted).runtime_generation,
+        Some(RuntimeGeneration(2))
+    );
+}
+
+#[test]
 fn restart_recompiles_for_the_new_core_session_and_restores_runtime_state() {
     let harness = Harness::new("restart-session");
     harness.core.state.lock().expect("the Core lock").view = two_node_proxy_view();
