@@ -296,6 +296,11 @@ fn write_status(status: &crate::domain::StatusSnapshot, output: &mut dyn Write) 
         "Supervisor: {}",
         supervisor_lifecycle(status.supervisor.lifecycle)
     )?;
+    writeln!(
+        output,
+        "Health Reasons: {}",
+        supervisor_health_reasons(&status.supervisor.health_reasons)
+    )?;
     writeln!(output, "Core: {}", core_lifecycle(status.core.lifecycle))?;
     writeln!(output, "Uptime: {}s", status.supervisor.uptime_seconds)
 }
@@ -682,6 +687,27 @@ fn supervisor_lifecycle(lifecycle: crate::domain::SupervisorLifecycle) -> &'stat
         crate::domain::SupervisorLifecycle::Stopped => "stopped",
         crate::domain::SupervisorLifecycle::Degraded => "degraded",
     }
+}
+
+fn supervisor_health_reasons(reasons: &[crate::domain::SupervisorHealthReason]) -> String {
+    if reasons.is_empty() {
+        return "none".to_owned();
+    }
+    reasons
+        .iter()
+        .map(|reason| match reason {
+            crate::domain::SupervisorHealthReason::RuntimeRecovery => "runtime_recovery",
+            crate::domain::SupervisorHealthReason::SelectionCompensation => {
+                "selection_compensation"
+            }
+            crate::domain::SupervisorHealthReason::ConfigurationProjection => {
+                "configuration_projection"
+            }
+            crate::domain::SupervisorHealthReason::ProbeScheduler => "probe_scheduler",
+            crate::domain::SupervisorHealthReason::SelectionRestoration => "selection_restoration",
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn core_lifecycle(lifecycle: crate::domain::CoreLifecycle) -> &'static str {

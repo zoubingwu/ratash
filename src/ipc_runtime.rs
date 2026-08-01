@@ -43,7 +43,8 @@ use crate::domain::{
     NodeRecordId, ProbeGeneration, ProbeQueueStatus, ProfileId, ProxyGroupId, RuntimeApplyPhase,
     RuntimeApplySnapshot, RuntimeGeneration, RuntimeRecoverySnapshot, RuntimeRecoveryStatus,
     SampleState, SelectedNodeSummary, StatusSnapshot, StreamHealthSet, StreamState,
-    SubscriptionUrl, SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason, TunStatus,
+    SubscriptionUrl, SupervisorHealthReason, SupervisorLifecycle, SupervisorStatus, TrafficSample,
+    TunReason, TunStatus,
 };
 use crate::error::ErrorCode;
 use crate::ipc::{
@@ -3581,7 +3582,7 @@ impl TryFrom<WireStatusSnapshot> for StatusSnapshot {
             Into::into,
         );
         Ok(Self {
-            supervisor: status.supervisor.into(),
+            supervisor: status.supervisor.try_into()?,
             core: status.core.into(),
             tun: status.tun.into(),
             active_profile: status.active_profile.map(TryInto::try_into).transpose()?,
@@ -3713,24 +3714,79 @@ struct WireSupervisorStatus {
     lifecycle: WireSupervisorLifecycle,
     started_at_unix_ms: u64,
     uptime_seconds: u64,
+    #[serde(default)]
+    health_reasons: Vec<WireSupervisorHealthReason>,
 }
 
 impl From<SupervisorStatus> for WireSupervisorStatus {
     fn from(status: SupervisorStatus) -> Self {
+        let mut health_reasons = status.health_reasons;
+        health_reasons.sort_unstable();
+        health_reasons.dedup();
         Self {
             lifecycle: status.lifecycle.into(),
             started_at_unix_ms: status.started_at_unix_ms,
             uptime_seconds: status.uptime_seconds,
+            health_reasons: health_reasons.into_iter().map(Into::into).collect(),
         }
     }
 }
 
-impl From<WireSupervisorStatus> for SupervisorStatus {
-    fn from(status: WireSupervisorStatus) -> Self {
-        Self {
+impl TryFrom<WireSupervisorStatus> for SupervisorStatus {
+    type Error = WireConversionError;
+
+    fn try_from(status: WireSupervisorStatus) -> Result<Self, Self::Error> {
+        let health_reasons = status
+            .health_reasons
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<SupervisorHealthReason>>();
+        if health_reasons.len() > 5
+            || !health_reasons
+                .windows(2)
+                .all(|window| window[0] < window[1])
+        {
+            return Err(WireConversionError);
+        }
+        Ok(Self {
             lifecycle: status.lifecycle.into(),
             started_at_unix_ms: status.started_at_unix_ms,
             uptime_seconds: status.uptime_seconds,
+            health_reasons,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireSupervisorHealthReason {
+    RuntimeRecovery,
+    SelectionCompensation,
+    ConfigurationProjection,
+    ProbeScheduler,
+    SelectionRestoration,
+}
+
+impl From<SupervisorHealthReason> for WireSupervisorHealthReason {
+    fn from(value: SupervisorHealthReason) -> Self {
+        match value {
+            SupervisorHealthReason::RuntimeRecovery => Self::RuntimeRecovery,
+            SupervisorHealthReason::SelectionCompensation => Self::SelectionCompensation,
+            SupervisorHealthReason::ConfigurationProjection => Self::ConfigurationProjection,
+            SupervisorHealthReason::ProbeScheduler => Self::ProbeScheduler,
+            SupervisorHealthReason::SelectionRestoration => Self::SelectionRestoration,
+        }
+    }
+}
+
+impl From<WireSupervisorHealthReason> for SupervisorHealthReason {
+    fn from(value: WireSupervisorHealthReason) -> Self {
+        match value {
+            WireSupervisorHealthReason::RuntimeRecovery => Self::RuntimeRecovery,
+            WireSupervisorHealthReason::SelectionCompensation => Self::SelectionCompensation,
+            WireSupervisorHealthReason::ConfigurationProjection => Self::ConfigurationProjection,
+            WireSupervisorHealthReason::ProbeScheduler => Self::ProbeScheduler,
+            WireSupervisorHealthReason::SelectionRestoration => Self::SelectionRestoration,
         }
     }
 }

@@ -28,7 +28,7 @@ use hopash::domain::{
     CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus, LocalRuleSetRevision, NodeRecordId,
     ProbeGeneration, ProfileId, ProxyGroupId, RuntimeApplyPhase, RuntimeApplySnapshot,
     RuntimeGeneration, RuntimeRecoverySnapshot, RuntimeRecoveryStatus, SubscriptionUrl,
-    SupervisorLifecycle,
+    SupervisorHealthReason, SupervisorLifecycle,
 };
 use hopash::error::ErrorCode;
 use hopash::ipc::{
@@ -382,6 +382,11 @@ fn runtime_apply_and_core_health_round_trip_through_typed_ipc() {
         backoff_ms: Some(4_000),
         diagnostic: Some(CoreDiagnosticCategory::RestartLimitReached),
     };
+    expected.supervisor.lifecycle = SupervisorLifecycle::Degraded;
+    expected.supervisor.health_reasons = vec![
+        SupervisorHealthReason::RuntimeRecovery,
+        SupervisorHealthReason::ProbeScheduler,
+    ];
     expected.apply_state = hopash::domain::ApplyState::Recovering;
     expected.runtime_apply = RuntimeApplySnapshot {
         candidate_generation: Some(RuntimeGeneration(9)),
@@ -462,6 +467,11 @@ fn legacy_status_without_core_restart_decodes_with_inactive_defaults() {
         .and_then(serde_json::Value::as_object_mut)
         .expect("the captured response should contain Core status");
     assert!(core.remove("restart").is_some());
+    let supervisor = legacy_response
+        .pointer_mut("/data/data/supervisor")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("the captured response should contain Supervisor status");
+    assert!(supervisor.remove("health_reasons").is_some());
     let status = legacy_response
         .pointer_mut("/data/data")
         .and_then(serde_json::Value::as_object_mut)
@@ -486,6 +496,7 @@ fn legacy_status_without_core_restart_decodes_with_inactive_defaults() {
         panic!("legacy response should return status")
     };
     assert_eq!(status.core.restart, CoreRestartStatus::default());
+    assert!(status.supervisor.health_reasons.is_empty());
     assert_eq!(status.runtime_apply, RuntimeApplySnapshot::default());
     fixture.join().expect("legacy fixture should stop");
 }

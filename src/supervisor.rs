@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -41,8 +41,8 @@ use crate::domain::{
     CoreRestartStatus, CoreStatus, NodeRecordId, ProbeGeneration, ProbeQueueStatus, ProfileId,
     ProxyGroupId, RuntimeApplyPhase, RuntimeApplySnapshot, RuntimeGeneration,
     RuntimeRecoverySnapshot, RuntimeRecoveryStatus, SampleState, SelectedNodeSummary,
-    StatusSnapshot, StreamHealthSet, StreamState, SubscriptionUrl, SupervisorLifecycle,
-    SupervisorStatus, TrafficSample, TunReason, TunStatus,
+    StatusSnapshot, StreamHealthSet, StreamState, SubscriptionUrl, SupervisorHealthReason,
+    SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason, TunStatus,
 };
 use crate::error::ErrorCode;
 use crate::profile::{
@@ -583,7 +583,7 @@ struct SupervisorState {
     probe_core_generation: Option<CoreInstanceGeneration>,
     selection_restore_pending: bool,
     selection_restore_attempts_remaining: usize,
-    degraded: bool,
+    health_reasons: BTreeSet<SupervisorHealthReason>,
 }
 
 #[derive(Default)]
@@ -760,7 +760,7 @@ impl Supervisor {
             committed_generation,
             ..RuntimeApplySnapshot::default()
         };
-        let mut startup_degraded = false;
+        let mut startup_health_reasons = BTreeSet::new();
         if let Some(configuration) = effective_configuration.as_ref() {
             let generation = dependencies
                 .transactions
@@ -776,7 +776,9 @@ impl Supervisor {
                     revisions: current_revisions(&profiles, &local_rules, Some(configuration)),
                 });
             let success = result.map_err(map_transaction_error)?;
-            startup_degraded = recovery_requires_degraded(success.recovery);
+            if recovery_requires_degraded(success.recovery) {
+                startup_health_reasons.insert(SupervisorHealthReason::RuntimeRecovery);
+            }
             runtime_generation = Some(success.committed_generation);
             startup_runtime_apply = successful_runtime_apply_snapshot(success);
         } else {
@@ -791,6 +793,7 @@ impl Supervisor {
             &profiles,
             runtime_generation,
             startup_runtime_apply.clone(),
+            startup_health_reasons.iter().copied().collect(),
         );
         let supervisor = Self {
             clock: dependencies.clock,
@@ -818,7 +821,7 @@ impl Supervisor {
                 probe_core_generation: None,
                 selection_restore_pending: false,
                 selection_restore_attempts_remaining: 0,
-                degraded: startup_degraded,
+                health_reasons: startup_health_reasons,
             }),
             activation: Mutex::new(ActivationQueue::default()),
             apply_in_progress: AtomicBool::new(false),
@@ -1155,8 +1158,18 @@ impl Supervisor {
 
     pub fn retry_selection_restore(&self) -> Result<bool, ApplicationError> {
         let mut state = self.state.lock().map_err(|_| internal_error())?;
+        if !state.selection_restore_pending
+            && state
+                .health_reasons
+                .contains(&SupervisorHealthReason::SelectionRestoration)
+        {
+            self.begin_selection_restore(&mut state);
+        }
         self.reconcile_runtime_state_locked(&mut state);
-        Ok(!state.selection_restore_pending)
+        Ok(!state.selection_restore_pending
+            && !state
+                .health_reasons
+                .contains(&SupervisorHealthReason::SelectionRestoration))
     }
 
     pub fn reconcile_runtime_state(&self) -> Result<(), ApplicationError> {
@@ -1203,11 +1216,11 @@ impl Supervisor {
             .now_unix_ms()
             .saturating_sub(self.started_at_unix_ms)
             / 1_000;
-        if let Some(core) = &managed_core {
-            let order = effective_group_order(&state.profiles)?;
-            if let Ok(view) = self.core.proxy_view(core, &order) {
-                state.cached_proxy_view = Some(view);
-            }
+        if let Some(core) = &managed_core
+            && let Ok(order) = effective_group_order_with_health(&mut state)
+            && let Ok(view) = self.core.proxy_view(core, &order)
+        {
+            state.cached_proxy_view = Some(view);
         }
         let active_profile =
             active_profile_id
@@ -1233,13 +1246,14 @@ impl Supervisor {
         let runtime_apply = self.current_runtime_apply();
         let status = StatusSnapshot {
             supervisor: SupervisorStatus {
-                lifecycle: if state.degraded || core_health.degraded {
+                lifecycle: if !state.health_reasons.is_empty() || core_health.degraded {
                     SupervisorLifecycle::Degraded
                 } else {
                     SupervisorLifecycle::Ready
                 },
                 started_at_unix_ms: self.started_at_unix_ms,
                 uptime_seconds,
+                health_reasons: state.health_reasons.iter().copied().collect(),
             },
             core: core_health.core,
             tun: core_health.tun,
@@ -1299,9 +1313,11 @@ impl Supervisor {
     ) -> Result<ConfigTransactionSuccess, ApplicationError> {
         match result {
             Ok(success) => {
-                if recovery_requires_degraded(success.recovery) {
-                    state.degraded = true;
-                }
+                set_health_reason(
+                    state,
+                    SupervisorHealthReason::RuntimeRecovery,
+                    recovery_requires_degraded(success.recovery),
+                );
                 *self
                     .last_runtime_apply
                     .lock()
@@ -1310,9 +1326,11 @@ impl Supervisor {
                 Ok(success)
             }
             Err(error) => {
-                if recovery_requires_degraded(error.recovery) {
-                    state.degraded = true;
-                }
+                set_health_reason(
+                    state,
+                    SupervisorHealthReason::RuntimeRecovery,
+                    recovery_requires_degraded(error.recovery),
+                );
                 *self
                     .last_runtime_apply
                     .lock()
@@ -1658,7 +1676,9 @@ impl Supervisor {
                 .as_ref()
                 .is_some_and(|previous| self.core.select_node(&core, previous).is_ok());
             if !compensated {
-                state.degraded = true;
+                state
+                    .health_reasons
+                    .insert(SupervisorHealthReason::SelectionCompensation);
             }
             return Err(ApplicationError::new(
                 ErrorCode::ExternalOperationFailed,
@@ -1674,6 +1694,12 @@ impl Supervisor {
         state.cached_proxy_view = None;
         state.selection_restore_pending = false;
         state.selection_restore_attempts_remaining = 0;
+        state
+            .health_reasons
+            .remove(&SupervisorHealthReason::SelectionCompensation);
+        state
+            .health_reasons
+            .remove(&SupervisorHealthReason::SelectionRestoration);
         Ok(ApplicationOutput::ProxySelection(ProxySelectionOutcome {
             group_id,
             group: group_name,
@@ -1927,7 +1953,7 @@ impl Supervisor {
             .map_err(|_| core_error("The Managed Core is unavailable"))?
             .managed_core
             .ok_or_else(|| core_error("The Managed Core is unavailable"))?;
-        let order = effective_group_order(&state.profiles)?;
+        let order = effective_group_order_with_health(state)?;
         let view = self
             .core
             .proxy_view(&core, &order)
@@ -1952,6 +1978,15 @@ impl Supervisor {
             state.probes.deactivate();
             state.selection_restore_pending = false;
             state.selection_restore_attempts_remaining = 0;
+            state
+                .health_reasons
+                .remove(&SupervisorHealthReason::ConfigurationProjection);
+            state
+                .health_reasons
+                .remove(&SupervisorHealthReason::ProbeScheduler);
+            state
+                .health_reasons
+                .remove(&SupervisorHealthReason::SelectionRestoration);
             return;
         }
         let core = self
@@ -1982,12 +2017,9 @@ impl Supervisor {
         {
             return;
         }
-        let order = match effective_group_order(&state.profiles) {
+        let order = match effective_group_order_with_health(state) {
             Ok(order) => order,
-            Err(_) => {
-                state.degraded = true;
-                return;
-            }
+            Err(_) => return,
         };
         let view = match self.core.proxy_view(&core, &order) {
             Ok(view) => view,
@@ -2025,15 +2057,25 @@ impl Supervisor {
             .is_err()
         {
             state.probes.deactivate();
-            state.degraded = true;
+            state.probe_core_generation = None;
+            state
+                .health_reasons
+                .insert(SupervisorHealthReason::ProbeScheduler);
+        } else {
+            state.probe_core_generation = Some(core_generation);
+            state
+                .health_reasons
+                .remove(&SupervisorHealthReason::ProbeScheduler);
         }
-        state.probe_core_generation = Some(core_generation);
     }
 
     fn begin_selection_restore(&self, state: &mut SupervisorState) {
         let Some(active_id) = state.profiles.active_profile_id() else {
             state.selection_restore_pending = false;
             state.selection_restore_attempts_remaining = 0;
+            state
+                .health_reasons
+                .remove(&SupervisorHealthReason::SelectionRestoration);
             return;
         };
         let has_selections = state
@@ -2046,6 +2088,11 @@ impl Supervisor {
         } else {
             0
         };
+        if !has_selections {
+            state
+                .health_reasons
+                .remove(&SupervisorHealthReason::SelectionRestoration);
+        }
     }
 
     fn restore_active_selections(
@@ -2057,6 +2104,9 @@ impl Supervisor {
         let Some(active_id) = state.profiles.active_profile_id() else {
             state.selection_restore_pending = false;
             state.selection_restore_attempts_remaining = 0;
+            state
+                .health_reasons
+                .remove(&SupervisorHealthReason::SelectionRestoration);
             return;
         };
         let selections = state
@@ -2080,6 +2130,9 @@ impl Supervisor {
             self.consume_selection_restore_attempt(state);
         } else {
             state.selection_restore_attempts_remaining = 0;
+            state
+                .health_reasons
+                .remove(&SupervisorHealthReason::SelectionRestoration);
         }
     }
 
@@ -2091,7 +2144,9 @@ impl Supervisor {
             state.selection_restore_attempts_remaining.saturating_sub(1);
         if state.selection_restore_attempts_remaining == 0 {
             state.selection_restore_pending = false;
-            state.degraded = true;
+            state
+                .health_reasons
+                .insert(SupervisorHealthReason::SelectionRestoration);
         }
     }
 
@@ -2340,6 +2395,33 @@ fn effective_group_order(profiles: &ProfileCatalog) -> Result<Vec<String>, Appli
         .filter_map(serde_yaml_ng::Value::as_str)
         .map(str::to_owned)
         .collect())
+}
+
+fn effective_group_order_with_health(
+    state: &mut SupervisorState,
+) -> Result<Vec<String>, ApplicationError> {
+    match effective_group_order(&state.profiles) {
+        Ok(order) => {
+            state
+                .health_reasons
+                .remove(&SupervisorHealthReason::ConfigurationProjection);
+            Ok(order)
+        }
+        Err(error) => {
+            state
+                .health_reasons
+                .insert(SupervisorHealthReason::ConfigurationProjection);
+            Err(error)
+        }
+    }
+}
+
+fn set_health_reason(state: &mut SupervisorState, reason: SupervisorHealthReason, active: bool) {
+    if active {
+        state.health_reasons.insert(reason);
+    } else {
+        state.health_reasons.remove(&reason);
+    }
 }
 
 fn resolve_proxy_group<'a>(
@@ -3221,6 +3303,7 @@ fn initial_status_snapshot(
     profiles: &ProfileCatalog,
     runtime_generation: Option<RuntimeGeneration>,
     runtime_apply: RuntimeApplySnapshot,
+    health_reasons: Vec<SupervisorHealthReason>,
 ) -> StatusSnapshot {
     let active_profile = profiles
         .active_profile_id()
@@ -3232,9 +3315,14 @@ fn initial_status_snapshot(
     let unconfigured = active_profile.is_none();
     StatusSnapshot {
         supervisor: SupervisorStatus {
-            lifecycle: SupervisorLifecycle::Ready,
+            lifecycle: if health_reasons.is_empty() {
+                SupervisorLifecycle::Ready
+            } else {
+                SupervisorLifecycle::Degraded
+            },
             started_at_unix_ms,
             uptime_seconds: 0,
+            health_reasons,
         },
         core: CoreStatus {
             lifecycle: if unconfigured {

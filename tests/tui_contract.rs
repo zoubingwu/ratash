@@ -20,7 +20,8 @@ use hopash::domain::{
     CoreStatus, NodeRecordId, ProbeQueueStatus, ProfileId, ProxyGroupId, RuntimeApplyPhase,
     RuntimeApplySnapshot, RuntimeGeneration, RuntimeRecoverySnapshot, RuntimeRecoveryStatus,
     SampleState, SelectedNodeSummary, StatusSnapshot, StreamHealthSet, StreamState,
-    SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason, TunStatus,
+    SupervisorHealthReason, SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason,
+    TunStatus,
 };
 use hopash::ipc::RequestId;
 use hopash::telemetry::{LogLevel, LogSource};
@@ -115,6 +116,24 @@ fn overview_renders_the_final_stopped_supervisor_lifecycle() {
     let (text, _) = render_with_backend(&state, 80, 24);
 
     assert!(text.contains("Supervisor: Stopped | Core: Stopped"));
+}
+
+#[test]
+fn overview_renders_supervisor_health_reasons() {
+    let mut state = connected_state();
+    let status = state
+        .status
+        .as_mut()
+        .expect("the connected fixture should have status");
+    status.supervisor.lifecycle = SupervisorLifecycle::Degraded;
+    status.supervisor.health_reasons = vec![
+        SupervisorHealthReason::RuntimeRecovery,
+        SupervisorHealthReason::SelectionRestoration,
+    ];
+
+    let (text, _) = render_with_backend(&state, 100, 28);
+
+    assert!(text.contains("Health: runtime_recovery, selection_restoration"));
 }
 
 #[test]
@@ -1294,6 +1313,7 @@ fn status_snapshot() -> StatusSnapshot {
             lifecycle: SupervisorLifecycle::Ready,
             started_at_unix_ms: 1_000,
             uptime_seconds: 60,
+            health_reasons: Vec::new(),
         },
         core: CoreStatus {
             lifecycle: CoreLifecycle::Ready,

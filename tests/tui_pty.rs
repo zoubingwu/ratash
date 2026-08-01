@@ -321,6 +321,7 @@ fn full_snapshot() -> FullViewSnapshot {
                 lifecycle: SupervisorLifecycle::Ready,
                 started_at_unix_ms: 1,
                 uptime_seconds: 2,
+                health_reasons: Vec::new(),
             },
             core: CoreStatus {
                 lifecycle: CoreLifecycle::Ready,

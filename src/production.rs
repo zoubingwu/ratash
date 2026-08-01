@@ -338,6 +338,7 @@ fn stopped_status(
                 lifecycle: SupervisorLifecycle::Stopped,
                 started_at_unix_ms: now,
                 uptime_seconds: 0,
+                health_reasons: Vec::new(),
             },
             core: crate::domain::CoreStatus {
                 lifecycle: CoreLifecycle::Stopped,

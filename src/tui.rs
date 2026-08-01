@@ -27,7 +27,7 @@ use crate::constants::{
 };
 use crate::domain::{
     CoreDiagnosticCategory, NodeRecordId, ProfileId, ProxyGroupId, RuntimeApplyPhase,
-    RuntimeRecoveryStatus, SampleState, StatusSnapshot, TunReason,
+    RuntimeRecoveryStatus, SampleState, StatusSnapshot, SupervisorHealthReason, TunReason,
 };
 use crate::ipc::RequestId;
 use crate::telemetry::{CoreLogRecord, LogLevel, LogSource};
@@ -2066,8 +2066,25 @@ fn render_overview(state: &AppState, area: Rect, buffer: &mut Buffer) {
             .map_or_else(String::new, |message| {
                 format!("\nWhy: {}", terminal_safe(message))
             });
+        let health_reasons = if status.supervisor.health_reasons.is_empty() {
+            "none".to_owned()
+        } else {
+            status
+                .supervisor
+                .health_reasons
+                .iter()
+                .map(|reason| match reason {
+                    SupervisorHealthReason::RuntimeRecovery => "runtime_recovery",
+                    SupervisorHealthReason::SelectionCompensation => "selection_compensation",
+                    SupervisorHealthReason::ConfigurationProjection => "configuration_projection",
+                    SupervisorHealthReason::ProbeScheduler => "probe_scheduler",
+                    SupervisorHealthReason::SelectionRestoration => "selection_restoration",
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         format!(
-            "Connection: {connection}\nSupervisor: {:?} | Core: {:?}\nRestart: {restart_pending}, tries={}, wait={restart_backoff}\nDiagnostic: {restart_diagnostic}\nTUN: {tun_effective}, cap={tun_capable}, {tun_reason}\nApply: {}, candidate={candidate_generation}, committed={committed_generation}\nRecovery: {}, restored={restored_generation}{recovery_detail}\nProfile: {} | Group: {}\nNode: {} | Latency: {delay}\nSelection Restore: {selection_restore}\nSampled At: {sampled_at}\nFreshness: {freshness}\nProbe: {probe_status} (generation {probe_generation})\nProbe Queue: {probe_queue_state}, queued {}, in-flight {}, stale {:.1}%\nProbe Window: oldest {oldest_due}, full pass {} ms\nConnections: {} | Uptime: {}s",
+            "Connection: {connection}\nSupervisor: {:?} | Core: {:?}\nHealth: {health_reasons}\nRestart: {restart_pending}, tries={}, wait={restart_backoff}\nDiagnostic: {restart_diagnostic}\nTUN: {tun_effective}, cap={tun_capable}, {tun_reason}\nApply: {}, candidate={candidate_generation}, committed={committed_generation}\nRecovery: {}, restored={restored_generation}{recovery_detail}\nProfile: {} | Group: {}\nNode: {} | Latency: {delay}\nSelection Restore: {selection_restore}\nSampled At: {sampled_at}\nFreshness: {freshness}\nProbe: {probe_status} (generation {probe_generation})\nProbe Queue: {probe_queue_state}, queued {}, in-flight {}, stale {:.1}%\nProbe Window: oldest {oldest_due}, full pass {} ms\nConnections: {} | Uptime: {}s",
             status.supervisor.lifecycle,
             status.core.lifecycle,
             status.core.restart.attempts,

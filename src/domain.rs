@@ -7,6 +7,15 @@ pub enum SupervisorLifecycle {
     Degraded,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum SupervisorHealthReason {
+    RuntimeRecovery,
+    SelectionCompensation,
+    ConfigurationProjection,
+    ProbeScheduler,
+    SelectionRestoration,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoreLifecycle {
     Unconfigured,
@@ -359,6 +368,7 @@ pub struct SupervisorStatus {
     pub lifecycle: SupervisorLifecycle,
     pub started_at_unix_ms: u64,
     pub uptime_seconds: u64,
+    pub health_reasons: Vec<SupervisorHealthReason>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

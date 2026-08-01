@@ -72,6 +72,7 @@ impl ApplicationService {
                 lifecycle: SupervisorLifecycle::Ready,
                 started_at_unix_ms: self.started_at_unix_ms,
                 uptime_seconds,
+                health_reasons: Vec::new(),
             },
             core: CoreStatus {
                 lifecycle: CoreLifecycle::Unconfigured,

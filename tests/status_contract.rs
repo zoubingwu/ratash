@@ -3,7 +3,7 @@ use hopash::contract::{JsonEnvelope, StatusViewV1};
 use hopash::domain::{
     ApplyState, CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus, RuntimeApplyPhase,
     RuntimeApplySnapshot, RuntimeGeneration, RuntimeRecoverySnapshot, RuntimeRecoveryStatus,
-    SupervisorLifecycle,
+    SupervisorHealthReason, SupervisorLifecycle,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -49,7 +49,8 @@ fn zero_profile_status_serializes_the_complete_v1_contract() {
                 "supervisor": {
                     "lifecycle": "ready",
                     "started_at_unix_ms": "1785513600000",
-                    "uptime_seconds": 42
+                    "uptime_seconds": 42,
+                    "health_reasons": []
                 },
                 "core": {
                     "lifecycle": "unconfigured",
@@ -93,6 +94,33 @@ fn zero_profile_status_serializes_the_complete_v1_contract() {
                 }
             }
         })
+    );
+}
+
+#[test]
+fn supervisor_health_reasons_serialize_in_stable_cause_order() {
+    let mut status = ApplicationService::new().status();
+    status.supervisor.lifecycle = SupervisorLifecycle::Degraded;
+    status.supervisor.health_reasons = vec![
+        SupervisorHealthReason::RuntimeRecovery,
+        SupervisorHealthReason::SelectionCompensation,
+        SupervisorHealthReason::ConfigurationProjection,
+        SupervisorHealthReason::ProbeScheduler,
+        SupervisorHealthReason::SelectionRestoration,
+    ];
+
+    let value = serde_json::to_value(StatusViewV1::from(status))
+        .expect("Supervisor health reasons should serialize");
+
+    assert_eq!(
+        value["supervisor"]["health_reasons"],
+        json!([
+            "runtime_recovery",
+            "selection_compensation",
+            "configuration_projection",
+            "probe_scheduler",
+            "selection_restoration"
+        ])
     );
 }
 

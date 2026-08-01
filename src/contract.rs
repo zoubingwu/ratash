@@ -7,8 +7,8 @@ use crate::domain::{
     ActiveProfileSummary, ApplyState, CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus,
     CoreStatus, LatencySample, ProbeQueueStatus, RuntimeApplyPhase, RuntimeApplySnapshot,
     RuntimeRecoverySnapshot, RuntimeRecoveryStatus, SampleState, SelectedNodeSummary,
-    StatusSnapshot, StreamHealthSet, StreamState, SupervisorLifecycle, SupervisorStatus,
-    TrafficSample, TunReason, TunStatus,
+    StatusSnapshot, StreamHealthSet, StreamState, SupervisorHealthReason, SupervisorLifecycle,
+    SupervisorStatus, TrafficSample, TunReason, TunStatus,
 };
 
 pub const SCHEMA_VERSION: u16 = 1;
@@ -1061,14 +1061,41 @@ pub struct SupervisorViewV1 {
     pub lifecycle: SupervisorLifecycleViewV1,
     pub started_at_unix_ms: String,
     pub uptime_seconds: u64,
+    pub health_reasons: Vec<SupervisorHealthReasonViewV1>,
 }
 
 impl From<SupervisorStatus> for SupervisorViewV1 {
     fn from(status: SupervisorStatus) -> Self {
+        let mut health_reasons = status.health_reasons;
+        health_reasons.sort_unstable();
+        health_reasons.dedup();
         Self {
             lifecycle: status.lifecycle.into(),
             started_at_unix_ms: status.started_at_unix_ms.to_string(),
             uptime_seconds: status.uptime_seconds,
+            health_reasons: health_reasons.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorHealthReasonViewV1 {
+    RuntimeRecovery,
+    SelectionCompensation,
+    ConfigurationProjection,
+    ProbeScheduler,
+    SelectionRestoration,
+}
+
+impl From<SupervisorHealthReason> for SupervisorHealthReasonViewV1 {
+    fn from(reason: SupervisorHealthReason) -> Self {
+        match reason {
+            SupervisorHealthReason::RuntimeRecovery => Self::RuntimeRecovery,
+            SupervisorHealthReason::SelectionCompensation => Self::SelectionCompensation,
+            SupervisorHealthReason::ConfigurationProjection => Self::ConfigurationProjection,
+            SupervisorHealthReason::ProbeScheduler => Self::ProbeScheduler,
+            SupervisorHealthReason::SelectionRestoration => Self::SelectionRestoration,
         }
     }
 }

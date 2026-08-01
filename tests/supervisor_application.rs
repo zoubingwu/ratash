@@ -11,7 +11,7 @@ use hopash::core::{
 };
 use hopash::domain::{
     ApplyState, CoreInstanceGeneration, NodeRecordId, ProxyGroupId, RuntimeApplyPhase,
-    RuntimeGeneration, RuntimeRecoveryStatus, StreamState, SubscriptionUrl,
+    RuntimeGeneration, RuntimeRecoveryStatus, StreamState, SubscriptionUrl, SupervisorHealthReason,
 };
 use hopash::state::{AuthoritativeState, AuthoritativeStateStore};
 use hopash::supervisor::{
@@ -1027,6 +1027,7 @@ fn status_projects_core_restart_degradation_and_tun_capability() {
         degraded.supervisor.lifecycle,
         hopash::domain::SupervisorLifecycle::Degraded
     );
+    assert!(degraded.supervisor.health_reasons.is_empty());
     assert_eq!(
         degraded.core.lifecycle,
         hopash::domain::CoreLifecycle::Degraded
@@ -1085,6 +1086,7 @@ fn runtime_status_failure_is_publicly_degraded() {
         status.supervisor.lifecycle,
         hopash::domain::SupervisorLifecycle::Degraded
     );
+    assert!(status.supervisor.health_reasons.is_empty());
     assert_eq!(
         status.core.lifecycle,
         hopash::domain::CoreLifecycle::Degraded
@@ -1208,6 +1210,35 @@ fn first_profile_add_commits_rules_runtime_probes_and_reopens_from_persistence()
         Some(RuntimeGeneration(2))
     );
     assert_eq!(harness.transactions.apply_count.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn startup_apply_exposes_pending_runtime_recovery_health() {
+    let harness = Harness::new("startup-recovery-health");
+    harness.queue_profile("Primary", "node-a");
+    let supervisor = harness.open();
+    add_profile(&supervisor, "https://example.test/primary.yaml");
+    drop(supervisor);
+    *harness
+        .transactions
+        .next_success_recovery
+        .lock()
+        .expect("the success recovery lock") = Some(TransactionRecoveryOutcome::Pending {
+        target: Some(RuntimeGeneration(1)),
+    });
+
+    let reopened = harness.open();
+    let status = get_status(&reopened);
+
+    assert_eq!(
+        status.supervisor.lifecycle,
+        hopash::domain::SupervisorLifecycle::Degraded
+    );
+    assert_eq!(
+        status.supervisor.health_reasons,
+        [SupervisorHealthReason::RuntimeRecovery]
+    );
+    assert_eq!(status.runtime_apply.phase, RuntimeApplyPhase::Recovering);
 }
 
 #[test]
@@ -1462,6 +1493,10 @@ fn committed_apply_with_pending_cleanup_swaps_state_and_reports_degraded_recover
         status.supervisor.lifecycle,
         hopash::domain::SupervisorLifecycle::Degraded
     );
+    assert_eq!(
+        status.supervisor.health_reasons,
+        [SupervisorHealthReason::RuntimeRecovery]
+    );
     assert_eq!(status.runtime_generation, Some(RuntimeGeneration(1)));
     assert_eq!(status.apply_state, ApplyState::Recovering);
     assert_eq!(status.runtime_apply.phase, RuntimeApplyPhase::Recovering);
@@ -1524,6 +1559,10 @@ fn failed_runtime_recovery_marks_the_supervisor_degraded_and_retains_rules() {
         status.supervisor.lifecycle,
         hopash::domain::SupervisorLifecycle::Degraded
     );
+    assert_eq!(
+        status.supervisor.health_reasons,
+        [SupervisorHealthReason::RuntimeRecovery]
+    );
     assert_eq!(status.core.lifecycle, hopash::domain::CoreLifecycle::Ready);
     assert!(status.tun.effective);
     assert_eq!(status.runtime_generation, Some(RuntimeGeneration(1)));
@@ -1570,6 +1609,11 @@ fn failed_runtime_recovery_marks_the_supervisor_degraded_and_retains_rules() {
         recovered_status.runtime_apply.recovery.status,
         RuntimeRecoveryStatus::NotRequired
     );
+    assert_eq!(
+        recovered_status.supervisor.lifecycle,
+        hopash::domain::SupervisorLifecycle::Ready
+    );
+    assert!(recovered_status.supervisor.health_reasons.is_empty());
 }
 
 #[test]
@@ -1649,6 +1693,22 @@ fn oversized_active_node_set_deactivates_probes_and_marks_degraded_state() {
         status.supervisor.lifecycle,
         hopash::domain::SupervisorLifecycle::Degraded
     );
+    assert_eq!(
+        status.supervisor.health_reasons,
+        [SupervisorHealthReason::ProbeScheduler]
+    );
+
+    harness.core.state.lock().expect("the Core lock").view = fixture_proxy_view();
+    supervisor
+        .reconcile_runtime_state()
+        .expect("a valid Node set should reseed probes");
+    let recovered = get_status(&supervisor);
+    assert_eq!(
+        recovered.supervisor.lifecycle,
+        hopash::domain::SupervisorLifecycle::Ready
+    );
+    assert!(recovered.supervisor.health_reasons.is_empty());
+    assert_eq!(recovered.probe_queue.active_node_count, 1);
 }
 
 #[test]
@@ -1945,7 +2005,7 @@ fn unresolved_selection_restoration_has_a_fixed_retry_limit() {
             .retry_selection_restore()
             .expect("a bounded restore attempt should complete");
     }
-    assert!(complete);
+    assert!(!complete);
 
     let ApplicationOutput::Status(status) = supervisor
         .execute(ApplicationOperation::GetStatus)
@@ -1957,7 +2017,24 @@ fn unresolved_selection_restoration_has_a_fixed_retry_limit() {
         status.supervisor.lifecycle,
         hopash::domain::SupervisorLifecycle::Degraded
     );
+    assert_eq!(
+        status.supervisor.health_reasons,
+        [SupervisorHealthReason::SelectionRestoration]
+    );
     assert!(!status.selection_restore_pending);
+
+    harness.core.state.lock().expect("the Core lock").view = two_node_proxy_view();
+    assert!(
+        supervisor
+            .retry_selection_restore()
+            .expect("an explicit retry should restore the saved selection")
+    );
+    let recovered = get_status(&supervisor);
+    assert_eq!(
+        recovered.supervisor.lifecycle,
+        hopash::domain::SupervisorLifecycle::Ready
+    );
+    assert!(recovered.supervisor.health_reasons.is_empty());
 }
 
 #[test]
@@ -2062,6 +2139,40 @@ fn proxy_selection_persists_after_core_success_and_compensates_on_failure() {
             .collect::<Vec<_>>(),
         vec!["node-b", "node-a"]
     );
+    drop(core);
+    assert!(get_status(&supervisor).supervisor.health_reasons.is_empty());
+
+    {
+        let mut core = harness.core.state.lock().expect("the Core lock");
+        core.fail_selection_call = Some(core.selections.len() + 2);
+    }
+    harness
+        .transactions
+        .fail_next_metadata
+        .store(true, Ordering::Relaxed);
+    supervisor
+        .execute(ApplicationOperation::ProxySelect {
+            group: "Main".to_owned(),
+            node: NodeRecordId::for_core("node-a").as_str().to_owned(),
+        })
+        .expect_err("failed persistence compensation should surface an error");
+    let degraded = get_status(&supervisor);
+    assert_eq!(
+        degraded.supervisor.lifecycle,
+        hopash::domain::SupervisorLifecycle::Degraded
+    );
+    assert_eq!(
+        degraded.supervisor.health_reasons,
+        [SupervisorHealthReason::SelectionCompensation]
+    );
+
+    supervisor
+        .execute(ApplicationOperation::ProxySelect {
+            group: "Main".to_owned(),
+            node: NodeRecordId::for_core("node-b").as_str().to_owned(),
+        })
+        .expect("a persisted selection should settle compensation health");
+    assert!(get_status(&supervisor).supervisor.health_reasons.is_empty());
 }
 
 #[test]
