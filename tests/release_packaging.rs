@@ -5,13 +5,89 @@ use hopash::constants::{
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const PRODUCT_CONTRACT: &str = include_str!("../fixtures/release/product-contract-v1.json");
 const PACKAGE_CONTRACT: &str = include_str!("../packaging/macos/package-contract-v1.json");
 const BENCHMARK_METADATA: &str = include_str!("../fixtures/release/benchmark-metadata-v1.json");
+
+#[test]
+fn geodata_manifest_pins_immutable_core_assets_and_source() {
+    let manifest: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(project_path(
+            "fixtures/mihomo/v1.19.28/geodata-manifest.json",
+        ))
+        .expect("Geo data manifest should be readable"),
+    )
+    .expect("Geo data manifest should be valid JSON");
+
+    assert_eq!(manifest["schema_version"], 1);
+    assert_eq!(manifest["core_version"], "v1.19.28");
+    assert_eq!(
+        manifest["repository"],
+        "https://github.com/MetaCubeX/meta-rules-dat"
+    );
+    assert_eq!(
+        manifest["asset_commit"],
+        "1567448176a3b6b56661a93b96d1e1c4c10bf2f9"
+    );
+    assert_eq!(
+        manifest["source_commit"],
+        "4178770badecb1b349fbcd62c737e0d7a2079729"
+    );
+    assert_eq!(manifest["repository_license"], "GPL-3.0-only");
+    assert_eq!(
+        manifest["assets"],
+        serde_json::json!([
+            {
+                "file_name": "ASN.mmdb",
+                "source_name": "GeoLite2-ASN.mmdb",
+                "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/1567448176a3b6b56661a93b96d1e1c4c10bf2f9/GeoLite2-ASN.mmdb",
+                "size": 12_059_794,
+                "sha256": "0f7e30ae5c234389ff3d0221ab311b4a6688817dd62d43d2f8cccd5935118124"
+            },
+            {
+                "file_name": "Country.mmdb",
+                "source_name": "country.mmdb",
+                "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/1567448176a3b6b56661a93b96d1e1c4c10bf2f9/country.mmdb",
+                "size": 7_903_639,
+                "sha256": "80a846466123b76373bb2e9da1d27708a0c87e795d4650f60f82c7d179c8c9d0"
+            },
+            {
+                "file_name": "GeoIP.dat",
+                "source_name": "geoip.dat",
+                "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/1567448176a3b6b56661a93b96d1e1c4c10bf2f9/geoip.dat",
+                "size": 17_483_060,
+                "sha256": "6ba63d75f307d16a81ae09406ddcf2779fa75cb642d4aae59613370d62d33509"
+            },
+            {
+                "file_name": "GeoSite.dat",
+                "source_name": "geosite.dat",
+                "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/1567448176a3b6b56661a93b96d1e1c4c10bf2f9/geosite.dat",
+                "size": 4_238_038,
+                "sha256": "ebe025201883b095a62c4b2d72e1477ec4f14a5afba132f1effe7651cb4921cf"
+            }
+        ])
+    );
+
+    let notice = fs::read_to_string(project_path("packaging/macos/GeoData-NOTICE.txt"))
+        .expect("Geo data notice should be readable");
+    for required in [
+        "GPL-3.0-only",
+        "1567448176a3b6b56661a93b96d1e1c4c10bf2f9",
+        "4178770badecb1b349fbcd62c737e0d7a2079729",
+        "MetaCubeX-meta-rules-dat-GPL-3.0.txt",
+        "This product includes GeoLite Data created by MaxMind",
+        "https://www.maxmind.com/en/geolite/eula",
+    ] {
+        assert!(
+            notice.contains(required),
+            "Geo data notice is missing {required}"
+        );
+    }
+}
 
 #[test]
 fn release_contract_pins_both_macos_installers_and_core_artifacts() {
@@ -31,6 +107,18 @@ fn release_contract_pins_both_macos_installers_and_core_artifacts() {
     assert_eq!(
         package["paths"]["service_socket"],
         "/var/run/hopash-rs/core-service.sock"
+    );
+    assert_eq!(
+        package["paths"]["geodata"],
+        "/Library/Application Support/Hopash RS/share/geodata"
+    );
+    assert_eq!(
+        package["geodata"]["manifest"],
+        "/usr/local/share/hopash/release/geodata-manifest.json"
+    );
+    assert_eq!(
+        package["geodata"]["files"],
+        serde_json::json!(["ASN.mmdb", "Country.mmdb", "GeoIP.dat", "GeoSite.dat"])
     );
     assert_eq!(package["internal_service"]["mode"], "__core-service");
     assert_eq!(
@@ -73,6 +161,7 @@ fn package_staging_contains_the_complete_installation_contract() {
     let hopash = fixture.path.join("hopash");
     let mihomo = fixture.path.join("mihomo");
     let mihomo_license = fixture.path.join("Mihomo-GPL-3.0.txt");
+    let geodata = write_geodata_fixture(&fixture.path);
     fs::write(&hopash, b"fixture hopash executable")
         .expect("fixture Hopash executable should be written");
     fs::write(&mihomo, b"fixture Mihomo executable")
@@ -84,7 +173,8 @@ fn package_staging_contains_the_complete_installation_contract() {
     let stage = fixture.path.join("stage");
     let digest = hex_digest(&fs::read(&mihomo).expect("fixture Mihomo should be readable"));
 
-    let output = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg(project_path("scripts/package-macos.sh"))
         .args(["--version", "0.1.0"])
         .args(["--target", "aarch64-apple-darwin"])
@@ -94,7 +184,9 @@ fn package_staging_contains_the_complete_installation_contract() {
         .arg(&mihomo)
         .args(["--mihomo-sha256", &digest])
         .arg("--mihomo-license")
-        .arg(&mihomo_license)
+        .arg(&mihomo_license);
+    add_geodata_arguments(&mut command, &geodata);
+    let output = command
         .arg("--stage-only")
         .arg(&stage)
         .output()
@@ -127,13 +219,31 @@ fn package_staging_contains_the_complete_installation_contract() {
         "payload/usr/local/share/hopash/release/product-contract-v1.json",
         "payload/usr/local/share/hopash/release/benchmark-metadata-v1.json",
         "payload/usr/local/share/hopash/release/package-contract-v1.json",
+        "payload/usr/local/share/hopash/release/geodata-manifest.json",
         "payload/usr/local/share/hopash/licenses/Mihomo-GPL-3.0.txt",
         "payload/usr/local/share/hopash/licenses/Mihomo-NOTICE.txt",
+        "payload/usr/local/share/hopash/licenses/MetaCubeX-meta-rules-dat-GPL-3.0.txt",
+        "payload/usr/local/share/hopash/licenses/GeoData-NOTICE.txt",
+        "payload/Library/Application Support/Hopash RS/share/geodata/ASN.mmdb",
+        "payload/Library/Application Support/Hopash RS/share/geodata/Country.mmdb",
+        "payload/Library/Application Support/Hopash RS/share/geodata/GeoIP.dat",
+        "payload/Library/Application Support/Hopash RS/share/geodata/GeoSite.dat",
         "payload/Library/LaunchDaemons/io.hopash.core-runtime.plist",
         "scripts/postinstall",
     ] {
         let path = stage.join(asset);
         assert!(path.is_file(), "missing {}", path.display());
+        let expected_mode = if asset == "scripts/postinstall" {
+            0o755
+        } else {
+            0o644
+        };
+        assert_eq!(
+            mode(&path),
+            expected_mode,
+            "unexpected mode for {}",
+            path.display()
+        );
     }
 
     let plist = fs::read_to_string(
@@ -158,6 +268,78 @@ fn package_staging_contains_the_complete_installation_contract() {
 }
 
 #[test]
+fn package_builder_rejects_missing_symlinked_and_changed_geodata_assets() {
+    let fixture = TempDirectory::new("package-geodata-verification");
+    let hopash = fixture.path.join("hopash");
+    let mihomo = fixture.path.join("mihomo");
+    let mihomo_license = fixture.path.join("Mihomo-GPL-3.0.txt");
+    let geodata = write_geodata_fixture(&fixture.path);
+    fs::write(&hopash, b"fixture hopash executable")
+        .expect("fixture Hopash executable should be written");
+    fs::write(&mihomo, b"fixture Mihomo executable")
+        .expect("fixture Mihomo executable should be written");
+    fs::write(&mihomo_license, b"fixture GPL-3.0 license")
+        .expect("fixture Mihomo license should be written");
+    let mihomo_digest = hex_digest(&fs::read(&mihomo).expect("fixture Mihomo should be readable"));
+    let run_builder = |allow_custom_manifest: bool| {
+        let mut command = Command::new("sh");
+        command
+            .arg(project_path("scripts/package-macos.sh"))
+            .args(["--version", "0.1.0"])
+            .args(["--target", "aarch64-apple-darwin"])
+            .arg("--hopash")
+            .arg(&hopash)
+            .arg("--mihomo")
+            .arg(&mihomo)
+            .args(["--mihomo-sha256", &mihomo_digest])
+            .arg("--mihomo-license")
+            .arg(&mihomo_license);
+        add_geodata_arguments(&mut command, &geodata);
+        if !allow_custom_manifest {
+            command.env_remove("HOPASH_TEST_ALLOW_CUSTOM_GEODATA_MANIFEST");
+        }
+        command
+            .arg("--stage-only")
+            .arg(fixture.path.join("rejected-stage"))
+            .output()
+            .expect("package validation command should run")
+    };
+
+    let mismatched_manifest = run_builder(false);
+    assert_eq!(mismatched_manifest.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&mismatched_manifest.stderr)
+            .contains("Geo data manifest identity does not match the bundled catalog")
+    );
+
+    let country = geodata.directory.join("Country.mmdb");
+    let original_country = fs::read(&country).expect("fixture Country database should be readable");
+    let mut changed_country = original_country.clone();
+    changed_country[0] ^= 0xff;
+    fs::write(&country, changed_country).expect("changed Country database should be written");
+    let changed = run_builder(true);
+    assert_eq!(changed.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&changed.stderr)
+            .contains("Country.mmdb failed SHA-256 verification")
+    );
+
+    fs::write(&country, original_country).expect("fixture Country database should be restored");
+    let geoip = geodata.directory.join("GeoIP.dat");
+    let geoip_target = fixture.path.join("GeoIP.dat.target");
+    fs::rename(&geoip, &geoip_target).expect("fixture GeoIP database should move");
+    symlink(&geoip_target, &geoip).expect("fixture GeoIP symlink should be created");
+    let symlinked = run_builder(true);
+    assert_eq!(symlinked.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&symlinked.stderr).contains("GeoIP.dat is unavailable"));
+
+    fs::remove_file(&geoip).expect("fixture GeoIP symlink should be removed");
+    let missing = run_builder(true);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("GeoIP.dat is unavailable"));
+}
+
+#[test]
 fn postinstall_waits_for_a_booted_out_service_before_bootstrap() {
     let script = fs::read_to_string(project_path("packaging/macos/scripts/postinstall"))
         .expect("postinstall should be readable");
@@ -175,15 +357,23 @@ fn postinstall_waits_for_a_booted_out_service_before_bootstrap() {
     assert!(script.contains("SERVICE_REMOVAL_ATTEMPTS=600"));
     assert!(script.contains("/bin/sleep 0.1"));
     assert!(script.contains("timed out waiting for the previous Core service to stop"));
+    assert!(script.contains("GEODATA_ROOT=\"$SERVICE_ROOT/share/geodata\""));
+    assert!(script.contains(
+        "/bin/chmod 0644 \"$GEODATA_ROOT/ASN.mmdb\" \"$GEODATA_ROOT/Country.mmdb\" \"$GEODATA_ROOT/GeoIP.dat\" \"$GEODATA_ROOT/GeoSite.dat\""
+    ));
+
+    let uninstaller = fs::read_to_string(project_path("packaging/macos/uninstall.sh"))
+        .expect("uninstaller should be readable");
+    assert!(uninstaller.contains("'/Library/Application Support/Hopash RS'"));
 }
 
-#[cfg(target_os = "macos")]
 #[test]
-fn package_builder_emits_a_verifiable_macos_installer_without_installing_it() {
+fn package_builder_rejects_a_custom_manifest_for_installable_output() {
     let fixture = TempDirectory::new("package-build");
     let hopash = fixture.path.join("hopash");
     let mihomo = fixture.path.join("mihomo");
     let mihomo_license = fixture.path.join("Mihomo-GPL-3.0.txt");
+    let geodata = write_geodata_fixture(&fixture.path);
     fs::write(&hopash, b"#!/bin/sh\nexit 0\n").expect("fixture Hopash should be written");
     fs::write(&mihomo, b"#!/bin/sh\nexit 0\n").expect("fixture Mihomo should be written");
     fs::write(&mihomo_license, b"fixture GPL-3.0 license")
@@ -193,7 +383,8 @@ fn package_builder_emits_a_verifiable_macos_installer_without_installing_it() {
     let digest = hex_digest(&fs::read(&mihomo).expect("fixture Mihomo should be readable"));
     let output_directory = fixture.path.join("dist");
 
-    let output = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg(project_path("scripts/package-macos.sh"))
         .args(["--version", "0.1.0"])
         .args(["--target", "aarch64-apple-darwin"])
@@ -203,48 +394,19 @@ fn package_builder_emits_a_verifiable_macos_installer_without_installing_it() {
         .arg(&mihomo)
         .args(["--mihomo-sha256", &digest])
         .arg("--mihomo-license")
-        .arg(&mihomo_license)
+        .arg(&mihomo_license);
+    add_geodata_arguments(&mut command, &geodata);
+    let output = command
         .arg("--output")
         .arg(&output_directory)
         .output()
         .expect("package build command should run");
+    assert_eq!(output.status.code(), Some(1));
     assert!(
-        output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+            .contains("Custom Geo data manifests are restricted to unsigned test staging")
     );
-
-    let package = output_directory.join("hopash-0.1.0-aarch64-apple-darwin.pkg");
-    let checksum = output_directory.join("hopash-0.1.0-aarch64-apple-darwin.pkg.sha256");
-    assert!(package.is_file());
-    assert!(checksum.is_file());
-    let checksum_result = Command::new("/usr/bin/shasum")
-        .current_dir(&output_directory)
-        .args(["-a", "256", "-c"])
-        .arg(checksum.file_name().expect("checksum should have a name"))
-        .output()
-        .expect("checksum verification should run");
-    assert!(checksum_result.status.success());
-
-    let payload = Command::new("/usr/sbin/pkgutil")
-        .arg("--payload-files")
-        .arg(package)
-        .output()
-        .expect("package payload inspection should run");
-    assert!(payload.status.success());
-    let payload = String::from_utf8_lossy(&payload.stdout);
-    for required in [
-        "usr/local/bin/hopash",
-        "Library/PrivilegedHelperTools/io.hopash.core-runtime",
-        "Library/Application Support/Hopash RS/bin/mihomo",
-        "usr/local/share/man/man1/hopash-profile-add.1",
-    ] {
-        assert!(
-            payload.contains(required),
-            "package payload is missing {required}"
-        );
-    }
+    assert!(!output_directory.exists());
 }
 
 #[test]
@@ -429,6 +591,7 @@ fn package_scripts_are_valid_posix_shell() {
     for script in [
         "scripts/package-macos.sh",
         "scripts/package-local-macos.sh",
+        "scripts/validate-pinned-mihomo-geodata.sh",
         "scripts/capture-release-benchmarks-macos.sh",
         "scripts/macos-release-resource-probe.sh",
         "packaging/macos/scripts/postinstall",
@@ -445,6 +608,73 @@ fn package_scripts_are_valid_posix_shell() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[test]
+fn local_and_release_builds_verify_and_pass_pinned_geodata() {
+    let local = fs::read_to_string(project_path("scripts/package-local-macos.sh"))
+        .expect("local package script should be readable");
+    for required in [
+        "fixtures/mihomo/v1.19.28/geodata-manifest.json",
+        ".assets[$index].url",
+        ".assets[$index].size",
+        ".assets[$index].sha256",
+        "failed size verification",
+        "failed SHA-256 verification",
+        "validate-pinned-mihomo-geodata.sh",
+        "--geodata-directory",
+        "--geodata-manifest",
+        "--geodata-license",
+    ] {
+        assert!(
+            local.contains(required),
+            "local package script is missing {required}"
+        );
+    }
+
+    let release = fs::read_to_string(project_path(".github/workflows/release.yml"))
+        .expect("release workflow should be readable");
+    for required in [
+        "Download and verify the pinned Geo data",
+        "Validate the pinned Geo data with Mihomo",
+        "./scripts/validate-pinned-mihomo-geodata.sh",
+        "fixtures/mihomo/v1.19.28/geodata-manifest.json",
+        "--geodata-directory",
+        "--geodata-manifest",
+        "--geodata-license",
+        "meta-rules-dat-$geodata_source_commit-source.tar.gz",
+        "dist/geodata-manifest.json",
+    ] {
+        assert!(
+            release.contains(required),
+            "release workflow is missing {required}"
+        );
+    }
+}
+
+#[test]
+fn pinned_geodata_acceptance_parses_both_mihomo_data_modes_from_symlinks() {
+    let script = fs::read_to_string(project_path("scripts/validate-pinned-mihomo-geodata.sh"))
+        .expect("Geo data acceptance script should be readable");
+
+    for required in [
+        "for asset in ASN.mmdb Country.mmdb GeoIP.dat GeoSite.dat",
+        "/bin/ln -s",
+        "geodata-mode: false",
+        "geodata-mode: true",
+        "GEOIP,CN,DIRECT",
+        "GEOSITE,CN,DIRECT",
+        "IP-ASN,13335,DIRECT",
+        "unset CLASH_AGE_SECRET_KEY",
+        "CLASH_CONFIG_STRING",
+        "SKIP_SAFE_PATH_CHECK",
+    ] {
+        assert!(
+            script.contains(required),
+            "Geo data acceptance script is missing {required}"
+        );
+    }
+    assert_eq!(script.matches("\"$mihomo\" -t").count(), 2);
 }
 
 #[test]
@@ -474,13 +704,15 @@ fn package_builder_rejects_partial_signing_configuration_before_staging() {
     let hopash = fixture.path.join("hopash");
     let mihomo = fixture.path.join("mihomo");
     let mihomo_license = fixture.path.join("Mihomo-GPL-3.0.txt");
+    let geodata = write_geodata_fixture(&fixture.path);
     fs::write(&hopash, b"fixture hopash").expect("fixture Hopash should be written");
     fs::write(&mihomo, b"fixture mihomo").expect("fixture Mihomo should be written");
     fs::write(&mihomo_license, b"fixture license")
         .expect("fixture Mihomo license should be written");
     let digest = hex_digest(&fs::read(&mihomo).expect("fixture Mihomo should be readable"));
 
-    let output = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg(project_path("scripts/package-macos.sh"))
         .args(["--version", "0.1.0"])
         .args(["--target", "aarch64-apple-darwin"])
@@ -490,7 +722,9 @@ fn package_builder_rejects_partial_signing_configuration_before_staging() {
         .arg(&mihomo)
         .args(["--mihomo-sha256", &digest])
         .arg("--mihomo-license")
-        .arg(&mihomo_license)
+        .arg(&mihomo_license);
+    add_geodata_arguments(&mut command, &geodata);
+    let output = command
         .args(["--application-identity", "fixture identity"])
         .arg("--stage-only")
         .arg(fixture.path.join("stage"))
@@ -562,6 +796,89 @@ fn hex_digest(content: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+struct GeodataFixture {
+    directory: PathBuf,
+    manifest: PathBuf,
+    license: PathBuf,
+}
+
+fn write_geodata_fixture(root: &Path) -> GeodataFixture {
+    let directory = root.join("geodata");
+    fs::create_dir(&directory).expect("fixture Geo data directory should be created");
+    let assets = [
+        (
+            "ASN.mmdb",
+            "GeoLite2-ASN.mmdb",
+            b"fixture ASN database".as_slice(),
+        ),
+        (
+            "Country.mmdb",
+            "country.mmdb",
+            b"fixture Country database".as_slice(),
+        ),
+        (
+            "GeoIP.dat",
+            "geoip.dat",
+            b"fixture GeoIP database".as_slice(),
+        ),
+        (
+            "GeoSite.dat",
+            "geosite.dat",
+            b"fixture GeoSite database".as_slice(),
+        ),
+    ];
+    let manifest_assets = assets
+        .into_iter()
+        .map(|(file_name, source_name, content)| {
+            fs::write(directory.join(file_name), content)
+                .expect("fixture Geo data asset should be written");
+            serde_json::json!({
+                "file_name": file_name,
+                "source_name": source_name,
+                "url": format!(
+                    "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/1567448176a3b6b56661a93b96d1e1c4c10bf2f9/{source_name}"
+                ),
+                "size": content.len(),
+                "sha256": hex_digest(content)
+            })
+        })
+        .collect::<Vec<_>>();
+    let manifest = root.join("geodata-manifest.json");
+    fs::write(
+        &manifest,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "core_version": "v1.19.28",
+            "repository": "https://github.com/MetaCubeX/meta-rules-dat",
+            "asset_commit": "1567448176a3b6b56661a93b96d1e1c4c10bf2f9",
+            "source_commit": "4178770badecb1b349fbcd62c737e0d7a2079729",
+            "repository_license": "GPL-3.0-only",
+            "assets": manifest_assets
+        }))
+        .expect("fixture Geo data manifest should serialize"),
+    )
+    .expect("fixture Geo data manifest should be written");
+    let license = root.join("MetaCubeX-meta-rules-dat-GPL-3.0.txt");
+    fs::write(&license, b"fixture GPL-3.0-only license")
+        .expect("fixture Geo data license should be written");
+    GeodataFixture {
+        directory,
+        manifest,
+        license,
+    }
+}
+
+fn add_geodata_arguments(command: &mut Command, fixture: &GeodataFixture) {
+    command
+        .env("HOPASH_TEST_ALLOW_CUSTOM_GEODATA_MANIFEST", "1")
+        .arg("--geodata-directory")
+        .arg(&fixture.directory)
+        .arg("--geodata-manifest")
+        .arg(&fixture.manifest)
+        .arg("--geodata-license")
+        .arg(&fixture.license);
 }
 
 struct TempDirectory {

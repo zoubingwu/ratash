@@ -21,6 +21,7 @@ use hopash::core_service_ipc::{
     CoreServiceServerConfig,
 };
 use hopash::domain::{CoreInstanceGeneration, RuntimeGeneration};
+use hopash::geodata::GeoDataCatalog;
 use hopash::ipc::{bind_private_listener, read_frame, write_frame};
 use sha2::{Digest, Sha256};
 
@@ -311,6 +312,21 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
+        Self::start_with_config(|_, config| config)
+    }
+
+    fn with_installed_geo_data(prepare: impl FnOnce(&Path)) -> Self {
+        Self::start_with_config(move |directory, config| {
+            let root = directory.path.join("installed-geodata");
+            let catalog = write_installed_geo_data(&root);
+            prepare(&root);
+            config.with_installed_geo_data(root, nix::unistd::geteuid().as_raw(), catalog)
+        })
+    }
+
+    fn start_with_config(
+        configure: impl FnOnce(&TestDirectory, CoreServiceServerConfig) -> CoreServiceServerConfig,
+    ) -> Self {
         let directory = TestDirectory::new();
         let service_root = directory.path.join("service-owned");
         fs::create_dir(&service_root).expect("the service root should be created");
@@ -318,12 +334,12 @@ impl Harness {
         let socket_path = directory.path.join("ipc/core-runtime.sock");
         let runtime = Arc::new(FakeRuntime::new(runtime_root.clone(), &service_root));
         let owner_uid = nix::unistd::geteuid().as_raw();
-        let server = CoreServiceServer::start(
-            &socket_path,
-            Arc::clone(&runtime),
+        let config = configure(
+            &directory,
             CoreServiceServerConfig::new(&runtime_root, owner_uid),
-        )
-        .expect("the Core service IPC server should start");
+        );
+        let server = CoreServiceServer::start(&socket_path, Arc::clone(&runtime), config)
+            .expect("the Core service IPC server should start");
         let client = CoreServiceClient::for_service_uid(
             &socket_path,
             nix::unistd::Uid::effective().as_raw(),
@@ -862,6 +878,237 @@ fn bundle_ingress_rejects_symlinked_provider_files_before_runtime_apply() {
 }
 
 #[test]
+fn bundle_ingress_copies_verified_installed_geo_data_into_the_generation() {
+    let harness = Harness::with_installed_geo_data(|_| {});
+    let session = harness
+        .client
+        .open_owner_session(&harness.owner_request())
+        .expect("the owner session should open");
+    let bundle = harness.source_bundle(12);
+
+    harness
+        .client
+        .apply_candidate(&session.proof, &bundle)
+        .expect("the candidate with installed Geo data should apply");
+
+    let staged_root = harness
+        .runtime
+        .state()
+        .staged_bundles
+        .get(&12)
+        .expect("the staged bundle should be recorded")
+        .generation_root
+        .clone();
+    for (file_name, _, content) in TEST_GEO_DATA {
+        let path = staged_root.join(file_name);
+        assert_eq!(
+            fs::read(&path).expect("the staged Geo-data asset should be readable"),
+            content
+        );
+        let metadata =
+            fs::symlink_metadata(path).expect("the staged Geo-data metadata should be readable");
+        assert!(metadata.is_file());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(metadata.mode() & 0o777, 0o400);
+    }
+
+    harness
+        .client
+        .apply_candidate(&session.proof, &bundle)
+        .expect("an intact existing generation should be reusable");
+    let country = staged_root.join("Country.mmdb");
+    fs::set_permissions(&country, fs::Permissions::from_mode(0o600))
+        .expect("the fixture Geo-data permissions should become writable");
+    fs::write(&country, vec![b'x'; TEST_GEO_DATA[1].2.len()])
+        .expect("the staged Geo-data fixture should be replaced");
+    fs::set_permissions(&country, fs::Permissions::from_mode(0o400))
+        .expect("the fixture Geo-data permissions should be restored");
+
+    harness
+        .client
+        .apply_candidate(&session.proof, &bundle)
+        .expect("a changed service-owned Geo-data asset should be repaired");
+
+    assert_eq!(
+        fs::read(country).expect("the repaired Geo-data asset should be readable"),
+        TEST_GEO_DATA[1].2
+    );
+}
+
+#[test]
+fn bundle_ingress_upgrades_a_pre_geodata_generation_and_cleans_interrupted_staging() {
+    let harness = Harness::with_installed_geo_data(|_| {});
+    let session = harness
+        .client
+        .open_owner_session(&harness.owner_request())
+        .expect("the owner session should open");
+    let bundle = harness.source_bundle(12);
+    let generation_root = write_legacy_service_generation(&harness.runtime_root, &bundle);
+    let preserved = [
+        "manifest.json",
+        "mihomo",
+        "config.yaml",
+        "providers/local.yaml",
+    ]
+    .map(|path| {
+        (
+            path,
+            fs::read(generation_root.join(path))
+                .expect("the legacy Runtime Generation file should be readable"),
+        )
+    });
+    let interrupted = generation_root.join(".hopash-geodata-Country.mmdb.pending");
+    fs::write(&interrupted, b"interrupted")
+        .expect("the interrupted Geo-data staging file should be written");
+    fs::set_permissions(&interrupted, fs::Permissions::from_mode(0o400))
+        .expect("the interrupted Geo-data staging mode should be private");
+
+    harness
+        .client
+        .apply_candidate(&session.proof, &bundle)
+        .expect("the legacy Runtime Generation should gain bundled Geo data");
+
+    for (path, expected) in preserved {
+        assert_eq!(
+            fs::read(generation_root.join(path))
+                .expect("the preserved Runtime Generation file should be readable"),
+            expected
+        );
+    }
+    for (file_name, _, content) in TEST_GEO_DATA {
+        let path = generation_root.join(file_name);
+        assert_eq!(
+            fs::read(&path).expect("the migrated Geo-data asset should be readable"),
+            content
+        );
+        assert_eq!(
+            fs::symlink_metadata(path)
+                .expect("the migrated Geo-data metadata should be readable")
+                .mode()
+                & 0o777,
+            0o400
+        );
+    }
+    assert!(!interrupted.exists());
+}
+
+#[test]
+fn bundle_ingress_rejects_an_unsafe_legacy_generation_root() {
+    let harness = Harness::with_installed_geo_data(|_| {});
+    let session = harness
+        .client
+        .open_owner_session(&harness.owner_request())
+        .expect("the owner session should open");
+    let bundle = harness.source_bundle(12);
+    let generation_root = write_legacy_service_generation(&harness.runtime_root, &bundle);
+    fs::set_permissions(&generation_root, fs::Permissions::from_mode(0o755))
+        .expect("the legacy Runtime Generation mode should be changed");
+
+    let error = harness
+        .client
+        .apply_candidate(&session.proof, &bundle)
+        .expect_err("an unsafe legacy Runtime Generation root should be rejected");
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::InvalidBundle);
+    assert_eq!(harness.runtime.state().apply_count, 0);
+    assert!(!generation_root.join("Country.mmdb").exists());
+}
+
+#[test]
+fn bundle_ingress_rejects_an_unsafe_legacy_geodata_destination() {
+    let harness = Harness::with_installed_geo_data(|_| {});
+    let session = harness
+        .client
+        .open_owner_session(&harness.owner_request())
+        .expect("the owner session should open");
+    let bundle = harness.source_bundle(12);
+    let generation_root = write_legacy_service_generation(&harness.runtime_root, &bundle);
+    let outside = harness.directory.path.join("outside-country.mmdb");
+    fs::write(&outside, TEST_GEO_DATA[1].2)
+        .expect("the outside Geo-data fixture should be written");
+    symlink(&outside, generation_root.join("Country.mmdb"))
+        .expect("the unsafe legacy Geo-data symlink should be created");
+
+    let error = harness
+        .client
+        .apply_candidate(&session.proof, &bundle)
+        .expect_err("an unsafe legacy Geo-data destination should be rejected");
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::InvalidBundle);
+    assert_eq!(harness.runtime.state().apply_count, 0);
+    assert!(
+        fs::symlink_metadata(generation_root.join("Country.mmdb"))
+            .expect("the unsafe legacy Geo-data destination should remain present")
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn bundle_ingress_rejects_a_missing_installed_geo_data_asset() {
+    let harness = Harness::with_installed_geo_data(|root| {
+        fs::remove_file(root.join("GeoIP.dat"))
+            .expect("the installed Geo-data fixture should be removed");
+    });
+    let session = harness
+        .client
+        .open_owner_session(&harness.owner_request())
+        .expect("the owner session should open");
+
+    let error = harness
+        .client
+        .apply_candidate(&session.proof, &harness.source_bundle(12))
+        .expect_err("a missing installed Geo-data asset should be rejected");
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::InvalidBundle);
+    assert_eq!(harness.runtime.state().apply_count, 0);
+}
+
+#[test]
+fn bundle_ingress_rejects_a_symlinked_installed_geo_data_asset() {
+    let harness = Harness::with_installed_geo_data(|root| {
+        let asset = root.join("GeoSite.dat");
+        let outside = root.with_file_name("outside-geosite.dat");
+        fs::write(&outside, TEST_GEO_DATA[3].2)
+            .expect("the outside Geo-data fixture should be written");
+        fs::remove_file(&asset).expect("the installed Geo-data fixture should be removed");
+        symlink(outside, asset).expect("the installed Geo-data symlink should be created");
+    });
+    let session = harness
+        .client
+        .open_owner_session(&harness.owner_request())
+        .expect("the owner session should open");
+
+    let error = harness
+        .client
+        .apply_candidate(&session.proof, &harness.source_bundle(12))
+        .expect_err("a symlinked installed Geo-data asset should be rejected");
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::InvalidBundle);
+    assert_eq!(harness.runtime.state().apply_count, 0);
+}
+
+#[test]
+fn bundle_ingress_rejects_an_installed_geo_data_digest_mismatch() {
+    let harness = Harness::with_installed_geo_data(|root| {
+        fs::write(root.join("GeoIP.dat"), vec![b'x'; TEST_GEO_DATA[2].2.len()])
+            .expect("the installed Geo-data fixture should be changed");
+    });
+    let session = harness
+        .client
+        .open_owner_session(&harness.owner_request())
+        .expect("the owner session should open");
+
+    let error = harness
+        .client
+        .apply_candidate(&session.proof, &harness.source_bundle(12))
+        .expect_err("an installed Geo-data digest mismatch should be rejected");
+
+    assert_eq!(error.kind, CoreRuntimeErrorKind::InvalidBundle);
+    assert_eq!(harness.runtime.state().apply_count, 0);
+}
+
+#[test]
 fn absolute_response_deadline_bounds_a_stalled_runtime_operation() {
     let harness = Harness::new();
     let session = harness
@@ -1326,6 +1573,74 @@ fn write_bundle(root: &Path, generation: RuntimeGeneration) -> RuntimeBundle {
             .expect("the binary digest should be a string")
             .to_owned(),
     }
+}
+
+fn write_legacy_service_generation(runtime_root: &Path, bundle: &RuntimeBundle) -> PathBuf {
+    let generation_root = runtime_root.join(format!("generation-{:020}", bundle.generation.0));
+    fs::create_dir_all(generation_root.join("providers"))
+        .expect("the legacy Runtime Generation directories should be created");
+    fs::set_permissions(&generation_root, fs::Permissions::from_mode(0o700))
+        .expect("the legacy Runtime Generation mode should be private");
+    fs::set_permissions(
+        generation_root.join("providers"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("the legacy provider directory mode should be private");
+    for (path, mode) in [
+        ("manifest.json", 0o400),
+        ("mihomo", 0o500),
+        ("config.yaml", 0o400),
+        ("providers/local.yaml", 0o400),
+    ] {
+        fs::copy(
+            bundle.generation_root.join(path),
+            generation_root.join(path),
+        )
+        .expect("the legacy Runtime Generation file should be copied");
+        fs::set_permissions(generation_root.join(path), fs::Permissions::from_mode(mode))
+            .expect("the legacy Runtime Generation file mode should be private");
+    }
+    generation_root
+}
+
+const TEST_GEO_DATA: [(&str, &str, &[u8]); 4] = [
+    ("ASN.mmdb", "GeoLite2-ASN.mmdb", b"fixture-asn-mmdb"),
+    ("Country.mmdb", "country.mmdb", b"fixture-country-mmdb"),
+    ("GeoIP.dat", "geoip.dat", b"fixture-geoip-dat"),
+    ("GeoSite.dat", "geosite.dat", b"fixture-geosite-dat"),
+];
+
+fn write_installed_geo_data(root: &Path) -> GeoDataCatalog {
+    fs::create_dir(root).expect("the installed Geo-data root should be created");
+    let asset_commit = "1111111111111111111111111111111111111111";
+    let source_commit = "2222222222222222222222222222222222222222";
+    let assets = TEST_GEO_DATA
+        .iter()
+        .map(|(file_name, source_name, content)| {
+            fs::write(root.join(file_name), content)
+                .expect("the installed Geo-data fixture should be written");
+            serde_json::json!({
+                "file_name": file_name,
+                "source_name": source_name,
+                "url": format!(
+                    "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/{asset_commit}/{source_name}"
+                ),
+                "size": content.len(),
+                "sha256": sha256(content),
+            })
+        })
+        .collect::<Vec<_>>();
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "core_version": "v1.19.28",
+        "repository": "https://github.com/MetaCubeX/meta-rules-dat",
+        "asset_commit": asset_commit,
+        "source_commit": source_commit,
+        "repository_license": "GPL-3.0-only",
+        "assets": assets,
+    });
+    GeoDataCatalog::from_manifest(&manifest.to_string())
+        .expect("the fixture Geo-data manifest should be valid")
 }
 
 fn service_generation_names(root: &Path) -> Vec<u64> {

@@ -54,6 +54,7 @@ use crate::daemon::{
 };
 use crate::domain::{CoreLifecycle, LocalRuleSetRevision, SupervisorLifecycle};
 use crate::error::ErrorCode;
+use crate::geodata::GeoDataCatalog;
 #[cfg(test)]
 use crate::ipc_runtime::IpcClient;
 use crate::ipc_runtime::{IpcServer, IpcServerConfig, IpcStreamBroker, SameUserPeerAuthorizer};
@@ -108,6 +109,7 @@ use foreground::expect_status;
 pub const INTERNAL_CORE_SERVICE_MODE: &str = "__core-service";
 pub const CORE_SERVICE_SOCKET_PATH: &str = "/var/run/hopash-rs/core-service.sock";
 pub const BUNDLED_MIHOMO_PATH: &str = "/Library/Application Support/Hopash RS/bin/mihomo";
+pub const BUNDLED_GEODATA_PATH: &str = "/Library/Application Support/Hopash RS/share/geodata";
 
 const INSTALLED_HOPASH_PATH: &str = "/usr/local/bin/hopash";
 pub const HOPASH_CODE_IDENTIFIER: &str = "hopash";
@@ -430,6 +432,7 @@ pub fn run_core_service(invocation: CoreServiceInvocation) -> io::Result<()> {
     }
     let peer_authorizer = Arc::new(InstalledHopashPeerAuthorizer::new()?);
     let compiler = ConfigCompiler::bundled().map_err(invalid_product_configuration)?;
+    let geodata = GeoDataCatalog::bundled().map_err(invalid_product_configuration)?;
     let compiler_policy_sha256 = compiler.compiler_policy_sha256().to_owned();
     let mihomo_binary_sha256 = verified_binary_sha256(&invocation.mihomo_binary)?;
     let runtime = Arc::new(
@@ -455,10 +458,12 @@ pub fn run_core_service(invocation: CoreServiceInvocation) -> io::Result<()> {
         )
         .map_err(|_| io::Error::other("the privileged Core service could not initialize"))?,
     );
+    let server_config = CoreServiceServerConfig::new(invocation.runtime_root, invocation.owner_uid)
+        .with_installed_geo_data(BUNDLED_GEODATA_PATH, 0, geodata);
     let mut server = CoreServiceServer::start_with_peer_authorizer(
         &invocation.socket_path,
         Arc::clone(&runtime),
-        CoreServiceServerConfig::new(invocation.runtime_root, invocation.owner_uid),
+        server_config,
         peer_authorizer,
     )?;
     let signal = ProcessSignalSource::new()
@@ -615,7 +620,12 @@ fn run_owned_supervisor(
     );
 
     let validator: Arc<dyn CoreConfigValidator + Send + Sync> = Arc::new(
-        MihomoCommandValidator::bundled(&mihomo_binary, &mihomo_binary_sha256).map_err(|_| {
+        MihomoCommandValidator::bundled(
+            &mihomo_binary,
+            &mihomo_binary_sha256,
+            BUNDLED_GEODATA_PATH,
+        )
+        .map_err(|_| {
             StartupError::new(
                 StartupStage::SupervisorInitialization,
                 StartupFailureCategory::Configuration,

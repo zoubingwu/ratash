@@ -15,6 +15,7 @@ use crate::constants::{
     MIHOMO_VALIDATION_TIMEOUT,
 };
 use crate::digest::is_lower_sha256_hex;
+use crate::geodata::{GeoDataCatalog, GeoDataError};
 use crate::mihomo_command::enforce_managed_runtime;
 
 #[derive(Clone)]
@@ -23,6 +24,13 @@ pub struct MihomoCommandValidator {
     expected_sha256: String,
     timeout: Duration,
     cancellation: Arc<AtomicBool>,
+    geodata: Option<ValidationGeoData>,
+}
+
+#[derive(Clone)]
+struct ValidationGeoData {
+    root: PathBuf,
+    catalog: GeoDataCatalog,
 }
 
 impl MihomoCommandValidator {
@@ -43,14 +51,34 @@ impl MihomoCommandValidator {
             expected_sha256,
             timeout,
             cancellation: Arc::new(AtomicBool::new(false)),
+            geodata: None,
         })
     }
 
     pub fn bundled(
         binary: impl Into<PathBuf>,
         expected_sha256: impl Into<String>,
+        geodata_root: impl Into<PathBuf>,
     ) -> Result<Self, MihomoValidationError> {
-        Self::new(binary, expected_sha256, MIHOMO_VALIDATION_TIMEOUT)
+        Self::new(binary, expected_sha256, MIHOMO_VALIDATION_TIMEOUT)?.with_geodata(
+            geodata_root,
+            GeoDataCatalog::bundled().map_err(map_geodata_error)?,
+        )
+    }
+
+    pub fn with_geodata(
+        mut self,
+        root: impl Into<PathBuf>,
+        catalog: GeoDataCatalog,
+    ) -> Result<Self, MihomoValidationError> {
+        let root = root.into();
+        if !root.is_absolute() {
+            return Err(MihomoValidationError::new(
+                MihomoValidationErrorKind::InvalidPolicy,
+            ));
+        }
+        self.geodata = Some(ValidationGeoData { root, catalog });
+        Ok(self)
     }
 
     pub fn validate_detailed(
@@ -70,6 +98,12 @@ impl MihomoCommandValidator {
         }
         let binary = self.verify_binary()?;
         let staging_root = verify_staging_root(staging_root)?;
+        if let Some(geodata) = &self.geodata {
+            geodata
+                .catalog
+                .stage_from(&geodata.root, &staging_root)
+                .map_err(map_geodata_error)?;
+        }
         let mut files = ValidationFiles::create(&staging_root, configuration.yaml().as_bytes())?;
         let stdout = files.stdout_file()?;
         let stderr = files.stderr_file()?;
@@ -167,6 +201,7 @@ impl fmt::Debug for MihomoCommandValidator {
             .field("binary", &"[REDACTED]")
             .field("expected_sha256", &"[REDACTED]")
             .field("timeout", &self.timeout)
+            .field("geodata", &self.geodata.as_ref().map(|_| "configured"))
             .finish()
     }
 }
@@ -322,6 +357,16 @@ fn map_output_error(error: io::Error) -> MihomoValidationError {
     MihomoValidationError::new(kind)
 }
 
+fn map_geodata_error(error: GeoDataError) -> MihomoValidationError {
+    let kind = match error {
+        GeoDataError::InvalidManifest => MihomoValidationErrorKind::InvalidPolicy,
+        GeoDataError::InvalidRoot | GeoDataError::InvalidAsset | GeoDataError::Io => {
+            MihomoValidationErrorKind::GeoDataUnavailable
+        }
+    };
+    MihomoValidationError::new(kind)
+}
+
 fn contains_fatal_marker(bytes: &[u8]) -> bool {
     let value = String::from_utf8_lossy(bytes).to_ascii_lowercase();
     value.contains("fatal") || value.contains("parse config error")
@@ -341,6 +386,7 @@ pub enum MihomoValidationErrorKind {
     BinaryIdentityMismatch,
     InvalidStagingRoot,
     ConfigurationTooLarge,
+    GeoDataUnavailable,
     StagingIo,
     SpawnFailed,
     WaitFailed,
@@ -390,6 +436,9 @@ impl fmt::Display for MihomoValidationError {
             }
             MihomoValidationErrorKind::ConfigurationTooLarge => {
                 "the Effective Configuration exceeds its size limit"
+            }
+            MihomoValidationErrorKind::GeoDataUnavailable => {
+                "the bundled Mihomo Geo data is unavailable or invalid"
             }
             MihomoValidationErrorKind::StagingIo => "Mihomo validation staging failed",
             MihomoValidationErrorKind::SpawnFailed => {

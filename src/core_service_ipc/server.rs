@@ -21,6 +21,7 @@ use crate::constants::{
 };
 use crate::core::{CoreRuntime, CoreRuntimeError, CoreRuntimeErrorKind, OwnerSessionProof};
 use crate::domain::RuntimeGeneration;
+use crate::geodata::GeoDataCatalog;
 use crate::ipc::{read_frame, write_frame};
 use crate::runtime_bundle::{
     RuntimeGenerationRetention, inspect_runtime_generations_with_reserved,
@@ -33,7 +34,7 @@ use super::authorization::{
     AcceptPeerIdentity, CoreServicePeerAuthorizer, CoreServicePeerIdentity, peer_identity,
 };
 use super::error::{authentication_error, protocol_error, safe_io_error, unavailable_error};
-use super::ingress::{BundleIngressError, stage_runtime_bundle};
+use super::ingress::{BundleIngressError, GeoDataIngress, stage_runtime_bundle};
 use super::socket::{SocketIdentity, bind_service_listener, cleanup_socket, prepare_runtime_root};
 use super::wire::{WireEmpty, WireOperation, WireRequest, WireResponse, WireSuccess};
 
@@ -63,6 +64,7 @@ pub struct CoreServiceServerConfig {
     pub io_timeout: Duration,
     pub worker_count: usize,
     pub pending_connection_capacity: usize,
+    installed_geo_data: Option<GeoDataIngress>,
 }
 
 impl CoreServiceServerConfig {
@@ -74,7 +76,23 @@ impl CoreServiceServerConfig {
             io_timeout: CORE_SERVICE_REQUEST_TIMEOUT,
             worker_count: DEFAULT_SERVER_WORKERS,
             pending_connection_capacity: DEFAULT_PENDING_CONNECTIONS,
+            installed_geo_data: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_installed_geo_data(
+        mut self,
+        root: impl Into<PathBuf>,
+        expected_owner_uid: u32,
+        catalog: GeoDataCatalog,
+    ) -> Self {
+        self.installed_geo_data = Some(GeoDataIngress::new(
+            root.into(),
+            expected_owner_uid,
+            catalog,
+        ));
+        self
     }
 }
 
@@ -90,6 +108,7 @@ impl fmt::Debug for CoreServiceServerConfig {
                 "pending_connection_capacity",
                 &self.pending_connection_capacity,
             )
+            .field("installed_geo_data", &self.installed_geo_data.is_some())
             .finish()
     }
 }
@@ -157,6 +176,7 @@ impl CoreServiceServer {
         let context = Arc::new(ServerContext {
             runtime,
             runtime_staging_root,
+            installed_geo_data: config.installed_geo_data.clone(),
             runtime_retention: Mutex::new(runtime_retention),
             session: Mutex::new(None),
         });
@@ -242,6 +262,7 @@ impl Drop for CoreServiceServer {
 struct ServerContext {
     runtime: Arc<dyn CoreRuntime>,
     runtime_staging_root: PathBuf,
+    installed_geo_data: Option<GeoDataIngress>,
     runtime_retention: Mutex<ServiceRuntimeRetention>,
     session: Mutex<Option<BoundSession>>,
 }
@@ -337,6 +358,10 @@ struct AcceptedConnection {
 
 fn validate_server_config(config: &CoreServiceServerConfig) -> io::Result<()> {
     if !config.runtime_staging_root.is_absolute()
+        || config
+            .installed_geo_data
+            .as_ref()
+            .is_some_and(|geo_data| !geo_data.root().is_absolute())
         || config.io_timeout.is_zero()
         || config.worker_count == 0
         || config.pending_connection_capacity == 0
@@ -610,7 +635,12 @@ fn dispatch(
             let planned = retention
                 .plan(bundle.generation)
                 .map_err(|error| error.into_core())?;
-            let staged = stage_runtime_bundle(&context.runtime_staging_root, peer.uid(), &bundle)?;
+            let staged = stage_runtime_bundle(
+                &context.runtime_staging_root,
+                peer.uid(),
+                &bundle,
+                context.installed_geo_data.as_ref(),
+            )?;
             prune_runtime_generations_with_reserved(
                 &context.runtime_staging_root,
                 planned.into(),

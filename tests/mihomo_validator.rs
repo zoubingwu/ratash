@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use hopash::config::{AuthoritativeConfig, ConfigCompiler, CoreConfigValidator};
+use hopash::geodata::GeoDataCatalog;
 use hopash::profile::{ProfileSnapshot, SnapshotLimits};
 use hopash::validator::{MihomoCommandValidator, MihomoValidationErrorKind};
 use sha2::{Digest, Sha256};
@@ -74,6 +75,77 @@ exit 0
             .mode()
             & 0o777,
         0o700
+    );
+}
+
+#[test]
+fn configured_geodata_is_verified_and_staged_before_core_validation() {
+    let directory = TestDirectory::new("geodata");
+    let binary = fixture_binary(
+        &directory.path,
+        "validator",
+        r#"#!/bin/sh
+test -f "$3/Country.mmdb" || exit 65
+test -f "$3/GeoIP.dat" || exit 65
+test -f "$3/GeoSite.dat" || exit 65
+test -f "$3/ASN.mmdb" || exit 65
+exit 0
+"#,
+    );
+    let source = directory.path.join("source");
+    let staging = directory.path.join("staging");
+    fs::create_dir(&source).expect("Geo-data source should be created");
+    fs::create_dir(&staging).expect("staging directory should be created");
+    let catalog = fixture_geodata_catalog(&source);
+    let interrupted = staging.join(".hopash-geodata-ASN.mmdb.pending");
+    symlink(source.join("ASN.mmdb"), &interrupted)
+        .expect("an interrupted Geo-data link should be staged");
+    let effective = effective_configuration(&staging, "MATCH,DIRECT");
+    let validator = validator(&binary, Duration::from_secs(5))
+        .with_geodata(&source, catalog)
+        .expect("the Geo-data policy should be valid");
+
+    validator
+        .validate_detailed(&effective, &staging)
+        .expect("the staged Geo data should reach Core validation");
+
+    for file_name in ["ASN.mmdb", "Country.mmdb", "GeoIP.dat", "GeoSite.dat"] {
+        let path = staging.join(file_name);
+        let metadata = fs::symlink_metadata(&path).expect("the staged Geo-data asset should exist");
+        assert!(metadata.file_type().is_symlink());
+        assert!(
+            fs::metadata(path)
+                .expect("the link target should exist")
+                .is_file()
+        );
+    }
+    assert!(fs::symlink_metadata(interrupted).is_err());
+}
+
+#[test]
+fn configured_geodata_preserves_an_unrecognized_pending_entry() {
+    let directory = TestDirectory::new("unsafe-geodata-pending");
+    let binary = fixture_binary(&directory.path, "validator", "#!/bin/sh\nexit 0\n");
+    let source = directory.path.join("source");
+    let staging = directory.path.join("staging");
+    fs::create_dir(&source).expect("Geo-data source should be created");
+    fs::create_dir(&staging).expect("staging directory should be created");
+    let catalog = fixture_geodata_catalog(&source);
+    let pending = staging.join(".hopash-geodata-ASN.mmdb.pending");
+    fs::write(&pending, b"preserve").expect("the unrecognized entry should be written");
+    let effective = effective_configuration(&staging, "MATCH,DIRECT");
+    let validator = validator(&binary, Duration::from_secs(5))
+        .with_geodata(&source, catalog)
+        .expect("the Geo-data policy should be valid");
+
+    let error = validator
+        .validate_detailed(&effective, &staging)
+        .expect_err("an unrecognized pending entry should block staging");
+
+    assert_eq!(error.kind(), MihomoValidationErrorKind::GeoDataUnavailable);
+    assert_eq!(
+        fs::read(pending).expect("the unrecognized entry should be preserved"),
+        b"preserve"
     );
 }
 
@@ -241,6 +313,51 @@ fn effective_configuration(
 fn validator(binary: &Path, timeout: Duration) -> MihomoCommandValidator {
     MihomoCommandValidator::new(binary, sha256(binary), timeout)
         .expect("validator policy should be valid")
+}
+
+fn fixture_geodata_catalog(root: &Path) -> GeoDataCatalog {
+    let commit = "a".repeat(40);
+    let assets = [
+        ("ASN.mmdb", "GeoLite2-ASN.mmdb", b"asn".as_slice()),
+        ("Country.mmdb", "country.mmdb", b"country".as_slice()),
+        ("GeoIP.dat", "geoip.dat", b"geoip".as_slice()),
+        ("GeoSite.dat", "geosite.dat", b"geosite".as_slice()),
+    ]
+    .into_iter()
+    .map(|(file_name, source_name, content)| {
+        fs::write(root.join(file_name), content).expect("the Geo-data fixture should be written");
+        serde_json::json!({
+            "file_name": file_name,
+            "source_name": source_name,
+            "url": format!(
+                "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/{commit}/{source_name}"
+            ),
+            "size": content.len(),
+            "sha256": sha256_bytes(content),
+        })
+    })
+    .collect::<Vec<_>>();
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "core_version": "v1.19.28",
+        "repository": "https://github.com/MetaCubeX/meta-rules-dat",
+        "asset_commit": commit,
+        "source_commit": "b".repeat(40),
+        "repository_license": "GPL-3.0-only",
+        "assets": assets,
+    });
+    GeoDataCatalog::from_manifest(&manifest.to_string())
+        .expect("the Geo-data fixture manifest should be valid")
+}
+
+fn sha256_bytes(content: &[u8]) -> String {
+    Sha256::digest(content)
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            use std::fmt::Write as _;
+            write!(output, "{byte:02x}").expect("writing to a String should succeed");
+            output
+        })
 }
 
 fn fixture_binary(root: &Path, name: &str, script: &str) -> PathBuf {

@@ -10,7 +10,19 @@
     "service_socket": "/var/run/hopash-rs/core-service.sock",
     "service_runtime_root": "/Library/Application Support/Hopash RS/runtime",
     "mihomo": "/Library/Application Support/Hopash RS/bin/mihomo",
+    "geodata": "/Library/Application Support/Hopash RS/share/geodata",
     "shared_assets": "/usr/local/share/hopash"
+  },
+  "geodata": {
+    "manifest": "/usr/local/share/hopash/release/geodata-manifest.json",
+    "license": "/usr/local/share/hopash/licenses/MetaCubeX-meta-rules-dat-GPL-3.0.txt",
+    "notice": "/usr/local/share/hopash/licenses/GeoData-NOTICE.txt",
+    "files": [
+      "ASN.mmdb",
+      "Country.mmdb",
+      "GeoIP.dat",
+      "GeoSite.dat"
+    ]
   },
   "internal_service": {
     "mode": "__core-service",

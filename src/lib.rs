@@ -16,6 +16,7 @@ mod digest;
 pub mod domain;
 pub mod error;
 pub mod frontend_ipc;
+pub mod geodata;
 pub mod ipc;
 pub mod ipc_runtime;
 pub mod lifecycle;

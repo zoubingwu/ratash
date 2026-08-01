@@ -1,0 +1,16 @@
+Hopash RS includes Geo data published by MetaCubeX/meta-rules-dat. The
+generator source is distributed under GPL-3.0-only.
+
+The packaged assets were generated at this immutable commit:
+
+https://github.com/MetaCubeX/meta-rules-dat/tree/1567448176a3b6b56661a93b96d1e1c4c10bf2f9
+
+The corresponding generator source and repository license are pinned at:
+
+https://github.com/MetaCubeX/meta-rules-dat/tree/4178770badecb1b349fbcd62c737e0d7a2079729
+
+The installed license is MetaCubeX-meta-rules-dat-GPL-3.0.txt.
+
+This product includes GeoLite Data created by MaxMind, available from
+https://www.maxmind.com. GeoLite Data use is governed by the current GeoLite2
+End User License Agreement at https://www.maxmind.com/en/geolite/eula.

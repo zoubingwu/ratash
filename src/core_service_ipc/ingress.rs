@@ -7,8 +7,10 @@ use std::os::fd::OwnedFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
-use nix::fcntl::{OFlag, open, openat};
-use nix::sys::stat::{Mode, SFlag, fstat};
+use nix::errno::Errno;
+use nix::fcntl::{AtFlags, OFlag, open, openat, renameat};
+use nix::sys::stat::{Mode, SFlag, fstat, fstatat};
+use nix::unistd::{UnlinkatFlags, unlinkat};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -18,12 +20,34 @@ use crate::constants::{
 use crate::core::{CoreRuntimeError, CoreRuntimeErrorKind, RuntimeBundle};
 use crate::digest::is_lower_sha256_hex;
 use crate::domain::RuntimeGeneration;
+use crate::geodata::{GeoDataAsset, GeoDataCatalog};
 
 use super::socket::sync_directory;
 
 const RUNTIME_MANIFEST_SCHEMA_VERSION: u16 = 1;
 const RUNTIME_MANIFEST_MAX_BYTES: usize = 64 * 1_024;
 const RUNTIME_PROVIDER_FILE_MAX: usize = 1_024;
+
+#[derive(Clone)]
+pub(super) struct GeoDataIngress {
+    root: PathBuf,
+    expected_owner_uid: u32,
+    catalog: GeoDataCatalog,
+}
+
+impl GeoDataIngress {
+    pub(super) fn new(root: PathBuf, expected_owner_uid: u32, catalog: GeoDataCatalog) -> Self {
+        Self {
+            root,
+            expected_owner_uid,
+            catalog,
+        }
+    }
+
+    pub(super) fn root(&self) -> &Path {
+        &self.root
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,8 +94,9 @@ pub(super) fn stage_runtime_bundle(
     runtime_root: &Path,
     owner_uid: u32,
     bundle: &RuntimeBundle,
+    geo_data: Option<&GeoDataIngress>,
 ) -> Result<RuntimeBundle, CoreRuntimeError> {
-    stage_runtime_bundle_inner(runtime_root, owner_uid, bundle)
+    stage_runtime_bundle_inner(runtime_root, owner_uid, bundle, geo_data)
         .map_err(BundleIngressError::into_core)
 }
 
@@ -79,6 +104,7 @@ fn stage_runtime_bundle_inner(
     runtime_root: &Path,
     owner_uid: u32,
     bundle: &RuntimeBundle,
+    geo_data: Option<&GeoDataIngress>,
 ) -> Result<RuntimeBundle, BundleIngressError> {
     if !bundle.generation_root.is_absolute()
         || !is_lower_sha256_hex(&bundle.manifest_sha256)
@@ -89,6 +115,9 @@ fn stage_runtime_bundle_inner(
     }
     let final_root = runtime_root.join(format!("generation-{:020}", bundle.generation.0));
     if generation_directory_exists(&final_root)? {
+        if let Some(geo_data) = geo_data {
+            ensure_staged_geo_data(&final_root, nix::unistd::geteuid().as_raw(), geo_data)?;
+        }
         return Ok(staged_bundle(bundle, final_root));
     }
 
@@ -113,6 +142,7 @@ fn stage_runtime_bundle_inner(
         &pending_root,
         &manifest_bytes,
         &manifest,
+        geo_data,
     );
     if let Err(error) = stage_result {
         let _ = remove_pending_root(runtime_root, &pending_root);
@@ -175,6 +205,7 @@ fn stage_pending_bundle(
     pending_root: &Path,
     manifest_bytes: &[u8],
     manifest: &IngressRuntimeManifest,
+    geo_data: Option<&GeoDataIngress>,
 ) -> Result<(), BundleIngressError> {
     copy_verified_file(
         source_root,
@@ -217,9 +248,324 @@ fn stage_pending_bundle(
             },
         )?;
     }
+    if let Some(geo_data) = geo_data {
+        stage_geo_data(pending_root, geo_data)?;
+    }
     write_new_file(&pending_root.join("manifest.json"), manifest_bytes, 0o400)?;
     sync_tree_directories(pending_root)?;
     Ok(())
+}
+
+fn stage_geo_data(
+    pending_root: &Path,
+    geo_data: &GeoDataIngress,
+) -> Result<(), BundleIngressError> {
+    let source_root = open_source_root(&geo_data.root, geo_data.expected_owner_uid)?;
+    for asset in geo_data.catalog.assets() {
+        let relative_path = Path::new(asset.file_name());
+        if !is_single_file_name(relative_path) {
+            return Err(BundleIngressError::Invalid);
+        }
+        let limit = usize::try_from(asset.size()).map_err(|_| BundleIngressError::Invalid)?;
+        let destination = pending_root.join(relative_path);
+        match fs::symlink_metadata(&destination) {
+            Ok(_) => return Err(BundleIngressError::Invalid),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(BundleIngressError::Unavailable),
+        }
+        copy_verified_file(
+            &source_root,
+            geo_data.expected_owner_uid,
+            BundleFileCopy {
+                relative_path,
+                destination: &destination,
+                limit,
+                expected_size: Some(asset.size()),
+                expected_sha256: asset.sha256(),
+                mode: 0o400,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum StagedGeoDataState {
+    Valid,
+    Repairable,
+}
+
+fn ensure_staged_geo_data(
+    generation_path: &Path,
+    generation_owner_uid: u32,
+    geo_data: &GeoDataIngress,
+) -> Result<(), BundleIngressError> {
+    let generation_root = open_generation_root(generation_path, generation_owner_uid)?;
+    let mut removed_pending = false;
+    let mut needs_repair = false;
+    for asset in geo_data.catalog.assets() {
+        removed_pending |=
+            remove_interrupted_geo_data(&generation_root, generation_owner_uid, asset)?;
+        needs_repair |= inspect_staged_geo_data(&generation_root, generation_owner_uid, asset)?
+            == StagedGeoDataState::Repairable;
+    }
+    if removed_pending {
+        sync_directory_descriptor(&generation_root)?;
+    }
+    if !needs_repair {
+        return Ok(());
+    }
+
+    let source_root = open_source_root(&geo_data.root, geo_data.expected_owner_uid)?;
+    for asset in geo_data.catalog.assets() {
+        if let Err(error) = stage_geo_data_repair(
+            &source_root,
+            geo_data.expected_owner_uid,
+            generation_path,
+            &generation_root,
+            generation_owner_uid,
+            asset,
+        ) {
+            let _ =
+                cleanup_geo_data_repair(&generation_root, generation_owner_uid, &geo_data.catalog);
+            return Err(error);
+        }
+    }
+    sync_directory_descriptor(&generation_root)?;
+
+    for asset in geo_data.catalog.assets() {
+        if let Err(error) =
+            validate_geo_data_replacement_target(&generation_root, generation_owner_uid, asset)
+                .and_then(|()| {
+                    renameat(
+                        &generation_root,
+                        &pending_geo_data_name(asset),
+                        &generation_root,
+                        Path::new(asset.file_name()),
+                    )
+                    .map_err(|_| BundleIngressError::Unavailable)
+                })
+        {
+            let _ =
+                cleanup_geo_data_repair(&generation_root, generation_owner_uid, &geo_data.catalog);
+            return Err(error);
+        }
+    }
+    sync_directory_descriptor(&generation_root)?;
+
+    for asset in geo_data.catalog.assets() {
+        if inspect_staged_geo_data(&generation_root, generation_owner_uid, asset)?
+            != StagedGeoDataState::Valid
+        {
+            return Err(BundleIngressError::Invalid);
+        }
+    }
+    Ok(())
+}
+
+fn open_generation_root(path: &Path, owner_uid: u32) -> Result<OwnedFd, BundleIngressError> {
+    let descriptor = open(
+        path,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| BundleIngressError::Invalid)?;
+    let metadata = fstat(&descriptor).map_err(|_| BundleIngressError::Invalid)?;
+    if SFlag::from_bits_truncate(metadata.st_mode) & SFlag::S_IFMT != SFlag::S_IFDIR
+        || metadata.st_uid != owner_uid
+        || metadata.st_mode & 0o777 != 0o700
+    {
+        return Err(BundleIngressError::Invalid);
+    }
+    Ok(descriptor)
+}
+
+fn inspect_staged_geo_data(
+    generation_root: &OwnedFd,
+    owner_uid: u32,
+    asset: &GeoDataAsset,
+) -> Result<StagedGeoDataState, BundleIngressError> {
+    inspect_geo_data_file(
+        generation_root,
+        owner_uid,
+        Path::new(asset.file_name()),
+        asset,
+    )
+}
+
+fn inspect_geo_data_file(
+    generation_root: &OwnedFd,
+    owner_uid: u32,
+    path: &Path,
+    asset: &GeoDataAsset,
+) -> Result<StagedGeoDataState, BundleIngressError> {
+    if !is_single_file_name(path) {
+        return Err(BundleIngressError::Invalid);
+    }
+    let metadata = match fstatat(generation_root, path, AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Ok(metadata) => metadata,
+        Err(Errno::ENOENT) => return Ok(StagedGeoDataState::Repairable),
+        Err(_) => return Err(BundleIngressError::Invalid),
+    };
+    if SFlag::from_bits_truncate(metadata.st_mode) & SFlag::S_IFMT != SFlag::S_IFREG
+        || metadata.st_uid != owner_uid
+        || metadata.st_nlink != 1
+        || metadata.st_size < 0
+    {
+        return Err(BundleIngressError::Invalid);
+    }
+    if metadata.st_size as u64 != asset.size() || metadata.st_mode & 0o777 != 0o400 {
+        return Ok(StagedGeoDataState::Repairable);
+    }
+    let descriptor = openat(
+        generation_root,
+        path,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|_| BundleIngressError::Invalid)?;
+    let opened = fstat(&descriptor).map_err(|_| BundleIngressError::Invalid)?;
+    if opened.st_dev != metadata.st_dev || opened.st_ino != metadata.st_ino {
+        return Err(BundleIngressError::Invalid);
+    }
+    if file_digest_matches(descriptor, asset.size(), asset.sha256())? {
+        Ok(StagedGeoDataState::Valid)
+    } else {
+        Ok(StagedGeoDataState::Repairable)
+    }
+}
+
+fn remove_interrupted_geo_data(
+    generation_root: &OwnedFd,
+    owner_uid: u32,
+    asset: &GeoDataAsset,
+) -> Result<bool, BundleIngressError> {
+    let pending = pending_geo_data_name(asset);
+    let metadata = match fstatat(generation_root, &pending, AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Ok(metadata) => metadata,
+        Err(Errno::ENOENT) => return Ok(false),
+        Err(_) => return Err(BundleIngressError::Invalid),
+    };
+    if SFlag::from_bits_truncate(metadata.st_mode) & SFlag::S_IFMT != SFlag::S_IFREG
+        || metadata.st_uid != owner_uid
+        || metadata.st_nlink != 1
+        || metadata.st_mode & 0o377 != 0
+    {
+        return Err(BundleIngressError::Invalid);
+    }
+    unlinkat(generation_root, &pending, UnlinkatFlags::NoRemoveDir)
+        .map_err(|_| BundleIngressError::Unavailable)?;
+    Ok(true)
+}
+
+fn stage_geo_data_repair(
+    source_root: &OwnedFd,
+    source_owner_uid: u32,
+    generation_path: &Path,
+    generation_root: &OwnedFd,
+    generation_owner_uid: u32,
+    asset: &GeoDataAsset,
+) -> Result<(), BundleIngressError> {
+    let relative_path = Path::new(asset.file_name());
+    if !is_single_file_name(relative_path) {
+        return Err(BundleIngressError::Invalid);
+    }
+    let pending = pending_geo_data_name(asset);
+    copy_verified_file(
+        source_root,
+        source_owner_uid,
+        BundleFileCopy {
+            relative_path,
+            destination: &generation_path.join(&pending),
+            limit: usize::try_from(asset.size()).map_err(|_| BundleIngressError::Invalid)?,
+            expected_size: Some(asset.size()),
+            expected_sha256: asset.sha256(),
+            mode: 0o400,
+        },
+    )?;
+    if inspect_geo_data_file(generation_root, generation_owner_uid, &pending, asset)?
+        != StagedGeoDataState::Valid
+    {
+        return Err(BundleIngressError::Invalid);
+    }
+    Ok(())
+}
+
+fn validate_geo_data_replacement_target(
+    generation_root: &OwnedFd,
+    owner_uid: u32,
+    asset: &GeoDataAsset,
+) -> Result<(), BundleIngressError> {
+    let path = Path::new(asset.file_name());
+    let metadata = match fstatat(generation_root, path, AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Ok(metadata) => metadata,
+        Err(Errno::ENOENT) => return Ok(()),
+        Err(_) => return Err(BundleIngressError::Invalid),
+    };
+    if SFlag::from_bits_truncate(metadata.st_mode) & SFlag::S_IFMT != SFlag::S_IFREG
+        || metadata.st_uid != owner_uid
+        || metadata.st_nlink != 1
+    {
+        return Err(BundleIngressError::Invalid);
+    }
+    Ok(())
+}
+
+fn cleanup_geo_data_repair(
+    generation_root: &OwnedFd,
+    owner_uid: u32,
+    catalog: &GeoDataCatalog,
+) -> Result<(), BundleIngressError> {
+    for asset in catalog.assets() {
+        remove_interrupted_geo_data(generation_root, owner_uid, asset)?;
+    }
+    sync_directory_descriptor(generation_root)
+}
+
+fn pending_geo_data_name(asset: &GeoDataAsset) -> PathBuf {
+    PathBuf::from(format!(".hopash-geodata-{}.pending", asset.file_name()))
+}
+
+fn sync_directory_descriptor(directory: &OwnedFd) -> Result<(), BundleIngressError> {
+    File::from(
+        directory
+            .try_clone()
+            .map_err(|_| BundleIngressError::Unavailable)?,
+    )
+    .sync_all()
+    .map_err(|_| BundleIngressError::Unavailable)
+}
+
+fn file_digest_matches(
+    descriptor: OwnedFd,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<bool, BundleIngressError> {
+    let mut source = File::from(descriptor);
+    let mut hasher = Sha256::new();
+    let mut read_bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1_024];
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .map_err(|_| BundleIngressError::Invalid)?;
+        if read == 0 {
+            break;
+        }
+        read_bytes = read_bytes
+            .checked_add(read as u64)
+            .ok_or(BundleIngressError::Invalid)?;
+        if read_bytes > expected_size {
+            return Ok(false);
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(read_bytes == expected_size && encode_digest(hasher.finalize().as_ref()) == expected_sha256)
+}
+
+fn is_single_file_name(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
 }
 
 fn open_source_root(path: &Path, owner_uid: u32) -> Result<OwnedFd, BundleIngressError> {
@@ -230,7 +576,7 @@ fn open_source_root(path: &Path, owner_uid: u32) -> Result<OwnedFd, BundleIngres
     )
     .map_err(|_| BundleIngressError::Invalid)?;
     let metadata = fstat(&descriptor).map_err(|_| BundleIngressError::Invalid)?;
-    if !SFlag::from_bits_truncate(metadata.st_mode).contains(SFlag::S_IFDIR)
+    if SFlag::from_bits_truncate(metadata.st_mode) & SFlag::S_IFMT != SFlag::S_IFDIR
         || metadata.st_uid != owner_uid
     {
         return Err(BundleIngressError::Invalid);
@@ -261,7 +607,7 @@ fn open_source_file(
         )
         .map_err(|_| BundleIngressError::Invalid)?;
         let metadata = fstat(&directory).map_err(|_| BundleIngressError::Invalid)?;
-        if !SFlag::from_bits_truncate(metadata.st_mode).contains(SFlag::S_IFDIR)
+        if SFlag::from_bits_truncate(metadata.st_mode) & SFlag::S_IFMT != SFlag::S_IFDIR
             || metadata.st_uid != owner_uid
         {
             return Err(BundleIngressError::Invalid);
@@ -275,7 +621,7 @@ fn open_source_file(
     )
     .map_err(|_| BundleIngressError::Invalid)?;
     let metadata = fstat(&descriptor).map_err(|_| BundleIngressError::Invalid)?;
-    if !SFlag::from_bits_truncate(metadata.st_mode).contains(SFlag::S_IFREG)
+    if SFlag::from_bits_truncate(metadata.st_mode) & SFlag::S_IFMT != SFlag::S_IFREG
         || metadata.st_size < 0
         || metadata.st_uid != owner_uid
     {

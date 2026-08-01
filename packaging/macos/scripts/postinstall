@@ -5,6 +5,7 @@ SERVICE_LABEL='io.hopash.core-runtime'
 SERVICE_PLIST='/Library/LaunchDaemons/io.hopash.core-runtime.plist'
 SERVICE_EXECUTABLE='/Library/PrivilegedHelperTools/io.hopash.core-runtime'
 SERVICE_ROOT='/Library/Application Support/Hopash RS'
+GEODATA_ROOT="$SERVICE_ROOT/share/geodata"
 CLI_EXECUTABLE='/usr/local/bin/hopash'
 SERVICE_REMOVAL_ATTEMPTS=600
 
@@ -25,6 +26,10 @@ fi
 
 /bin/chmod 0755 "$CLI_EXECUTABLE" "$SERVICE_EXECUTABLE" "$SERVICE_ROOT/bin/mihomo"
 /usr/sbin/chown root:wheel "$CLI_EXECUTABLE" "$SERVICE_EXECUTABLE" "$SERVICE_ROOT/bin/mihomo"
+/bin/chmod 0755 "$SERVICE_ROOT/share" "$GEODATA_ROOT"
+/usr/sbin/chown root:wheel "$SERVICE_ROOT/share" "$GEODATA_ROOT"
+/bin/chmod 0644 "$GEODATA_ROOT/ASN.mmdb" "$GEODATA_ROOT/Country.mmdb" "$GEODATA_ROOT/GeoIP.dat" "$GEODATA_ROOT/GeoSite.dat"
+/usr/sbin/chown root:wheel "$GEODATA_ROOT/ASN.mmdb" "$GEODATA_ROOT/Country.mmdb" "$GEODATA_ROOT/GeoIP.dat" "$GEODATA_ROOT/GeoSite.dat"
 /bin/chmod 0644 "$SERVICE_PLIST"
 /usr/sbin/chown root:wheel "$SERVICE_PLIST"
 /usr/bin/sed -i '' "s/@OWNER_UID@/$owner_uid/g" "$SERVICE_PLIST"

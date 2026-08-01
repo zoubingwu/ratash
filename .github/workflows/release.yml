@@ -87,6 +87,32 @@ jobs:
           curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
             'https://raw.githubusercontent.com/MetaCubeX/mihomo/v1.19.28/LICENSE' \
             --output "$RUNNER_TEMP/Mihomo-GPL-3.0.txt"
+      - name: Download and verify the pinned Geo data
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest='fixtures/mihomo/v1.19.28/geodata-manifest.json'
+          geodata_directory="$RUNNER_TEMP/geodata"
+          mkdir -p "$geodata_directory"
+          test "$(jq -r '.assets | length' "$manifest")" = '4'
+          for index in 0 1 2 3; do
+            file_name=$(jq -r ".assets[$index].file_name" "$manifest")
+            url=$(jq -r ".assets[$index].url" "$manifest")
+            expected_size=$(jq -r ".assets[$index].size" "$manifest")
+            expected_sha256=$(jq -r ".assets[$index].sha256" "$manifest")
+            destination="$geodata_directory/$file_name"
+            curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+              "$url" --output "$destination"
+            test "$(stat -f '%z' "$destination")" = "$expected_size"
+            test "$(shasum -a 256 "$destination" | awk '{print $1}')" = "$expected_sha256"
+          done
+          source_commit=$(jq -r '.source_commit' "$manifest")
+          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/$source_commit/LICENSE" \
+            --output "$RUNNER_TEMP/MetaCubeX-meta-rules-dat-GPL-3.0.txt"
+      - name: Validate the pinned Geo data with Mihomo
+        shell: bash
+        run: ./scripts/validate-pinned-mihomo-geodata.sh "$RUNNER_TEMP/mihomo" "$RUNNER_TEMP/geodata"
       - name: Build the signed installer
         env:
           APPLICATION_IDENTITY: ${{ secrets.MACOS_APPLICATION_IDENTITY }}
@@ -96,6 +122,7 @@ jobs:
           set -euo pipefail
           test -n "$APPLICATION_IDENTITY"
           test -n "$INSTALLER_IDENTITY"
+          unset HOPASH_TEST_ALLOW_CUSTOM_GEODATA_MANIFEST
           mkdir -p dist
           ./scripts/package-macos.sh \
             --version '${{ steps.release.outputs.version }}' \
@@ -104,6 +131,9 @@ jobs:
             --mihomo "$RUNNER_TEMP/mihomo" \
             --mihomo-sha256 "$(shasum -a 256 "$RUNNER_TEMP/mihomo" | awk '{print $1}')" \
             --mihomo-license "$RUNNER_TEMP/Mihomo-GPL-3.0.txt" \
+            --geodata-directory "$RUNNER_TEMP/geodata" \
+            --geodata-manifest 'fixtures/mihomo/v1.19.28/geodata-manifest.json' \
+            --geodata-license "$RUNNER_TEMP/MetaCubeX-meta-rules-dat-GPL-3.0.txt" \
             --application-identity "$APPLICATION_IDENTITY" \
             --installer-identity "$INSTALLER_IDENTITY" \
             --output dist
@@ -147,6 +177,7 @@ jobs:
             --require-approved
           cp fixtures/release/product-contract-v1.json dist/
           cp packaging/macos/package-contract-v1.json dist/
+          cp fixtures/mihomo/v1.19.28/geodata-manifest.json dist/
       - name: Upload the release bundle
         uses: actions/upload-artifact@v4
         with:
@@ -179,7 +210,7 @@ jobs:
             echo
             echo 'Each installer contains the same signed Hopash executable for the public CLI, Supervisor, and privileged service entry points. Per-target binary size and the approved versioned resource benchmark results are attached as benchmark metadata.'
           } >release-notes.md
-      - name: Publish the corresponding Mihomo source
+      - name: Publish the corresponding GPL sources
         shell: bash
         run: |
           set -euo pipefail
@@ -189,6 +220,15 @@ jobs:
           (
             cd dist
             sha256sum mihomo-v1.19.28-source.tar.gz >mihomo-v1.19.28-source.tar.gz.sha256
+          )
+          geodata_source_commit=$(jq -r '.source_commit' dist/geodata-manifest.json)
+          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            "https://github.com/MetaCubeX/meta-rules-dat/archive/$geodata_source_commit.tar.gz" \
+            --output "dist/meta-rules-dat-$geodata_source_commit-source.tar.gz"
+          (
+            cd dist
+            sha256sum "meta-rules-dat-$geodata_source_commit-source.tar.gz" \
+              >"meta-rules-dat-$geodata_source_commit-source.tar.gz.sha256"
           )
       - name: Publish the signed installers
         uses: softprops/action-gh-release@v2
@@ -202,5 +242,8 @@ jobs:
             dist/benchmark-metadata-*.json
             dist/product-contract-v1.json
             dist/package-contract-v1.json
+            dist/geodata-manifest.json
             dist/mihomo-v1.19.28-source.tar.gz
             dist/mihomo-v1.19.28-source.tar.gz.sha256
+            dist/meta-rules-dat-*-source.tar.gz
+            dist/meta-rules-dat-*-source.tar.gz.sha256
