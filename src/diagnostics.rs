@@ -162,6 +162,11 @@ impl WrapperDiagnosticRing {
     }
 
     #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.capacity
     }

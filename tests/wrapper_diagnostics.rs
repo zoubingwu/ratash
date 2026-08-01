@@ -72,6 +72,8 @@ fn diagnostic_ring_rejects_zero_capacity_and_zero_tail_limits() {
         Err(WrapperDiagnosticError::InvalidLimit)
     ));
     let ring = WrapperDiagnosticRing::new(1).expect("fixture capacity should be valid");
+    assert!(ring.is_empty());
+    assert_eq!(ring.len(), 0);
     assert!(matches!(
         ring.tail_after(None, 0),
         Err(WrapperDiagnosticError::InvalidLimit)
