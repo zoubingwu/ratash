@@ -78,7 +78,8 @@
 - `src/rule.rs` owns Rule String parsing, ordered Local Rule Set mutations, revisions, and deterministic `rules.yaml` serialization.
 - `src/scheduler.rs` owns deterministic bounded Profile Refresh and Active Profile Delay Probe scheduling state.
 - `src/telemetry.rs` owns generation-scoped latest values, fixed traffic history, the count-and-byte-bounded authoritative Core Log ring, and bounded latest-tail projection.
-- `src/tui.rs` owns the revision-aware Ratatui view model, reducer, count-and-byte-bounded Core Log view, bounded search input, input mapping, pure rendering, fair event inbox, and reversible Crossterm terminal session.
+- `src/tui.rs` owns the revision-aware Ratatui view model, reducer, count-and-byte-bounded Core Log view, bounded search input, and input mapping.
+- `src/tui/render.rs` owns pure layout, rendering, and interaction projection; `src/tui/event_inbox.rs` owns fair bounded event scheduling; `src/tui/terminal.rs` owns reversible Crossterm terminal sessions.
 - `src/tui_runtime.rs` owns pre-terminal bootstrap, latest-intent mutation dispatch, cancellable foreground waits, bounded snapshot resynchronization, reconnect timing, live status and log intake, the coalesced event loop, signal handling, and the Ratatui/Crossterm runner.
 - `src/constants.rs` centralizes versioned product intervals, capacities, terminal limits, and input-size boundaries.
 - `src/digest.rs` is the internal SHA-256 helper shared by stable identities, immutable storage, and compiler policies.
