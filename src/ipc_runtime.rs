@@ -11,12 +11,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use mio::net::UnixListener as MioUnixListener;
+use mio::net::{UnixListener as MioUnixListener, UnixStream as MioUnixStream};
 use mio::{Events, Interest, Poll, Token, Waker};
 use serde::{Deserialize, Serialize};
-use socket2::{Domain, SockAddr, Socket, Type};
 
 use crate::application::{
     ApplicationClient, ApplicationError, ApplicationErrorDetails, ApplicationOperation,
@@ -31,6 +30,7 @@ use crate::application::{
     RuntimeApplyFailureStage, RuntimeApplyOutcome, RuntimeApplyStatus, SelectorCandidate,
     SelectorIdentity, SelectorKind,
 };
+use crate::cancellation::CancellationToken;
 use crate::constants::{
     CORE_LOG_LINE_MAX_BYTES, IPC_FRAME_MAX_BYTES, IPC_LIST_PAGE_SIZE, IPC_PROFILE_ADD_TIMEOUT,
     IPC_REQUEST_FRAME_MAX_BYTES, IPC_REQUEST_TIMEOUT, IPC_RUNTIME_MUTATION_TIMEOUT,
@@ -65,6 +65,8 @@ const DEFAULT_SERVER_WORKERS: usize = 4;
 const DEFAULT_PENDING_CONNECTIONS: usize = 32;
 const LISTENER_TOKEN: Token = Token(0);
 const SHUTDOWN_TOKEN: Token = Token(1);
+const CLIENT_CONNECT_TOKEN: Token = Token(0);
+const CLIENT_CANCEL_TOKEN: Token = Token(1);
 // -----------------------------------------------------------------------------
 // Synchronous client
 // -----------------------------------------------------------------------------
@@ -116,17 +118,54 @@ impl IpcClient {
         }
     }
 
-    fn connect(&self) -> io::Result<UnixStream> {
+    fn connect_cancellable(&self, cancellation: &CancellationToken) -> io::Result<UnixStream> {
         if self.connect_timeout.is_zero() || self.stream_timeout().is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "IPC deadlines must be positive",
             ));
         }
-        let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
-        let address = SockAddr::unix(&self.socket_path)?;
-        socket.connect_timeout(&address, self.connect_timeout)?;
-        let stream = UnixStream::from(socket);
+        if cancellation.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "IPC connect was cancelled",
+            ));
+        }
+        let mut poll = Poll::new()?;
+        let cancellation_waker = Arc::new(Waker::new(poll.registry(), CLIENT_CANCEL_TOKEN)?);
+        let interrupt_waker = Arc::clone(&cancellation_waker);
+        let _cancellation_registration = cancellation.register_interrupt(move || {
+            let _ = interrupt_waker.wake();
+        });
+        let mut stream = MioUnixStream::connect(&self.socket_path)?;
+        poll.registry()
+            .register(&mut stream, CLIENT_CONNECT_TOKEN, Interest::WRITABLE)?;
+        let deadline = Instant::now()
+            .checked_add(self.connect_timeout)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "IPC deadline overflow"))?;
+        let mut events = Events::with_capacity(4);
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "IPC connect was cancelled",
+                ));
+            }
+            if ipc_connection_is_ready(&stream)? {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "IPC connect timed out",
+                ));
+            }
+            poll_for_ipc_connect(&mut poll, &mut events, remaining, cancellation)?;
+        }
+        poll.registry().deregister(&mut stream)?;
+        let stream: UnixStream = stream.into();
+        stream.set_nonblocking(false)?;
         Ok(stream)
     }
 
@@ -158,9 +197,23 @@ impl IpcClient {
         after_sequence: Option<u64>,
         connection_generation: u64,
     ) -> Result<StatusStream, ApplicationError> {
-        let transport = self.open_stream(
+        self.subscribe_status_cancellable(
+            after_sequence,
+            connection_generation,
+            &CancellationToken::default(),
+        )
+    }
+
+    pub fn subscribe_status_cancellable(
+        &self,
+        after_sequence: Option<u64>,
+        connection_generation: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<StatusStream, ApplicationError> {
+        let transport = self.open_stream_cancellable(
             RequestOperation::SubscribeStatus(StatusSubscriptionPayload { after_sequence }),
             connection_generation,
+            cancellation,
         )?;
         Ok(StatusStream {
             transport,
@@ -175,9 +228,23 @@ impl IpcClient {
         after_sequence: Option<u64>,
         connection_generation: u64,
     ) -> Result<LogStream, ApplicationError> {
-        let transport = self.open_stream(
+        self.follow_logs_cancellable(
+            after_sequence,
+            connection_generation,
+            &CancellationToken::default(),
+        )
+    }
+
+    pub fn follow_logs_cancellable(
+        &self,
+        after_sequence: Option<u64>,
+        connection_generation: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<LogStream, ApplicationError> {
+        let transport = self.open_stream_cancellable(
             RequestOperation::FollowLogs(LogSubscriptionPayload { after_sequence }),
             connection_generation,
+            cancellation,
         )?;
         Ok(LogStream {
             transport,
@@ -187,18 +254,59 @@ impl IpcClient {
     }
 
     pub fn log_tail(&self, after_sequence: Option<u64>) -> Result<LogTailV1, ApplicationError> {
+        self.log_tail_cancellable(after_sequence, &CancellationToken::default())
+    }
+
+    pub fn log_tail_cancellable(
+        &self,
+        after_sequence: Option<u64>,
+        cancellation: &CancellationToken,
+    ) -> Result<LogTailV1, ApplicationError> {
+        if cancellation.is_cancelled() {
+            return Err(cancelled_operation(false));
+        }
         let request_id = self.request_id();
         let request = IpcRequest::new(
             request_id,
             RequestOperation::LogTail(LogTailPayload { after_sequence }),
         );
-        let stream = self.connect().map_err(connect_error)?;
+        let stream = self.connect_cancellable(cancellation).map_err(|error| {
+            if cancellation.is_cancelled() {
+                cancelled_operation(false)
+            } else {
+                connect_error(error)
+            }
+        })?;
+        let interrupt_stream = stream
+            .try_clone()
+            .map_err(|_| connect_error(io::Error::other("IPC stream clone failed")))?;
+        let _cancellation_registration = cancellation.register_interrupt(move || {
+            let _ = interrupt_stream.shutdown(Shutdown::Both);
+        });
         let mut stream =
             DeadlineUnixStream::new(stream, self.stream_timeout()).map_err(connect_error)?;
         stream.begin_write().map_err(connect_error)?;
-        write_frame(&mut stream, &request).map_err(write_error)?;
-        stream.begin_read().map_err(connect_error)?;
-        let response: IpcResponse = read_frame(&mut stream).map_err(read_error)?;
+        write_frame(&mut stream, &request).map_err(|error| {
+            if cancellation.is_cancelled() {
+                cancelled_operation(false)
+            } else {
+                write_error(error)
+            }
+        })?;
+        stream.begin_read().map_err(|error| {
+            if cancellation.is_cancelled() {
+                cancelled_operation(false)
+            } else {
+                connect_error(error)
+            }
+        })?;
+        let response: IpcResponse = read_frame(&mut stream).map_err(|error| {
+            if cancellation.is_cancelled() {
+                cancelled_operation(false)
+            } else {
+                read_error(error)
+            }
+        })?;
         response
             .ensure_correlated(request_id)
             .map_err(|_| protocol_error("The IPC response did not match the request"))?;
@@ -214,15 +322,31 @@ impl IpcClient {
         .map_err(|_| protocol_error("The IPC log tail response is invalid"))
     }
 
-    fn open_stream(
+    fn open_stream_cancellable(
         &self,
         operation: RequestOperation,
         connection_generation: u64,
+        cancellation: &CancellationToken,
     ) -> Result<StreamTransport, ApplicationError> {
+        if cancellation.is_cancelled() {
+            return Err(cancelled_operation(false));
+        }
         let request_id = self.request_id();
         let request = IpcRequest::new(request_id, operation);
-        let stream = self.connect().map_err(connect_error)?;
-        let cancellation = IpcStreamCancellation::new(
+        let stream = self.connect_cancellable(cancellation).map_err(|error| {
+            if cancellation.is_cancelled() {
+                cancelled_operation(false)
+            } else {
+                connect_error(error)
+            }
+        })?;
+        let interrupt_stream = stream
+            .try_clone()
+            .map_err(|_| connect_error(io::Error::other("IPC stream clone failed")))?;
+        let _cancellation_registration = cancellation.register_interrupt(move || {
+            let _ = interrupt_stream.shutdown(Shutdown::Both);
+        });
+        let stream_cancellation = IpcStreamCancellation::new(
             stream
                 .try_clone()
                 .map_err(|_| connect_error(io::Error::other("IPC stream clone failed")))?,
@@ -230,12 +354,18 @@ impl IpcClient {
         let mut stream =
             DeadlineUnixStream::new(stream, self.stream_timeout()).map_err(connect_error)?;
         stream.begin_write().map_err(connect_error)?;
-        write_frame(&mut stream, &request).map_err(write_error)?;
+        write_frame(&mut stream, &request).map_err(|error| {
+            if cancellation.is_cancelled() {
+                cancelled_operation(false)
+            } else {
+                write_error(error)
+            }
+        })?;
         Ok(StreamTransport {
             stream,
             request_id,
             connection_generation,
-            cancellation,
+            cancellation: stream_cancellation,
         })
     }
 }
@@ -1075,36 +1205,84 @@ impl ApplicationClient for IpcClient {
         &self,
         operation: ApplicationOperation,
     ) -> Result<ApplicationOutput, ApplicationError> {
-        match operation {
-            ApplicationOperation::ProfileList => self.execute_profile_list(),
-            ApplicationOperation::ProxyList { group } => self.execute_proxy_list(group),
-            ApplicationOperation::RuleList => self.execute_rule_list(),
-            operation => self.execute_once(operation),
-        }
+        self.execute_with_cancellation(operation, &CancellationToken::default())
+    }
+
+    fn execute_cancellable(
+        &self,
+        operation: ApplicationOperation,
+        cancellation: &CancellationToken,
+    ) -> Result<ApplicationOutput, ApplicationError> {
+        self.execute_with_cancellation(operation, cancellation)
     }
 }
 
 impl IpcClient {
+    fn execute_with_cancellation(
+        &self,
+        operation: ApplicationOperation,
+        cancellation: &CancellationToken,
+    ) -> Result<ApplicationOutput, ApplicationError> {
+        match operation {
+            ApplicationOperation::ProfileList => self.execute_profile_list(cancellation),
+            ApplicationOperation::ProxyList { group } => {
+                self.execute_proxy_list(group, cancellation)
+            }
+            ApplicationOperation::RuleList => self.execute_rule_list(cancellation),
+            operation => self.execute_once(operation, cancellation),
+        }
+    }
+
     fn execute_once(
         &self,
         operation: ApplicationOperation,
+        cancellation: &CancellationToken,
     ) -> Result<ApplicationOutput, ApplicationError> {
+        if cancellation.is_cancelled() {
+            return Err(cancelled_operation(false));
+        }
         let expected_output = ExpectedOutput::for_operation(&operation);
         let response_timeout = self.response_timeout(&operation);
         let may_commit = operation_may_commit(&operation);
         let request_id = self.request_id();
         let request = IpcRequest::new(request_id, request_operation(operation));
-        let stream = self.connect().map_err(connect_error)?;
+        let stream = self.connect_cancellable(cancellation).map_err(|error| {
+            if cancellation.is_cancelled() {
+                cancelled_operation(false)
+            } else {
+                connect_error(error)
+            }
+        })?;
+        let interrupt_stream = stream
+            .try_clone()
+            .map_err(|_| connect_error(io::Error::other("IPC stream clone failed")))?;
+        let _cancellation_registration = cancellation.register_interrupt(move || {
+            let _ = interrupt_stream.shutdown(Shutdown::Both);
+        });
         let mut stream =
             DeadlineUnixStream::new(stream, response_timeout).map_err(connect_error)?;
         stream.begin_write().map_err(connect_error)?;
-        write_frame(&mut stream, &request)
-            .map_err(|error| operation_write_error(error, may_commit))?;
-        stream
-            .begin_read()
-            .map_err(|error| operation_read_setup_error(error, may_commit))?;
-        let response: IpcResponse =
-            read_frame(&mut stream).map_err(|error| operation_read_error(error, may_commit))?;
+        write_frame(&mut stream, &request).map_err(|error| {
+            if cancellation.is_cancelled() {
+                cancelled_operation(may_commit)
+            } else {
+                operation_write_error(error, may_commit)
+            }
+        })?;
+        stream.begin_read().map_err(|error| {
+            if cancellation.is_cancelled() {
+                cancelled_operation(may_commit)
+            } else {
+                operation_read_setup_error(error, may_commit)
+            }
+        })?;
+        let response: IpcResponse = read_frame(&mut stream).map_err(|error| {
+            if cancellation.is_cancelled() {
+                cancelled_operation(may_commit)
+            } else {
+                operation_read_error(error, may_commit)
+            }
+        })?;
         response
             .ensure_correlated(request_id)
             .map_err(|_| protocol_error("The IPC response did not match the request"))?;
@@ -1129,12 +1307,16 @@ impl IpcClient {
         }
     }
 
-    fn execute_rule_list(&self) -> Result<ApplicationOutput, ApplicationError> {
+    fn execute_rule_list(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<ApplicationOutput, ApplicationError> {
         let mut offset = 0;
         let mut metadata = None;
         let mut rules = Vec::new();
         loop {
-            let output = self.execute_once(ApplicationOperation::RuleListPage { offset })?;
+            let output =
+                self.execute_once(ApplicationOperation::RuleListPage { offset }, cancellation)?;
             let page = match output {
                 ApplicationOutput::RulePage(page) => page,
                 ApplicationOutput::Rules(outcome) if offset == 0 => {
@@ -1173,12 +1355,18 @@ impl IpcClient {
         }
     }
 
-    fn execute_profile_list(&self) -> Result<ApplicationOutput, ApplicationError> {
+    fn execute_profile_list(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<ApplicationOutput, ApplicationError> {
         let mut offset = 0;
         let mut metadata = None;
         let mut profiles = Vec::new();
         loop {
-            let output = self.execute_once(ApplicationOperation::ProfileListPage { offset })?;
+            let output = self.execute_once(
+                ApplicationOperation::ProfileListPage { offset },
+                cancellation,
+            )?;
             let page = match output {
                 ApplicationOutput::ProfilePage(page) => page,
                 ApplicationOutput::Profiles(outcome) if offset == 0 => {
@@ -1215,18 +1403,25 @@ impl IpcClient {
         }
     }
 
-    fn execute_proxy_list(&self, group: String) -> Result<ApplicationOutput, ApplicationError> {
+    fn execute_proxy_list(
+        &self,
+        group: String,
+        cancellation: &CancellationToken,
+    ) -> Result<ApplicationOutput, ApplicationError> {
         let mut groups_offset = 0;
         let mut nodes_offset = 0;
         let mut metadata = None;
         let mut groups = Vec::new();
         let mut nodes = Vec::new();
         loop {
-            let output = self.execute_once(ApplicationOperation::ProxyListPage {
-                group: group.clone(),
-                groups_offset,
-                nodes_offset,
-            })?;
+            let output = self.execute_once(
+                ApplicationOperation::ProxyListPage {
+                    group: group.clone(),
+                    groups_offset,
+                    nodes_offset,
+                },
+                cancellation,
+            )?;
             let page = match output {
                 ApplicationOutput::ProxyPage(page) => page,
                 ApplicationOutput::Proxies(outcome) if groups_offset == 0 && nodes_offset == 0 => {
@@ -1440,6 +1635,20 @@ fn unknown_mutation_outcome(message: &'static str) -> ApplicationError {
     ApplicationError::new(ErrorCode::ExternalOperationFailed, message, false)
 }
 
+fn cancelled_operation(may_commit: bool) -> ApplicationError {
+    if may_commit {
+        unknown_mutation_outcome(
+            "The IPC mutation wait was cancelled; query current state before retrying",
+        )
+    } else {
+        ApplicationError::new(
+            ErrorCode::OperationUnavailable,
+            "The IPC operation was cancelled",
+            true,
+        )
+    }
+}
+
 fn operation_may_commit(operation: &ApplicationOperation) -> bool {
     matches!(
         operation,
@@ -1492,6 +1701,48 @@ fn is_timeout(error: &io::Error) -> bool {
     )
 }
 
+fn ipc_connection_is_ready(stream: &MioUnixStream) -> io::Result<bool> {
+    if let Some(error) = stream.take_error()? {
+        return Err(error);
+    }
+    match stream.peer_addr() {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotConnected | io::ErrorKind::WouldBlock
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn poll_for_ipc_connect(
+    poll: &mut Poll,
+    events: &mut Events,
+    remaining: Duration,
+    cancellation: &CancellationToken,
+) -> io::Result<()> {
+    events.clear();
+    poll.poll(events, Some(remaining))?;
+    if cancellation.is_cancelled() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "IPC connect was cancelled",
+        ));
+    }
+    if events.is_empty() {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "IPC connect timed out",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn protocol_error(message: &'static str) -> ApplicationError {
     ApplicationError::new(ErrorCode::ProtocolMismatch, message, false)
 }
@@ -1515,15 +1766,15 @@ fn application_error(error: &IpcError) -> ApplicationError {
         });
     }
     let selector_candidates = decode_selector_candidates(error.details.as_ref());
-    if result.details.is_none() && selector_candidates.is_none() {
-        if let Some(candidate_ids) = error
+    if result.details.is_none()
+        && selector_candidates.is_none()
+        && let Some(candidate_ids) = error
             .details
             .as_ref()
             .and_then(|details| details.get("candidate_ids"))
             .and_then(decode_candidate_ids)
-        {
-            result = result.with_details(ApplicationErrorDetails::CandidateIds { candidate_ids });
-        }
+    {
+        result = result.with_details(ApplicationErrorDetails::CandidateIds { candidate_ids });
     }
     if let Some((selector, candidates)) = selector_candidates {
         result = result.with_selector_candidates(selector, candidates);
@@ -1633,6 +1884,7 @@ fn parse_error_code(code: &str) -> Option<ErrorCode> {
         "policy_target_not_found" => ErrorCode::PolicyTargetNotFound,
         "profile_field_unsupported" => ErrorCode::ProfileFieldUnsupported,
         "tun_permission_denied" => ErrorCode::TunPermissionDenied,
+        "tun_unsupported" => ErrorCode::TunUnsupported,
         "core_unavailable" => ErrorCode::CoreUnavailable,
         "external_operation_failed" => ErrorCode::ExternalOperationFailed,
         "internal" => ErrorCode::Internal,
@@ -4333,6 +4585,39 @@ mod timeout_tests {
         };
         assert_eq!(client.response_timeout(&operation), timeout);
         assert_eq!(client.stream_timeout(), timeout);
+    }
+
+    #[test]
+    fn cancellation_wakes_a_stalled_connect_poll() {
+        let mut poll = Poll::new().expect("fixture poll should initialize");
+        let waker = Arc::new(
+            Waker::new(poll.registry(), CLIENT_CANCEL_TOKEN)
+                .expect("fixture cancellation waker should initialize"),
+        );
+        let cancellation = CancellationToken::default();
+        let interrupt_waker = Arc::clone(&waker);
+        let _registration = cancellation.register_interrupt(move || {
+            let _ = interrupt_waker.wake();
+        });
+        let worker_cancellation = cancellation.clone();
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            worker_cancellation.cancel();
+        });
+        let mut events = Events::with_capacity(2);
+        let started = Instant::now();
+
+        let error = poll_for_ipc_connect(
+            &mut poll,
+            &mut events,
+            Duration::from_secs(5),
+            &cancellation,
+        )
+        .expect_err("cancellation should wake the stalled connect poll");
+
+        worker.join().expect("cancellation worker should stop");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_millis(250));
     }
 
     #[test]

@@ -64,6 +64,8 @@ pub const IPC_LIST_PAGE_SIZE: usize = 128;
 
 pub const MINIMUM_TERMINAL_WIDTH: u16 = 80;
 pub const MINIMUM_TERMINAL_HEIGHT: u16 = 24;
+pub const TUI_SEARCH_MAX_BYTES: usize = 256;
+pub const TUI_SEARCH_MAX_CHARACTERS: usize = 128;
 
 const _: () = {
     assert!(

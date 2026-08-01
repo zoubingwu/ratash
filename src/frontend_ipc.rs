@@ -61,6 +61,7 @@ struct ActiveConnection {
 
 struct ConnectionControl {
     active: AtomicBool,
+    cancellation: CancellationToken,
     status: IpcStreamCancellation,
     logs: Mutex<Option<IpcStreamCancellation>>,
 }
@@ -103,6 +104,7 @@ impl IpcStatusLogEventSource {
         let log_cancellation = logs.cancellation();
         let control = Arc::new(ConnectionControl {
             active: AtomicBool::new(true),
+            cancellation: CancellationToken::default(),
             status: status_cancellation,
             logs: Mutex::new(Some(log_cancellation)),
         });
@@ -197,13 +199,17 @@ impl StatusLogEventSource for IpcStatusLogEventSource {
         };
         let status = self
             .client
-            .subscribe_status(status_sequence, connection_generation)
+            .subscribe_status_cancellable(status_sequence, connection_generation, cancellation)
             .map_err(status_stream_error)?;
         if cancellation.is_cancelled() {
             status.cancellation().cancel();
             return Err(cancelled_stream_error());
         }
-        let logs = match self.client.follow_logs(log_sequence, connection_generation) {
+        let logs = match self.client.follow_logs_cancellable(
+            log_sequence,
+            connection_generation,
+            cancellation,
+        ) {
             Ok(logs) => logs,
             Err(error) => {
                 status.cancellation().cancel();
@@ -250,7 +256,7 @@ impl StatusLogEventSource for IpcStatusLogEventSource {
         let buffer = self.active_buffer(connection_generation)?;
         let tail = self
             .client
-            .log_tail(after_sequence)
+            .log_tail_cancellable(after_sequence, cancellation)
             .map_err(status_stream_error)?;
         if cancellation.is_cancelled() {
             return Err(cancelled_stream_error());
@@ -352,6 +358,7 @@ impl ConnectionControl {
 
     fn fail(&self, buffer: &ConnectionBuffer) {
         if self.active.swap(false, Ordering::AcqRel) {
+            self.cancellation.cancel();
             self.cancel_streams();
             buffer.mark_disconnected();
         }
@@ -359,6 +366,7 @@ impl ConnectionControl {
 
     fn stop(&self) {
         self.active.store(false, Ordering::Release);
+        self.cancellation.cancel();
         self.cancel_streams();
     }
 
@@ -609,19 +617,24 @@ fn run_log_reader(
                     }
                 },
                 LogStreamItem::Gap { .. } => {
-                    let tail = match client.log_tail(after_sequence) {
-                        Ok(tail) => tail,
-                        Err(_) => {
-                            control.fail(buffer);
-                            return;
-                        }
-                    };
+                    let tail =
+                        match client.log_tail_cancellable(after_sequence, &control.cancellation) {
+                            Ok(tail) => tail,
+                            Err(_) => {
+                                control.fail(buffer);
+                                return;
+                            }
+                        };
                     if buffer.publish_tail(&tail).is_err() {
                         control.fail(buffer);
                         return;
                     }
                     after_sequence = tail.latest_sequence;
-                    let next = match client.follow_logs(after_sequence, generation) {
+                    let next = match client.follow_logs_cancellable(
+                        after_sequence,
+                        generation,
+                        &control.cancellation,
+                    ) {
                         Ok(next) => next,
                         Err(_) => {
                             control.fail(buffer);
@@ -666,18 +679,24 @@ fn recover_log_stream(
     if !control.active.load(Ordering::Acquire) {
         return None;
     }
-    let mut tail = client.log_tail(after_sequence).ok()?;
+    let mut tail = client
+        .log_tail_cancellable(after_sequence, &control.cancellation)
+        .ok()?;
     let sequence_reset = after_sequence
         .zip(tail.latest_sequence)
         .is_some_and(|(after, latest)| latest < after)
         || (after_sequence.is_some() && tail.latest_sequence.is_none());
     if sequence_reset {
-        tail = client.log_tail(None).ok()?;
+        tail = client
+            .log_tail_cancellable(None, &control.cancellation)
+            .ok()?;
         tail.gap = true;
     }
     buffer.publish_tail(&tail).ok()?;
     let recovered_after = tail.latest_sequence;
-    let next = client.follow_logs(recovered_after, generation).ok()?;
+    let next = client
+        .follow_logs_cancellable(recovered_after, generation, &control.cancellation)
+        .ok()?;
     if !control.install_log_stream(next.cancellation()) {
         return None;
     }
@@ -721,12 +740,14 @@ pub struct LogFollowCancellation {
 #[derive(Default)]
 struct LogFollowCancellationInner {
     cancelled: AtomicBool,
+    operation: CancellationToken,
     stream: Mutex<Option<IpcStreamCancellation>>,
 }
 
 impl LogFollowCancellation {
     pub fn cancel(&self) {
         self.inner.cancelled.store(true, Ordering::Release);
+        self.inner.operation.cancel();
         if let Some(stream) = self
             .inner
             .stream
@@ -813,7 +834,7 @@ impl ForegroundLogFollower {
             }
             let mut stream = self
                 .client
-                .follow_logs(after_sequence, generation)
+                .follow_logs_cancellable(after_sequence, generation, &cancellation.inner.operation)
                 .map_err(LogFollowError::Application)?;
             if !cancellation.install(stream.cancellation()) {
                 return Ok(LogFollowCompletion::Interrupted);
@@ -839,7 +860,7 @@ impl ForegroundLogFollower {
                         }
                         let tail = self
                             .client
-                            .log_tail(after_sequence)
+                            .log_tail_cancellable(after_sequence, &cancellation.inner.operation)
                             .map_err(LogFollowError::Application)?;
                         for record in &tail.records {
                             write_log_record(record, format, stdout)?;

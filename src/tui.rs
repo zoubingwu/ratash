@@ -23,7 +23,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Sparkli
 use crate::application::{LatencyFreshness, LatencyProbeStatus};
 use crate::constants::{
     LOG_CAPACITY, MAX_ACTIVE_NODES, MINIMUM_TERMINAL_HEIGHT, MINIMUM_TERMINAL_WIDTH,
-    TRAFFIC_SERIES_CAPACITY,
+    TRAFFIC_SERIES_CAPACITY, TUI_SEARCH_MAX_BYTES, TUI_SEARCH_MAX_CHARACTERS,
 };
 use crate::domain::{
     CoreDiagnosticCategory, NodeRecordId, ProfileId, ProxyGroupId, RuntimeApplyPhase,
@@ -357,7 +357,6 @@ pub struct FullViewSnapshot {
 #[derive(Clone, Debug)]
 pub struct MutationSuccess {
     pub message: String,
-    pub snapshot: FullViewSnapshot,
 }
 
 #[derive(Clone, Debug)]
@@ -388,6 +387,8 @@ pub struct AppState {
     interaction_map: Option<InteractionMap>,
     next_request_id: u64,
     next_frame_revision: u64,
+    view_revision: u64,
+    status_revision: u64,
 }
 
 impl Default for AppState {
@@ -423,6 +424,8 @@ impl AppState {
             interaction_map: None,
             next_request_id: 1,
             next_frame_revision: 1,
+            view_revision: 1,
+            status_revision: 1,
         }
     }
 
@@ -450,7 +453,37 @@ impl AppState {
         id
     }
 
+    fn bump_view_revision(&mut self) {
+        self.view_revision = self.view_revision.wrapping_add(1).max(1);
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn view_revision(&self) -> u64 {
+        self.view_revision
+    }
+
+    #[must_use]
+    #[doc(hidden)]
+    pub fn status_revision(&self) -> u64 {
+        self.status_revision
+    }
+
+    #[must_use]
+    pub(crate) fn accepts_snapshot_refresh(
+        &self,
+        generation: u64,
+        base_view_revision: u64,
+    ) -> bool {
+        generation == self.connection.generation
+            && self.connection.status == ConnectionStatus::Connected
+            && self.pending.is_none()
+            && base_view_revision == self.view_revision
+    }
+
     fn replace_snapshot(&mut self, generation: u64, snapshot: FullViewSnapshot) {
+        self.bump_view_revision();
+        self.status_revision = self.status_revision.wrapping_add(1).max(1);
         self.pending = None;
         self.profiles.activation_pending = None;
         self.proxies.group_load_pending = None;
@@ -504,11 +537,14 @@ impl AppState {
         self.render_dirty = true;
     }
 
-    fn refresh_snapshot(&mut self, generation: u64, snapshot: FullViewSnapshot) {
-        if generation != self.connection.generation
-            || self.connection.status != ConnectionStatus::Connected
-            || self.pending.is_some()
-        {
+    fn refresh_snapshot(
+        &mut self,
+        generation: u64,
+        base_view_revision: u64,
+        base_status_revision: u64,
+        snapshot: FullViewSnapshot,
+    ) {
+        if !self.accepts_snapshot_refresh(generation, base_view_revision) {
             return;
         }
         let proxies = snapshot
@@ -532,7 +568,8 @@ impl AppState {
             .into_iter()
             .take(PROFILE_VIEW_CAPACITY)
             .collect::<Vec<_>>();
-        if self.status.as_ref() == Some(&snapshot.status)
+        let replace_status = base_status_revision == self.status_revision;
+        if (!replace_status || self.status.as_ref() == Some(&snapshot.status))
             && (!replace_proxies || self.proxies.rows == proxies)
             && self.proxies.groups == proxy_groups
             && self.profiles.rows == profiles
@@ -571,7 +608,10 @@ impl AppState {
         {
             self.profiles.selected = index;
         }
-        self.status = Some(snapshot.status);
+        if replace_status {
+            self.status = Some(snapshot.status);
+            self.status_revision = self.status_revision.wrapping_add(1).max(1);
+        }
         self.connection.snapshot_stale = false;
         if replace_proxies {
             self.proxies.selected_group = self.proxies.rows.first().map(|row| row.group.clone());
@@ -591,6 +631,7 @@ impl AppState {
             })
             .unwrap_or(0);
         self.clamp_selections();
+        self.bump_view_revision();
         self.render_dirty = true;
     }
 
@@ -643,7 +684,13 @@ pub enum UiEvent {
     },
     SnapshotRefreshed {
         connection_generation: u64,
+        base_view_revision: u64,
+        base_status_revision: u64,
         snapshot: FullViewSnapshot,
+    },
+    SnapshotRefreshFailed {
+        connection_generation: u64,
+        base_view_revision: u64,
     },
     ProxyGroupLoaded {
         request_id: RequestId,
@@ -734,6 +781,8 @@ pub enum Command {
     },
     RefreshSnapshot {
         connection_generation: u64,
+        base_view_revision: u64,
+        base_status_revision: u64,
     },
     Cancel {
         request_id: RequestId,
@@ -779,7 +828,15 @@ pub fn update(state: &mut AppState, event: UiEvent) -> Vec<Command> {
                 && state.connection.status == ConnectionStatus::Connected
                 && state.status.as_ref() != Some(&status)
             {
+                let collection_changed = state
+                    .status
+                    .as_ref()
+                    .is_some_and(|previous| status_requires_snapshot_refresh(previous, &status));
                 state.status = Some(status);
+                state.status_revision = state.status_revision.wrapping_add(1).max(1);
+                if collection_changed {
+                    state.bump_view_revision();
+                }
                 state.push_traffic_sample();
                 state.render_dirty = true;
             }
@@ -787,9 +844,26 @@ pub fn update(state: &mut AppState, event: UiEvent) -> Vec<Command> {
         }
         UiEvent::SnapshotRefreshed {
             connection_generation,
+            base_view_revision,
+            base_status_revision,
             snapshot,
         } => {
-            state.refresh_snapshot(connection_generation, snapshot);
+            state.refresh_snapshot(
+                connection_generation,
+                base_view_revision,
+                base_status_revision,
+                snapshot,
+            );
+            Vec::new()
+        }
+        UiEvent::SnapshotRefreshFailed {
+            connection_generation,
+            base_view_revision,
+        } => {
+            if state.accepts_snapshot_refresh(connection_generation, base_view_revision) {
+                state.connection.snapshot_stale = state.status.is_some();
+                state.render_dirty = true;
+            }
             Vec::new()
         }
         UiEvent::ProxyGroupLoaded {
@@ -826,6 +900,7 @@ pub fn update(state: &mut AppState, event: UiEvent) -> Vec<Command> {
                             .unwrap_or(0);
                         state.proxies.selected = 0;
                         state.proxies.scroll = 0;
+                        state.bump_view_revision();
                         state.toast = Some(format!(
                             "Success: Loaded Proxy Group {}",
                             snapshot.group.name
@@ -874,8 +949,17 @@ pub fn update(state: &mut AppState, event: UiEvent) -> Vec<Command> {
             if current {
                 match result {
                     Ok(success) => {
-                        state.replace_snapshot(connection_generation, success.snapshot);
+                        if state.pending.as_ref().is_some_and(|pending| {
+                            pending.kind == PendingOperationKind::ActivateProfile
+                        }) {
+                            state.profiles.activation_pending = None;
+                        }
+                        state.pending = None;
+                        state.proxies.selection_pending = None;
+                        state.connection.snapshot_stale = state.status.is_some();
+                        state.bump_view_revision();
                         state.toast = Some(format!("Success: {}", success.message));
+                        state.render_dirty = true;
                     }
                     Err(message) => {
                         if state.pending.as_ref().is_some_and(|pending| {
@@ -922,6 +1006,18 @@ pub fn update(state: &mut AppState, event: UiEvent) -> Vec<Command> {
             Vec::new()
         }
     }
+}
+
+pub(crate) fn status_requires_snapshot_refresh(
+    previous: &StatusSnapshot,
+    next: &StatusSnapshot,
+) -> bool {
+    previous.active_profile != next.active_profile
+        || previous.runtime_generation != next.runtime_generation
+        || previous.core.instance_generation != next.core.instance_generation
+        || previous.primary_proxy_group != next.primary_proxy_group
+        || previous.selected_node != next.selected_node
+        || previous.latency != next.latency
 }
 
 fn apply_intent(state: &mut AppState, intent: UiIntent) -> Vec<Command> {
@@ -1051,11 +1147,13 @@ fn apply_intent(state: &mut AppState, intent: UiIntent) -> Vec<Command> {
 }
 
 fn append_search(state: &mut AppState, character: char) {
-    if !character.is_control() {
-        if let Some(search) = current_search_mut(state) {
-            search.push(character);
-            state.clamp_selections();
-        }
+    if !character.is_control()
+        && let Some(search) = current_search_mut(state)
+        && search.chars().count() < TUI_SEARCH_MAX_CHARACTERS
+        && search.len().saturating_add(character.len_utf8()) <= TUI_SEARCH_MAX_BYTES
+    {
+        search.push(character);
+        state.clamp_selections();
     }
 }
 
@@ -1181,6 +1279,7 @@ fn issue_profile_activation(state: &mut AppState, profile_id: ProfileId) -> Vec<
         connection_generation: state.connection.generation,
         kind: PendingOperationKind::ActivateProfile,
     });
+    state.bump_view_revision();
     commands.push(Command::ActivateProfile {
         request_id,
         connection_generation: state.connection.generation,
@@ -1210,6 +1309,7 @@ fn issue_node_selection(
         state.proxies.selected_group = Some(group.name.clone());
     }
     state.proxies.selection_pending = Some((group_id.clone(), node_id.clone()));
+    state.bump_view_revision();
     commands.push(Command::SelectNode {
         request_id,
         connection_generation: state.connection.generation,
@@ -2825,15 +2925,15 @@ impl FairEventInbox {
             self.shutdown = Some(event);
             return;
         }
-        if source == EventSource::Telemetry && matches!(event, UiEvent::StatusSnapshot { .. }) {
-            if let Some(position) = self
+        if source == EventSource::Telemetry
+            && matches!(event, UiEvent::StatusSnapshot { .. })
+            && let Some(position) = self
                 .telemetry
                 .iter()
                 .rposition(|queued| matches!(queued, UiEvent::StatusSnapshot { .. }))
-            {
-                self.telemetry[position] = event;
-                return;
-            }
+        {
+            self.telemetry[position] = event;
+            return;
         }
         let index = source_index(source);
         let queue = match source {
@@ -2861,13 +2961,13 @@ impl FairEventInbox {
             .saturating_add(self.budgets.telemetry);
         let mut events = Vec::with_capacity(total_budget);
         drain_source(&mut self.terminal, self.budgets.terminal, &mut events);
+        drain_source(&mut self.telemetry, self.budgets.telemetry, &mut events);
         drain_source(
             &mut self.command_results,
             self.budgets.command_result,
             &mut events,
         );
         drain_source(&mut self.deadlines, self.budgets.deadline, &mut events);
-        drain_source(&mut self.telemetry, self.budgets.telemetry, &mut events);
         events
     }
 

@@ -20,6 +20,7 @@ use hopash::application::{
     RuleSummary, RuntimeApplyFailureStage, RuntimeApplyOutcome, RuntimeApplyStatus,
     SelectorCandidate, SelectorIdentity, SelectorKind,
 };
+use hopash::cancellation::CancellationToken;
 use hopash::constants::{
     IPC_LIST_PAGE_SIZE, IPC_REQUEST_FRAME_MAX_BYTES, LOCAL_RULE_COUNT_MAX, MAX_ACTIVE_NODES,
     PROFILE_COUNT_MAX,
@@ -1326,6 +1327,75 @@ fn mutation_read_deadline_requires_state_reconciliation_before_retry() {
     );
 
     fixture.join().expect("fixture server should stop");
+}
+
+#[test]
+fn cancelling_a_mutation_wait_interrupts_ipc_and_requires_state_reconciliation() {
+    let socket = TempSocket::new("cancelled-mutation-wait");
+    let listener = bind_private_listener(socket.path()).expect("fixture listener should bind");
+    let (request_sender, request_receiver) = std::sync::mpsc::sync_channel(1);
+    let fixture = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("fixture should accept");
+        let _: IpcRequest = read_frame(&mut stream).expect("fixture should read request");
+        request_sender
+            .send(())
+            .expect("fixture should report the request");
+        let mut byte = [0_u8; 1];
+        let _ = stream.read(&mut byte);
+    });
+    let cancellation = CancellationToken::default();
+    let worker_cancellation = cancellation.clone();
+    let client_path = socket.path().to_owned();
+    let worker = thread::spawn(move || {
+        IpcClient::with_timeouts(client_path, Duration::from_secs(5), Duration::from_secs(5))
+            .execute_cancellable(
+                ApplicationOperation::RuleRemove {
+                    rule: "MATCH,DIRECT".to_owned(),
+                },
+                &worker_cancellation,
+            )
+    });
+    request_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("mutation request should reach the fixture");
+
+    let started = Instant::now();
+    cancellation.cancel();
+    let error = worker
+        .join()
+        .expect("client worker should stop")
+        .expect_err("cancelled mutation wait should report an unknown outcome");
+
+    assert!(started.elapsed() < Duration::from_millis(250));
+    assert_eq!(error.code, ErrorCode::ExternalOperationFailed);
+    assert!(!error.retryable);
+    assert!(
+        error
+            .message
+            .contains("query current state before retrying")
+    );
+    fixture.join().expect("fixture server should stop");
+}
+
+#[test]
+fn a_pre_cancelled_query_skips_the_complete_ipc_path() {
+    let socket = TempSocket::new("pre-cancelled-query");
+    let cancellation = CancellationToken::default();
+    cancellation.cancel();
+    let client = IpcClient::with_timeouts(
+        socket.path(),
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    );
+    let started = Instant::now();
+
+    let error = client
+        .execute_cancellable(ApplicationOperation::GetStatus, &cancellation)
+        .expect_err("pre-cancelled query should stop before connecting");
+
+    assert!(started.elapsed() < Duration::from_millis(50));
+    assert_eq!(error.code, ErrorCode::OperationUnavailable);
+    assert!(error.retryable);
 }
 
 #[test]

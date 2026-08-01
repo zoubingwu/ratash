@@ -18,8 +18,9 @@ use hopash::domain::{
 };
 use hopash::ipc::RequestId;
 use hopash::tui::{
-    Command, FullViewSnapshot, KeyInput, ProfileRow, ProxyGroupRow, ProxyGroupSnapshot, ProxyRow,
-    TerminalAction, TerminalControl, TerminalInput, UiEvent, ViewLogRecord,
+    Command, FullViewSnapshot, KeyInput, MutationSuccess, ProfileRow, ProxyGroupRow,
+    ProxyGroupSnapshot, ProxyRow, TerminalAction, TerminalControl, TerminalInput, UiEvent,
+    UiIntent, ViewLogRecord,
 };
 use hopash::tui_runtime::{
     ApplicationSnapshotSource, BackgroundCommandDispatcher, BoundedReconnectTimer,
@@ -371,7 +372,8 @@ fn live_status_revisions_coalesce_into_one_background_snapshot_refresh() {
     assert!(matches!(
         dispatcher.submitted.as_slice(),
         [Command::RefreshSnapshot {
-            connection_generation: 1
+            connection_generation: 1,
+            ..
         }]
     ));
     assert_eq!(waiter.waits(), vec![Some(Duration::from_millis(100))]);
@@ -414,7 +416,8 @@ fn profile_refresh_deadline_requests_a_bounded_full_snapshot() {
     assert!(matches!(
         dispatcher.submitted.as_slice(),
         [Command::RefreshSnapshot {
-            connection_generation: 1
+            connection_generation: 1,
+            ..
         }]
     ));
     assert_eq!(waiter.waits(), vec![Some(Duration::from_secs(1))]);
@@ -443,6 +446,8 @@ fn background_snapshot_refresh_replaces_profiles_and_proxies() {
         source: hopash::tui::EventSource::CommandResult,
         event: UiEvent::SnapshotRefreshed {
             connection_generation: 1,
+            base_view_revision: 2,
+            base_status_revision: 2,
             snapshot: refreshed,
         },
     });
@@ -478,6 +483,94 @@ fn background_snapshot_refresh_replaces_profiles_and_proxies() {
 }
 
 #[test]
+fn mutation_resync_completes_during_live_traffic_without_rolling_status_back() {
+    let profile_id = ProfileId::new();
+    let mut initial = snapshot(10);
+    initial.profiles.push(ProfileRow {
+        id: profile_id,
+        name: "Initial".to_owned(),
+        active: false,
+        fresh: true,
+        last_success_at_unix_ms: 1,
+        next_refresh_at_unix_ms: 40_000,
+        error: None,
+    });
+    let mut refreshed = initial.clone();
+    refreshed.status.traffic.upload_bytes_per_second = 25;
+    refreshed.profiles[0].active = true;
+    refreshed.profiles[0].name = "Resynced".to_owned();
+    let events = Arc::new(ScriptedEvents::new([
+        Some(StatusLogEvent::Status {
+            connection_generation: 1,
+            status: Box::new(status_with_upload(&initial.status, 20)),
+        }),
+        None,
+        Some(StatusLogEvent::Status {
+            connection_generation: 1,
+            status: Box::new(status_with_upload(&initial.status, 30)),
+        }),
+        None,
+        None,
+        Some(StatusLogEvent::Status {
+            connection_generation: 1,
+            status: Box::new(status_with_upload(&initial.status, 40)),
+        }),
+        None,
+    ]));
+    let mut dispatcher = MutationResyncDispatcher::new(refreshed);
+    let mut reconnect = PassiveReconnect;
+    let mut input = ActivationThenQuitInput {
+        polls: 0,
+        quit_on: 7,
+        profile_id,
+    };
+    let clock = AdjustableClock::new(Duration::ZERO, 10_000);
+    let waiter = AdvancingWaiter::new(clock.clone());
+    let signal = NoShutdownSignal;
+    let mut renderer = RecordingRenderer::new();
+    let waker = RuntimeWaker::default();
+
+    let mut runtime = StatusInterfaceRuntime::new(
+        1,
+        initial,
+        StatusInterfacePorts {
+            events,
+            dispatcher: &mut dispatcher,
+            reconnect: &mut reconnect,
+            input: &mut input,
+            waiter: &waiter,
+            waker,
+            clock: &clock,
+            signal: &signal,
+            renderer: &mut renderer,
+        },
+    );
+    runtime.run().expect("mutation resync should remain live");
+
+    assert_eq!(runtime.state().profiles.rows[0].name, "Resynced");
+    assert!(!runtime.state().connection.snapshot_stale);
+    assert_eq!(
+        runtime
+            .state()
+            .status
+            .as_ref()
+            .expect("latest live status should remain visible")
+            .traffic
+            .upload_bytes_per_second,
+        40
+    );
+    assert_eq!(runtime.state().toast.as_deref(), Some("Success: done"));
+    drop(runtime);
+    assert!(matches!(
+        dispatcher.submitted.as_slice(),
+        [
+            Command::ActivateProfile { .. },
+            Command::RefreshSnapshot { .. }
+        ]
+    ));
+}
+
+#[test]
 fn identical_background_snapshot_does_not_render_an_extra_frame() {
     let events = Arc::new(FakeEvents::default());
     let initial = snapshot(10);
@@ -486,6 +579,8 @@ fn identical_background_snapshot_does_not_render_an_extra_frame() {
         source: hopash::tui::EventSource::CommandResult,
         event: UiEvent::SnapshotRefreshed {
             connection_generation: 1,
+            base_view_revision: 2,
+            base_status_revision: 2,
             snapshot: initial.clone(),
         },
     });
@@ -676,7 +771,92 @@ fn background_dispatcher_runs_commands_off_the_render_thread_and_cancels_results
 }
 
 #[test]
-fn successful_mutation_dispatches_a_refreshed_full_snapshot() {
+fn mutation_dispatcher_cancels_the_active_wait_and_keeps_only_the_latest_pending_intent() {
+    let (started_sender, started_receiver) = mpsc::sync_channel(3);
+    let (cancelled_sender, cancelled_receiver) = mpsc::sync_channel(1);
+    let (release_sender, release_receiver) = mpsc::sync_channel(1);
+    let sources = StatusInterfaceSources {
+        snapshots: Arc::new(FakeSnapshots::successful(snapshot(0))),
+        events: Arc::new(FakeEvents::default()),
+        commands: Arc::new(CoalescingCommands {
+            started: started_sender,
+            cancelled: cancelled_sender,
+            release: Mutex::new(release_receiver),
+        }),
+    };
+    let mut dispatcher =
+        BackgroundCommandDispatcher::new(sources).expect("fixture command workers should start");
+    let waker = RuntimeWaker::default();
+    dispatcher.install_waker(waker.clone());
+    let profile_id = ProfileId::new();
+    dispatcher
+        .submit(Command::ActivateProfile {
+            request_id: RequestId(101),
+            connection_generation: 1,
+            profile_id,
+        })
+        .expect("first mutation should start");
+    assert!(matches!(
+        started_receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(ApplicationOperation::ProfileUse { .. })
+    ));
+
+    dispatcher
+        .submit(Command::SelectNode {
+            request_id: RequestId(102),
+            connection_generation: 1,
+            group_id: ProxyGroupId::for_name("Automatic"),
+            node_id: NodeRecordId::for_core("Berlin"),
+        })
+        .expect("second mutation should become pending");
+    cancelled_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("supersession should interrupt the active wait");
+    dispatcher
+        .submit(Command::SelectNode {
+            request_id: RequestId(103),
+            connection_generation: 1,
+            group_id: ProxyGroupId::for_name("Automatic"),
+            node_id: NodeRecordId::for_core("Paris"),
+        })
+        .expect("latest mutation should replace the pending mutation");
+
+    let checkpoint = waker.checkpoint();
+    release_sender
+        .send(())
+        .expect("active cancelled operation should finish");
+    assert_eq!(
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("latest mutation should be promoted"),
+        ApplicationOperation::ProxySelect {
+            group: ProxyGroupId::for_name("Automatic").as_str().to_owned(),
+            node: NodeRecordId::for_core("Paris").as_str().to_owned(),
+        }
+    );
+    waker.wait(checkpoint, Some(Duration::from_secs(1)));
+    assert!(matches!(
+        dispatcher
+            .try_next()
+            .expect("result queue should remain open")
+            .expect("latest mutation should publish its acknowledgement")
+            .event,
+        UiEvent::CommandResult {
+            request_id: RequestId(103),
+            result: Ok(_),
+            ..
+        }
+    ));
+    assert!(
+        started_receiver
+            .recv_timeout(Duration::from_millis(100))
+            .is_err()
+    );
+    dispatcher.shutdown();
+}
+
+#[test]
+fn successful_mutation_dispatches_an_ack_without_waiting_for_resync() {
     let order = Arc::new(Mutex::new(Vec::new()));
     let sources = StatusInterfaceSources {
         snapshots: Arc::new(FakeSnapshots {
@@ -718,7 +898,6 @@ fn successful_mutation_dispatches_a_refreshed_full_snapshot() {
             assert_eq!(request_id, RequestId(92));
             assert_eq!(connection_generation, 6);
             assert_eq!(success.message, "done");
-            assert_eq!(success.snapshot.status.traffic.upload_bytes_per_second, 73);
         }
         other => panic!("unexpected mutation event: {other:?}"),
     }
@@ -727,7 +906,7 @@ fn successful_mutation_dispatches_a_refreshed_full_snapshot() {
             .lock()
             .expect("order lock should be available")
             .as_slice(),
-        ["command", "snapshot", "group"]
+        ["command"]
     );
     dispatcher.shutdown();
 }
@@ -965,6 +1144,13 @@ fn status(upload: u64) -> StatusSnapshot {
     }
 }
 
+fn status_with_upload(status: &StatusSnapshot, upload: u64) -> StatusSnapshot {
+    let mut status = status.clone();
+    status.traffic.upload_bytes_per_second = upload;
+    status.traffic.download_bytes_per_second = upload.saturating_mul(2);
+    status
+}
+
 struct FakeSnapshots {
     snapshot: FullViewSnapshot,
     order: Arc<Mutex<Vec<&'static str>>>,
@@ -1122,6 +1308,52 @@ impl StatusLogEventSource for FakeEvents {
     }
 }
 
+struct ScriptedEvents {
+    events: Mutex<VecDeque<Option<StatusLogEvent>>>,
+}
+
+impl ScriptedEvents {
+    fn new(events: impl IntoIterator<Item = Option<StatusLogEvent>>) -> Self {
+        Self {
+            events: Mutex::new(events.into_iter().collect()),
+        }
+    }
+}
+
+impl StatusLogEventSource for ScriptedEvents {
+    fn connect(
+        &self,
+        _connection_generation: u64,
+        _cancellation: &CancellationToken,
+    ) -> Result<(), StatusInterfaceError> {
+        Ok(())
+    }
+
+    fn try_next(&self) -> Result<Option<StatusLogEvent>, StatusInterfaceError> {
+        Ok(self
+            .events
+            .lock()
+            .expect("scripted event lock should be available")
+            .pop_front()
+            .flatten())
+    }
+
+    fn fetch_log_tail(
+        &self,
+        _connection_generation: u64,
+        _after_sequence: Option<u64>,
+        _cancellation: &CancellationToken,
+    ) -> Result<LogTail, StatusInterfaceError> {
+        Ok(LogTail {
+            records: Vec::new(),
+            gap: false,
+            dropped_total: 0,
+        })
+    }
+
+    fn disconnect(&self, _connection_generation: u64) {}
+}
+
 struct ImmediateCommands;
 
 impl UiCommandExecutor for ImmediateCommands {
@@ -1256,6 +1488,40 @@ struct BlockingCommands {
     finished: mpsc::SyncSender<()>,
 }
 
+struct CoalescingCommands {
+    started: mpsc::SyncSender<ApplicationOperation>,
+    cancelled: mpsc::SyncSender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl UiCommandExecutor for CoalescingCommands {
+    fn execute(
+        &self,
+        operation: ApplicationOperation,
+        cancellation: &CancellationToken,
+    ) -> Result<String, StatusInterfaceError> {
+        self.started
+            .send(operation.clone())
+            .expect("test should receive each started mutation");
+        if matches!(operation, ApplicationOperation::ProfileUse { .. }) {
+            let cancelled = self.cancelled.clone();
+            let _registration = cancellation.register_interrupt(move || {
+                let _ = cancelled.send(());
+            });
+            self.release
+                .lock()
+                .expect("release lock should be available")
+                .recv()
+                .expect("test should release the cancelled mutation");
+            return Err(StatusInterfaceError::new(
+                StatusInterfaceErrorKind::Command,
+                "cancelled",
+            ));
+        }
+        Ok("done".to_owned())
+    }
+}
+
 impl UiCommandExecutor for BlockingCommands {
     fn execute(
         &self,
@@ -1291,6 +1557,69 @@ struct RecordingDispatcher {
     cancelled: Vec<RequestId>,
     cancelled_all: bool,
     shutdown: bool,
+}
+
+struct MutationResyncDispatcher {
+    submitted: Vec<Command>,
+    results: VecDeque<DispatchedEvent>,
+    refreshed: FullViewSnapshot,
+}
+
+impl MutationResyncDispatcher {
+    fn new(refreshed: FullViewSnapshot) -> Self {
+        Self {
+            submitted: Vec::new(),
+            results: VecDeque::new(),
+            refreshed,
+        }
+    }
+}
+
+impl CommandDispatcher for MutationResyncDispatcher {
+    fn submit(&mut self, command: Command) -> Result<(), CommandDispatchError> {
+        match &command {
+            Command::ActivateProfile {
+                request_id,
+                connection_generation,
+                ..
+            } => self.results.push_back(DispatchedEvent {
+                source: hopash::tui::EventSource::CommandResult,
+                event: UiEvent::CommandResult {
+                    request_id: *request_id,
+                    connection_generation: *connection_generation,
+                    result: Ok(MutationSuccess {
+                        message: "done".to_owned(),
+                    }),
+                },
+            }),
+            Command::RefreshSnapshot {
+                connection_generation,
+                base_view_revision,
+                base_status_revision,
+            } => self.results.push_back(DispatchedEvent {
+                source: hopash::tui::EventSource::CommandResult,
+                event: UiEvent::SnapshotRefreshed {
+                    connection_generation: *connection_generation,
+                    base_view_revision: *base_view_revision,
+                    base_status_revision: *base_status_revision,
+                    snapshot: self.refreshed.clone(),
+                },
+            }),
+            _ => {}
+        }
+        self.submitted.push(command);
+        Ok(())
+    }
+
+    fn cancel(&mut self, _request_id: RequestId) {}
+
+    fn cancel_all(&mut self) {}
+
+    fn try_next(&mut self) -> Result<Option<DispatchedEvent>, CommandDispatchError> {
+        Ok(self.results.pop_front())
+    }
+
+    fn shutdown(&mut self) {}
 }
 
 impl CommandDispatcher for RecordingDispatcher {
@@ -1472,6 +1801,28 @@ impl ShutdownSignal for ImmediateShutdown {
 struct ScriptedInput {
     polls: usize,
     quit_on: Option<usize>,
+}
+
+struct ActivationThenQuitInput {
+    polls: usize,
+    quit_on: usize,
+    profile_id: ProfileId,
+}
+
+impl TerminalEventSource for ActivationThenQuitInput {
+    fn try_event(&mut self) -> Result<Option<UiEvent>, StatusInterfaceError> {
+        self.polls = self.polls.saturating_add(1);
+        if self.polls == 1 {
+            return Ok(Some(UiEvent::Intent(UiIntent::ActivateProfile(
+                self.profile_id,
+            ))));
+        }
+        Ok(
+            (self.polls == self.quit_on).then_some(UiEvent::Terminal(TerminalInput::Key(
+                KeyInput::Character('q'),
+            ))),
+        )
+    }
 }
 
 impl ScriptedInput {

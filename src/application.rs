@@ -1,3 +1,4 @@
+use crate::cancellation::CancellationToken;
 use crate::domain::{
     ApplyState, CoreLifecycle, CoreStatus, LocalRuleSetRevision, NodeRecordId, ProbeGeneration,
     ProbeQueueStatus, ProfileId, ProxyGroupId, RuntimeApplySnapshot, RuntimeGeneration,
@@ -37,6 +38,21 @@ pub trait ApplicationClient {
         &self,
         operation: ApplicationOperation,
     ) -> Result<ApplicationOutput, ApplicationError>;
+
+    fn execute_cancellable(
+        &self,
+        operation: ApplicationOperation,
+        cancellation: &CancellationToken,
+    ) -> Result<ApplicationOutput, ApplicationError> {
+        if cancellation.is_cancelled() {
+            return Err(ApplicationError::new(
+                ErrorCode::OperationUnavailable,
+                "The application operation was cancelled",
+                true,
+            ));
+        }
+        self.execute(operation)
+    }
 }
 
 impl Default for ApplicationService {

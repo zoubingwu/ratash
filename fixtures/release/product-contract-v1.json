@@ -70,13 +70,15 @@
     "ipc_frame": 138412032,
     "ipc_request_frame": 262144,
     "core_log_line": 65536,
-    "json_output": 134217728
+    "json_output": 134217728,
+    "tui_search": 256
   },
   "other_limits": {
     "yaml_depth": 64,
     "ipc_list_page": 128,
     "minimum_terminal_width": 80,
-    "minimum_terminal_height": 24
+    "minimum_terminal_height": 24,
+    "tui_search_characters": 128
   },
   "probe_url": "https://www.gstatic.com/generate_204",
   "exit_codes": {

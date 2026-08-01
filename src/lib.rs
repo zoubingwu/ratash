@@ -2,6 +2,7 @@
 
 pub mod application;
 pub mod background;
+pub mod cancellation;
 pub mod cli;
 pub mod config;
 pub mod constants;

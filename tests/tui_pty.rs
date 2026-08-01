@@ -57,6 +57,10 @@ fn pty_child_entry() {
             run_crossterm_status_interface(status_sources(false))
                 .expect("the real terminal runner should exit cleanly");
         }
+        "stalled_q" | "stalled_sigint" | "stalled_sigterm" => {
+            run_crossterm_status_interface(stalled_status_sources())
+                .expect("the cancelled command runner should exit cleanly");
+        }
         "panic" => {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 run_crossterm_status_interface(status_sources(true))
@@ -107,6 +111,21 @@ fn real_pty_sigint_restores_terminal_modes() {
 #[test]
 fn real_pty_sigterm_restores_terminal_modes() {
     assert_signal_restoration("sigterm", Signal::SIGTERM);
+}
+
+#[test]
+fn real_pty_q_interrupts_a_stalled_foreground_command() {
+    assert_stalled_command_restoration("stalled_q", None);
+}
+
+#[test]
+fn real_pty_sigint_interrupts_a_stalled_foreground_command() {
+    assert_stalled_command_restoration("stalled_sigint", Some(Signal::SIGINT));
+}
+
+#[test]
+fn real_pty_sigterm_interrupts_a_stalled_foreground_command() {
+    assert_stalled_command_restoration("stalled_sigterm", Some(Signal::SIGTERM));
 }
 
 #[test]
@@ -173,6 +192,25 @@ fn assert_signal_restoration(scenario: &str, signal: Signal) {
     assert_terminal_restored(&output, scenario);
 }
 
+fn assert_stalled_command_restoration(scenario: &str, signal: Option<Signal>) {
+    let mut session = PtySession::spawn(scenario);
+    session.wait_for_text("Connection:");
+    session.write_input(b"3\r");
+    session.wait_for_text("HOPASH_PTY_COMMAND stalled");
+    let started = Instant::now();
+    if let Some(signal) = signal {
+        session.signal(signal);
+    } else {
+        session.write_input(b"q");
+    }
+    let output = session.finish();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{scenario} should interrupt the foreground wait within one second"
+    );
+    assert_terminal_restored(&output, scenario);
+}
+
 fn exercise_partial_terminal_initialization() {
     let mut control = CrosstermControl::new(FailingWriter::new());
     let error = run_with_terminal_session(&mut control, || Ok::<(), StatusInterfaceError>(()))
@@ -231,6 +269,16 @@ fn status_sources(panic_on_event: bool) -> StatusInterfaceSources {
         snapshots: Arc::new(StaticSnapshots),
         events: Arc::new(StaticEvents { panic_on_event }),
         commands: Arc::new(ImmediateCommands),
+    }
+}
+
+fn stalled_status_sources() -> StatusInterfaceSources {
+    StatusInterfaceSources {
+        snapshots: Arc::new(StaticSnapshots),
+        events: Arc::new(StaticEvents {
+            panic_on_event: false,
+        }),
+        commands: Arc::new(StalledCommands),
     }
 }
 
@@ -294,6 +342,32 @@ impl StatusLogEventSource for StaticEvents {
 }
 
 struct ImmediateCommands;
+
+struct StalledCommands;
+
+impl UiCommandExecutor for StalledCommands {
+    fn execute(
+        &self,
+        _operation: ApplicationOperation,
+        cancellation: &CancellationToken,
+    ) -> Result<String, StatusInterfaceError> {
+        eprintln!("HOPASH_PTY_COMMAND stalled");
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let _registration = cancellation.register_interrupt(move || {
+            let _ = sender.send(());
+        });
+        receiver.recv_timeout(Duration::from_secs(4)).map_err(|_| {
+            StatusInterfaceError::new(
+                hopash::tui_runtime::StatusInterfaceErrorKind::Command,
+                "The stalled fixture did not receive cancellation",
+            )
+        })?;
+        Err(StatusInterfaceError::new(
+            hopash::tui_runtime::StatusInterfaceErrorKind::Command,
+            "The foreground command was cancelled",
+        ))
+    }
+}
 
 impl UiCommandExecutor for ImmediateCommands {
     fn execute(

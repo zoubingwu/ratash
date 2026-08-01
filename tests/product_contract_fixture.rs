@@ -117,6 +117,7 @@ fn release_fixture_freezes_capacities_and_input_boundaries() {
         ("ipc_request_frame", IPC_REQUEST_FRAME_MAX_BYTES),
         ("core_log_line", CORE_LOG_LINE_MAX_BYTES),
         ("json_output", JSON_OUTPUT_MAX_BYTES),
+        ("tui_search", TUI_SEARCH_MAX_BYTES),
     ] {
         assert_eq!(byte_limits[name], actual, "{name} drifted");
     }
@@ -133,6 +134,10 @@ fn release_fixture_freezes_capacities_and_input_boundaries() {
     assert_eq!(
         contract["other_limits"]["minimum_terminal_height"],
         MINIMUM_TERMINAL_HEIGHT
+    );
+    assert_eq!(
+        contract["other_limits"]["tui_search_characters"],
+        TUI_SEARCH_MAX_CHARACTERS
     );
     assert_eq!(contract["probe_url"], PROBE_URL);
 }

@@ -26,6 +26,8 @@ fn observable_product_limits_are_frozen_for_the_release_contract() {
     assert_eq!(TRAFFIC_SERIES_CAPACITY, 300);
     assert_eq!(MINIMUM_TERMINAL_WIDTH, 80);
     assert_eq!(MINIMUM_TERMINAL_HEIGHT, 24);
+    assert_eq!(TUI_SEARCH_MAX_BYTES, 256);
+    assert_eq!(TUI_SEARCH_MAX_CHARACTERS, 128);
     assert_eq!(MAX_ACTIVE_NODES, 10_000);
     assert_eq!(SELECTION_RESTORE_ATTEMPT_LIMIT, 10);
     assert_eq!(LOCAL_RULE_COUNT_MAX, 20_000);
@@ -55,6 +57,7 @@ fn every_input_and_transport_boundary_has_a_positive_limit() {
         IPC_REQUEST_FRAME_MAX_BYTES,
         CORE_LOG_LINE_MAX_BYTES,
         JSON_OUTPUT_MAX_BYTES,
+        TUI_SEARCH_MAX_BYTES,
     ] {
         assert!(limit > 0);
     }

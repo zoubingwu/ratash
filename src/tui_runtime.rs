@@ -17,6 +17,7 @@ use crate::application::{
     ApplicationClient, ApplicationOperation, ApplicationOutput, ProfileMutationAction,
     ProfileRefreshState, ProxyAvailability, ProxyGroupSummary, ProxyListOutcome, ProxyMemberKind,
 };
+pub use crate::cancellation::CancellationToken;
 use crate::constants::{
     LOG_CAPACITY, MAX_ACTIVE_NODES, RECONNECT_INITIAL_BACKOFF, RECONNECT_MAX_BACKOFF,
 };
@@ -26,7 +27,7 @@ use crate::tui::{
     AppState, Command, ConnectionStatus, CrosstermControl, EventSource, FairEventInbox,
     FullViewSnapshot, InteractionMap, MutationSuccess, ProfileRow, ProxyGroupRow,
     ProxyGroupSnapshot, ProxyRow, TerminalControl, TerminalSession, UiEvent, ViewLogRecord,
-    from_crossterm_event, render, update,
+    from_crossterm_event, render, status_requires_snapshot_refresh, update,
 };
 
 const COMMAND_QUEUE_CAPACITY: usize = 32;
@@ -151,22 +152,6 @@ impl RuntimeWaiter for RuntimeWaker {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
         }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct CancellationToken {
-    cancelled: Arc<AtomicBool>,
-}
-
-impl CancellationToken {
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-    }
-
-    #[must_use]
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
     }
 }
 
@@ -306,9 +291,12 @@ where
         if cancellation.is_cancelled() {
             return Err(cancelled_error());
         }
-        let output = self.client.execute(operation).map_err(|error| {
-            StatusInterfaceError::new(StatusInterfaceErrorKind::Command, error.message)
-        })?;
+        let output = self
+            .client
+            .execute_cancellable(operation, cancellation)
+            .map_err(|error| {
+                StatusInterfaceError::new(StatusInterfaceErrorKind::Command, error.message)
+            })?;
         if cancellation.is_cancelled() {
             return Err(cancelled_error());
         }
@@ -366,7 +354,7 @@ where
         check_snapshot_cancellation(cancellation)?;
         let status = match self
             .client
-            .execute(ApplicationOperation::GetStatus)
+            .execute_cancellable(ApplicationOperation::GetStatus, cancellation)
             .map_err(snapshot_application_error)?
         {
             ApplicationOutput::Status(status) => status,
@@ -376,7 +364,7 @@ where
         check_snapshot_cancellation(cancellation)?;
         let profiles = match self
             .client
-            .execute(ApplicationOperation::ProfileList)
+            .execute_cancellable(ApplicationOperation::ProfileList, cancellation)
             .map_err(snapshot_application_error)?
         {
             ApplicationOutput::Profiles(outcome) => outcome
@@ -399,9 +387,12 @@ where
         let (proxy_groups, proxies) = if let Some(group) = status.primary_proxy_group.clone() {
             match self
                 .client
-                .execute(ApplicationOperation::ProxyList {
-                    group: group.clone(),
-                })
+                .execute_cancellable(
+                    ApplicationOperation::ProxyList {
+                        group: group.clone(),
+                    },
+                    cancellation,
+                )
                 .map_err(snapshot_application_error)?
             {
                 ApplicationOutput::Proxies(outcome) => {
@@ -466,9 +457,12 @@ where
         check_snapshot_cancellation(cancellation)?;
         match self
             .client
-            .execute(ApplicationOperation::ProxyList {
-                group: group.to_owned(),
-            })
+            .execute_cancellable(
+                ApplicationOperation::ProxyList {
+                    group: group.to_owned(),
+                },
+                cancellation,
+            )
             .map_err(snapshot_application_error)?
         {
             ApplicationOutput::Proxies(outcome) => Ok(proxy_group_snapshot(outcome)),
@@ -636,6 +630,7 @@ pub struct BackgroundCommandDispatcher {
     sender: SyncSender<WorkerMessage>,
     receiver: Receiver<DispatchedEvent>,
     cancellations: Arc<Mutex<CancellationRegistry>>,
+    mutations: Arc<Mutex<MutationDispatchState>>,
     stopping: Arc<AtomicBool>,
     wake: Arc<Mutex<Option<RuntimeWaker>>>,
     worker_wait_returns: Arc<AtomicU64>,
@@ -646,6 +641,23 @@ struct CancellationRegistry {
     next_task_id: u64,
     tasks: HashMap<u64, CancellationToken>,
     requests: HashMap<RequestId, u64>,
+}
+
+#[derive(Default)]
+struct MutationDispatchState {
+    active_task_id: Option<u64>,
+    pending: Option<CommandWork>,
+}
+
+struct CommandWorkerContext {
+    receiver: Arc<Mutex<Receiver<WorkerMessage>>>,
+    result_sender: SyncSender<DispatchedEvent>,
+    cancellations: Arc<Mutex<CancellationRegistry>>,
+    mutations: Arc<Mutex<MutationDispatchState>>,
+    stopping: Arc<AtomicBool>,
+    wake: Arc<Mutex<Option<RuntimeWaker>>>,
+    worker_wait_returns: Arc<AtomicU64>,
+    sources: StatusInterfaceSources,
 }
 
 impl CancellationRegistry {
@@ -713,6 +725,7 @@ impl BackgroundCommandDispatcher {
         let work_receiver = Arc::new(Mutex::new(work_receiver));
         let (result_sender, receiver) = mpsc::sync_channel(crate::tui::EVENT_SOURCE_CAPACITY);
         let cancellations = Arc::new(Mutex::new(CancellationRegistry::new()));
+        let mutations = Arc::new(Mutex::new(MutationDispatchState::default()));
         let stopping = Arc::new(AtomicBool::new(false));
         let wake = Arc::new(Mutex::new(None));
         let worker_wait_returns = Arc::new(AtomicU64::new(0));
@@ -721,6 +734,7 @@ impl BackgroundCommandDispatcher {
             let receiver = Arc::clone(&work_receiver);
             let result_sender = result_sender.clone();
             let cancellations = Arc::clone(&cancellations);
+            let mutations = Arc::clone(&mutations);
             let worker_stopping = Arc::clone(&stopping);
             let worker_wake = Arc::clone(&wake);
             let worker_wait_returns = Arc::clone(&worker_wait_returns);
@@ -728,15 +742,16 @@ impl BackgroundCommandDispatcher {
             let worker = thread::Builder::new()
                 .name(format!("hopash-tui-command-{index}"))
                 .spawn(move || {
-                    command_worker(
-                        &receiver,
-                        &result_sender,
-                        &cancellations,
-                        &worker_stopping,
-                        &worker_wake,
-                        &worker_wait_returns,
-                        &worker_sources,
-                    );
+                    command_worker(CommandWorkerContext {
+                        receiver,
+                        result_sender,
+                        cancellations,
+                        mutations,
+                        stopping: worker_stopping,
+                        wake: worker_wake,
+                        worker_wait_returns,
+                        sources: worker_sources,
+                    });
                 })
                 .map_err(|_| {
                     stopping.store(true, Ordering::Release);
@@ -757,6 +772,7 @@ impl BackgroundCommandDispatcher {
             sender,
             receiver,
             cancellations,
+            mutations,
             stopping,
             wake,
             worker_wait_returns,
@@ -799,6 +815,9 @@ impl CommandDispatcher for BackgroundCommandDispatcher {
             task_id,
             request_id,
         };
+        if is_mutation_command(&work.command) {
+            return self.submit_mutation(work);
+        }
         match self.sender.try_send(WorkerMessage::Run(work)) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(WorkerMessage::Run(work)))
@@ -847,46 +866,123 @@ impl CommandDispatcher for BackgroundCommandDispatcher {
     }
 }
 
+impl BackgroundCommandDispatcher {
+    fn submit_mutation(&mut self, work: CommandWork) -> Result<(), CommandDispatchError> {
+        let task_id = work.task_id;
+        let mut work = Some(work);
+        let (active_task_id, replaced) = {
+            let mut mutations = self.mutations.lock().map_err(|_| CommandDispatchError)?;
+            if let Some(active_task_id) = mutations.active_task_id {
+                (
+                    Some(active_task_id),
+                    mutations.pending.replace(
+                        work.take()
+                            .expect("mutation work must be available before dispatch"),
+                    ),
+                )
+            } else {
+                mutations.active_task_id = Some(task_id);
+                (None, None)
+            }
+        };
+        if let Some(active_task_id) = active_task_id {
+            if let Ok(mut cancellations) = self.cancellations.lock() {
+                if let Some(cancellation) = cancellations.tasks.get(&active_task_id) {
+                    cancellation.cancel();
+                }
+                if let Some(replaced) = replaced {
+                    replaced.cancellation.cancel();
+                    cancellations.remove(replaced.task_id, replaced.request_id);
+                }
+            }
+            return Ok(());
+        }
+        let work = work.expect("active mutation work must be available before queueing");
+        match self.sender.try_send(WorkerMessage::Run(work)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(WorkerMessage::Run(work)))
+            | Err(TrySendError::Disconnected(WorkerMessage::Run(work))) => {
+                if let Ok(mut mutations) = self.mutations.lock()
+                    && mutations.active_task_id == Some(work.task_id)
+                {
+                    mutations.active_task_id = None;
+                }
+                if let Ok(mut cancellations) = self.cancellations.lock() {
+                    cancellations.remove(work.task_id, work.request_id);
+                }
+                Err(CommandDispatchError)
+            }
+            Err(TrySendError::Full(WorkerMessage::Stop))
+            | Err(TrySendError::Disconnected(WorkerMessage::Stop)) => Err(CommandDispatchError),
+        }
+    }
+}
+
 impl Drop for BackgroundCommandDispatcher {
     fn drop(&mut self) {
         self.shutdown();
     }
 }
 
-fn command_worker(
-    receiver: &Arc<Mutex<Receiver<WorkerMessage>>>,
-    result_sender: &SyncSender<DispatchedEvent>,
-    cancellations: &Arc<Mutex<CancellationRegistry>>,
-    stopping: &AtomicBool,
-    wake: &Arc<Mutex<Option<RuntimeWaker>>>,
-    worker_wait_returns: &AtomicU64,
-    sources: &StatusInterfaceSources,
-) {
-    while !stopping.load(Ordering::Acquire) {
-        let message = match receiver.lock() {
-            Ok(receiver) => receiver.recv(),
-            Err(_) => return,
-        };
-        worker_wait_returns.fetch_add(1, Ordering::Relaxed);
-        let work = match message {
-            Ok(WorkerMessage::Run(work)) => work,
-            Ok(WorkerMessage::Stop) | Err(_) => return,
+fn command_worker(context: CommandWorkerContext) {
+    let mut promoted = None;
+    while !context.stopping.load(Ordering::Acquire) {
+        let work = match promoted.take() {
+            Some(work) => work,
+            None => {
+                let message = match context.receiver.lock() {
+                    Ok(receiver) => receiver.recv(),
+                    Err(_) => return,
+                };
+                context.worker_wait_returns.fetch_add(1, Ordering::Relaxed);
+                match message {
+                    Ok(WorkerMessage::Run(work)) => work,
+                    Ok(WorkerMessage::Stop) | Err(_) => return,
+                }
+            }
         };
         if work.cancellation.is_cancelled() {
-            remove_cancellation(cancellations, work.task_id, work.request_id);
+            remove_cancellation(&context.cancellations, work.task_id, work.request_id);
+            promoted = complete_mutation(&context.mutations, work.task_id);
             continue;
         }
         let result = execute_work(
             &work,
-            &sources.snapshots,
-            &sources.events,
-            &sources.commands,
+            &context.sources.snapshots,
+            &context.sources.events,
+            &context.sources.commands,
         );
-        remove_cancellation(cancellations, work.task_id, work.request_id);
-        if !work.cancellation.is_cancelled() && result_sender.try_send(result).is_ok() {
-            wake_runtime(wake);
+        remove_cancellation(&context.cancellations, work.task_id, work.request_id);
+        if !work.cancellation.is_cancelled() && context.result_sender.try_send(result).is_ok() {
+            wake_runtime(&context.wake);
         }
+        promoted = complete_mutation(&context.mutations, work.task_id);
     }
+}
+
+fn complete_mutation(
+    mutations: &Mutex<MutationDispatchState>,
+    task_id: u64,
+) -> Option<CommandWork> {
+    let mut mutations = mutations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if mutations.active_task_id != Some(task_id) {
+        return None;
+    }
+    mutations.active_task_id = None;
+    let next = mutations.pending.take();
+    if let Some(next) = &next {
+        mutations.active_task_id = Some(next.task_id);
+    }
+    next
+}
+
+fn is_mutation_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::ActivateProfile { .. } | Command::SelectNode { .. }
+    )
 }
 
 fn execute_work(
@@ -934,7 +1030,6 @@ fn execute_work(
                 profile: profile_id.to_string(),
             },
             &work.cancellation,
-            snapshots,
             commands,
         ),
         Command::SelectNode {
@@ -948,7 +1043,6 @@ fn execute_work(
             group_id,
             node_id,
             &work.cancellation,
-            snapshots,
             commands,
         ),
         Command::FetchProxyGroup {
@@ -997,18 +1091,23 @@ fn execute_work(
         }
         Command::RefreshSnapshot {
             connection_generation,
+            base_view_revision,
+            base_status_revision,
         } => match snapshots.refresh_view_snapshot(*connection_generation, &work.cancellation) {
             Ok(snapshot) => DispatchedEvent {
                 source: EventSource::CommandResult,
                 event: UiEvent::SnapshotRefreshed {
                     connection_generation: *connection_generation,
+                    base_view_revision: *base_view_revision,
+                    base_status_revision: *base_status_revision,
                     snapshot,
                 },
             },
             Err(_) => DispatchedEvent {
                 source: EventSource::CommandResult,
-                event: UiEvent::Disconnected {
+                event: UiEvent::SnapshotRefreshFailed {
                     connection_generation: *connection_generation,
+                    base_view_revision: *base_view_revision,
                 },
             },
         },
@@ -1051,18 +1150,12 @@ fn mutation_result(
     connection_generation: u64,
     operation: ApplicationOperation,
     cancellation: &CancellationToken,
-    snapshots: &Arc<dyn FullSnapshotSource>,
     commands: &Arc<dyn UiCommandExecutor>,
 ) -> DispatchedEvent {
     let result = commands
         .execute(operation, cancellation)
-        .and_then(|message| {
-            snapshots
-                .fetch_full_snapshot(connection_generation, cancellation)
-                .map(|snapshot| MutationSuccess {
-                    message: short_terminal_text(&message),
-                    snapshot,
-                })
+        .map(|message| MutationSuccess {
+            message: short_terminal_text(&message),
         });
     command_result(request_id, connection_generation, result)
 }
@@ -1073,7 +1166,6 @@ fn proxy_selection_result(
     group_id: &ProxyGroupId,
     node_id: &crate::domain::NodeRecordId,
     cancellation: &CancellationToken,
-    snapshots: &Arc<dyn FullSnapshotSource>,
     commands: &Arc<dyn UiCommandExecutor>,
 ) -> DispatchedEvent {
     let result = commands
@@ -1084,20 +1176,8 @@ fn proxy_selection_result(
             },
             cancellation,
         )
-        .and_then(|message| {
-            let mut snapshot =
-                snapshots.fetch_full_snapshot(connection_generation, cancellation)?;
-            let selected_group = snapshots.fetch_proxy_group(
-                group_id.as_str(),
-                connection_generation,
-                cancellation,
-            )?;
-            snapshot.proxy_groups = selected_group.groups;
-            snapshot.proxies = selected_group.proxies;
-            Ok(MutationSuccess {
-                message: short_terminal_text(&message),
-                snapshot,
-            })
+        .map(|message| MutationSuccess {
+            message: short_terminal_text(&message),
         });
     command_result(request_id, connection_generation, result)
 }
@@ -1829,15 +1909,6 @@ fn next_profile_refresh_at(snapshot: &FullViewSnapshot) -> Option<u64> {
         .min()
 }
 
-fn status_requires_snapshot_refresh(previous: &StatusSnapshot, next: &StatusSnapshot) -> bool {
-    previous.active_profile != next.active_profile
-        || previous.runtime_generation != next.runtime_generation
-        || previous.core.instance_generation != next.core.instance_generation
-        || previous.primary_proxy_group != next.primary_proxy_group
-        || previous.selected_node != next.selected_node
-        || previous.latency != next.latency
-}
-
 pub struct StatusInterfaceRuntime<'a> {
     state: AppState,
     inbox: FairEventInbox,
@@ -2004,6 +2075,8 @@ impl<'a> StatusInterfaceRuntime<'a> {
         if let Some(connection_generation) = self.freshness.take_due(self.clock.now()) {
             self.dispatch(Command::RefreshSnapshot {
                 connection_generation,
+                base_view_revision: self.state.view_revision(),
+                base_status_revision: self.state.status_revision(),
             });
             ready = true;
         }
@@ -2012,6 +2085,18 @@ impl<'a> StatusInterfaceRuntime<'a> {
 
     fn process_round(&mut self) {
         for event in self.inbox.drain_round() {
+            let committed_mutation = match &event {
+                UiEvent::CommandResult {
+                    request_id,
+                    connection_generation,
+                    result: Ok(_),
+                } => self.state.pending.as_ref().is_some_and(|pending| {
+                    pending.request_id == *request_id
+                        && pending.connection_generation == *connection_generation
+                        && *connection_generation == self.state.connection.generation
+                }),
+                _ => false,
+            };
             let refresh_from_status = match &event {
                 UiEvent::StatusSnapshot {
                     connection_generation,
@@ -2029,12 +2114,22 @@ impl<'a> StatusInterfaceRuntime<'a> {
             let completed_snapshot = match &event {
                 UiEvent::SnapshotRefreshed {
                     connection_generation,
+                    base_view_revision,
+                    base_status_revision: _,
                     snapshot,
                 } => Some((
                     *connection_generation,
                     next_profile_refresh_at(snapshot),
-                    self.state.pending.is_none(),
+                    self.state
+                        .accepts_snapshot_refresh(*connection_generation, *base_view_revision),
                 )),
+                _ => None,
+            };
+            let failed_snapshot = match &event {
+                UiEvent::SnapshotRefreshFailed {
+                    connection_generation,
+                    ..
+                } => Some(*connection_generation),
                 _ => None,
             };
             let connected_snapshot = match &event {
@@ -2062,6 +2157,10 @@ impl<'a> StatusInterfaceRuntime<'a> {
                 self.freshness
                     .request_refresh(self.state.connection.generation, self.clock.now());
             }
+            if committed_mutation {
+                self.freshness
+                    .request_refresh(self.state.connection.generation, self.clock.now());
+            }
             if let Some((generation, next_profile_refresh, accepted)) = completed_snapshot {
                 self.freshness.complete(
                     generation,
@@ -2070,6 +2169,9 @@ impl<'a> StatusInterfaceRuntime<'a> {
                     self.clock.now(),
                     self.clock.now_unix_ms(),
                 );
+            }
+            if let Some(generation) = failed_snapshot {
+                self.freshness.submit_failed(generation, self.clock.now());
             }
             if let Some((generation, next_profile_refresh)) = connected_snapshot
                 && generation == self.state.connection.generation
@@ -2205,6 +2307,7 @@ impl<'a> StatusInterfaceRuntime<'a> {
             }
             command @ Command::RefreshSnapshot {
                 connection_generation,
+                ..
             } => {
                 if connection_generation != self.state.connection.generation
                     || self.state.connection.status != ConnectionStatus::Connected

@@ -13,7 +13,7 @@ use ratatui::layout::Rect;
 use hopash::application::{LatencyFreshness, LatencyProbeStatus};
 use hopash::constants::{
     LOG_CAPACITY, MAX_ACTIVE_NODES, MINIMUM_TERMINAL_HEIGHT, MINIMUM_TERMINAL_WIDTH,
-    TRAFFIC_SERIES_CAPACITY,
+    TRAFFIC_SERIES_CAPACITY, TUI_SEARCH_MAX_BYTES, TUI_SEARCH_MAX_CHARACTERS,
 };
 use hopash::domain::{
     ActiveProfileSummary, ApplyState, CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus,
@@ -495,6 +495,32 @@ fn focused_search_receives_q_and_slash_as_text() {
 }
 
 #[test]
+fn every_search_field_enforces_character_and_utf8_byte_limits() {
+    for page in [Page::Proxies, Page::Profiles, Page::Logs] {
+        let mut ascii = connected_state();
+        ascii.page = page;
+        ascii.focus = Focus::Search;
+        for _ in 0..TUI_SEARCH_MAX_CHARACTERS + 1 {
+            update(&mut ascii, UiEvent::Intent(UiIntent::InputCharacter('a')));
+        }
+        let ascii_search = search_for_page(&ascii, page);
+        assert_eq!(ascii_search.chars().count(), TUI_SEARCH_MAX_CHARACTERS);
+        assert!(ascii_search.len() <= TUI_SEARCH_MAX_BYTES);
+
+        let mut utf8 = connected_state();
+        utf8.page = page;
+        utf8.focus = Focus::Search;
+        for _ in 0..TUI_SEARCH_MAX_CHARACTERS + 1 {
+            update(&mut utf8, UiEvent::Intent(UiIntent::InputCharacter('界')));
+        }
+        let utf8_search = search_for_page(&utf8, page);
+        assert!(utf8_search.chars().count() <= TUI_SEARCH_MAX_CHARACTERS);
+        assert!(utf8_search.len() <= TUI_SEARCH_MAX_BYTES);
+        assert!(utf8_search.len().saturating_add('界'.len_utf8()) > TUI_SEARCH_MAX_BYTES);
+    }
+}
+
+#[test]
 fn global_shortcuts_and_modal_routing_follow_input_priority() {
     let mut state = connected_state();
 
@@ -570,7 +596,7 @@ fn tab_and_shift_tab_visit_only_controls_present_on_each_page() {
 }
 
 #[test]
-fn proxy_group_browsing_keeps_mutations_and_discards_late_group_results() {
+fn proxy_group_browsing_remains_independent_from_mutations() {
     let mut state = connected_state();
     state.proxies.groups.push(manual_proxy_group());
     let profile_id = state.profiles.rows[1].id;
@@ -579,7 +605,6 @@ fn proxy_group_browsing_keeps_mutations_and_discards_late_group_results() {
         UiEvent::Intent(UiIntent::ActivateProfile(profile_id)),
     );
     let (mutation_request_id, generation) = activation_identity(&mutation_commands);
-    let mutation_snapshot = snapshot_from_state(&state);
 
     let group_commands = update(
         &mut state,
@@ -604,11 +629,9 @@ fn proxy_group_browsing_keeps_mutations_and_discards_late_group_results() {
             connection_generation: generation,
             result: Ok(MutationSuccess {
                 message: "Profile activated".to_owned(),
-                snapshot: mutation_snapshot,
             }),
         },
     );
-    let toast = state.toast.clone();
     update(
         &mut state,
         UiEvent::ProxyGroupLoaded {
@@ -618,8 +641,11 @@ fn proxy_group_browsing_keeps_mutations_and_discards_late_group_results() {
         },
     );
 
-    assert_eq!(state.proxies.selected_group.as_deref(), Some("Automatic"));
-    assert_eq!(state.toast, toast);
+    assert_eq!(state.proxies.selected_group.as_deref(), Some("Manual"));
+    assert_eq!(
+        state.toast.as_deref(),
+        Some("Success: Loaded Proxy Group Manual")
+    );
 }
 
 #[test]
@@ -730,7 +756,6 @@ fn stale_command_results_are_discarded_by_request_and_connection_generation() {
             connection_generation: generation,
             result: Ok(MutationSuccess {
                 message: "stale".to_owned(),
-                snapshot: refreshed_snapshot.clone(),
             }),
         },
     );
@@ -753,7 +778,6 @@ fn stale_command_results_are_discarded_by_request_and_connection_generation() {
             connection_generation: generation + 1,
             result: Ok(MutationSuccess {
                 message: "wrong generation".to_owned(),
-                snapshot: refreshed_snapshot.clone(),
             }),
         },
     );
@@ -767,12 +791,51 @@ fn stale_command_results_are_discarded_by_request_and_connection_generation() {
             connection_generation: generation,
             result: Ok(MutationSuccess {
                 message: "Profile activated".to_owned(),
-                snapshot: refreshed_snapshot,
             }),
         },
     );
     assert!(state.pending.is_none());
     assert_eq!(state.toast.as_deref(), Some("Success: Profile activated"));
+    assert!(state.connection.snapshot_stale);
+    assert_eq!(
+        state
+            .status
+            .as_ref()
+            .and_then(|status| status.active_profile.as_ref())
+            .map(|profile| profile.name.as_str()),
+        Some("Work")
+    );
+    assert_eq!(
+        state
+            .status
+            .as_ref()
+            .expect("committed mutation should retain the current status")
+            .traffic
+            .upload_bytes_per_second,
+        100
+    );
+    let base_view_revision = state.view_revision();
+    let base_status_revision = state.status_revision();
+    update(
+        &mut state,
+        UiEvent::SnapshotRefreshFailed {
+            connection_generation: generation,
+            base_view_revision,
+        },
+    );
+    assert_eq!(state.toast.as_deref(), Some("Success: Profile activated"));
+    assert!(state.connection.snapshot_stale);
+
+    update(
+        &mut state,
+        UiEvent::SnapshotRefreshed {
+            connection_generation: generation,
+            base_view_revision,
+            base_status_revision,
+            snapshot: refreshed_snapshot,
+        },
+    );
+    assert!(!state.connection.snapshot_stale);
     assert_eq!(
         state
             .status
@@ -808,7 +871,88 @@ fn stale_command_results_are_discarded_by_request_and_connection_generation() {
             .map(|proxy| proxy.selected),
         Some(true)
     );
-    assert_eq!(state.logs.dropped_total, 3);
+    assert_eq!(state.logs.dropped_total, 0);
+}
+
+#[test]
+fn snapshot_refresh_applies_collections_without_rolling_back_newer_live_status() {
+    let mut state = connected_state();
+    let base_view_revision = state.view_revision();
+    let base_status_revision = state.status_revision();
+    let mut refreshed = snapshot_from_state(&state);
+    refreshed
+        .profiles
+        .push(profile("Added during refresh", false));
+    refreshed.status.traffic.upload_bytes_per_second = 50;
+
+    let mut live = state.status.clone().expect("connected fixture has status");
+    live.traffic.upload_bytes_per_second = 900;
+    update(
+        &mut state,
+        UiEvent::StatusSnapshot {
+            connection_generation: 1,
+            status: live,
+        },
+    );
+    assert_eq!(state.view_revision(), base_view_revision);
+
+    update(
+        &mut state,
+        UiEvent::SnapshotRefreshed {
+            connection_generation: 1,
+            base_view_revision,
+            base_status_revision,
+            snapshot: refreshed,
+        },
+    );
+
+    assert_eq!(state.profiles.rows.len(), 3);
+    assert_eq!(
+        state
+            .status
+            .as_ref()
+            .expect("live status should remain present")
+            .traffic
+            .upload_bytes_per_second,
+        900
+    );
+}
+
+#[test]
+fn collection_revision_discards_a_refresh_started_before_a_relevant_status_change() {
+    let mut state = connected_state();
+    let base_view_revision = state.view_revision();
+    let base_status_revision = state.status_revision();
+    let mut stale = snapshot_from_state(&state);
+    stale.profiles.push(profile("Stale", false));
+
+    let mut live = state.status.clone().expect("connected fixture has status");
+    live.runtime_generation = Some(RuntimeGeneration(2));
+    update(
+        &mut state,
+        UiEvent::StatusSnapshot {
+            connection_generation: 1,
+            status: live,
+        },
+    );
+    update(
+        &mut state,
+        UiEvent::SnapshotRefreshed {
+            connection_generation: 1,
+            base_view_revision,
+            base_status_revision,
+            snapshot: stale,
+        },
+    );
+
+    assert_eq!(state.profiles.rows.len(), 2);
+    assert_eq!(
+        state
+            .status
+            .as_ref()
+            .and_then(|status| status.runtime_generation),
+        Some(RuntimeGeneration(2))
+    );
 }
 
 #[test]
@@ -1086,9 +1230,9 @@ fn fair_event_inbox_gives_each_ready_source_its_budget_every_round() {
     assert_eq!(round.len(), 5);
     assert!(matches!(round[0], UiEvent::Terminal(_)));
     assert!(matches!(round[1], UiEvent::Terminal(_)));
-    assert!(matches!(round[2], UiEvent::CommandResult { .. }));
-    assert!(matches!(round[3], UiEvent::ReconnectDeadline { .. }));
-    assert!(matches!(round[4], UiEvent::LogBatch { .. }));
+    assert!(matches!(round[2], UiEvent::LogBatch { .. }));
+    assert!(matches!(round[3], UiEvent::CommandResult { .. }));
+    assert!(matches!(round[4], UiEvent::ReconnectDeadline { .. }));
     assert_eq!(inbox.len(EventSource::Terminal), 8);
 }
 
@@ -1421,12 +1565,18 @@ fn manual_proxy_snapshot() -> ProxyGroupSnapshot {
     }
 }
 
+fn search_for_page(state: &AppState, page: Page) -> &str {
+    match page {
+        Page::Proxies => &state.proxies.filter,
+        Page::Profiles => &state.profiles.filter,
+        Page::Logs => &state.logs.search,
+        Page::Overview => "",
+    }
+}
+
 fn snapshot_from_state(state: &AppState) -> FullViewSnapshot {
     FullViewSnapshot {
-        status: state
-            .status
-            .clone()
-            .expect("connected state should have status"),
+        status: state.status.clone().expect("connected fixture has status"),
         proxy_groups: state.proxies.groups.clone(),
         proxies: state.proxies.rows.clone(),
         profiles: state.profiles.rows.clone(),
