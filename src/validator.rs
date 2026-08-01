@@ -15,6 +15,7 @@ use crate::constants::{
     MIHOMO_VALIDATION_TIMEOUT,
 };
 use crate::digest::is_lower_sha256_hex;
+use crate::mihomo_command::enforce_managed_runtime;
 
 #[derive(Clone)]
 pub struct MihomoCommandValidator {
@@ -73,14 +74,17 @@ impl MihomoCommandValidator {
         let stdout = files.stdout_file()?;
         let stderr = files.stderr_file()?;
 
-        let mut child = Command::new(binary)
+        let mut command = Command::new(binary);
+        command
             .args(["-t", "-d"])
             .arg(&staging_root)
             .arg("-f")
             .arg(&files.configuration)
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
+            .stderr(Stdio::from(stderr));
+        enforce_managed_runtime(&mut command);
+        let mut child = command
             .spawn()
             .map_err(|_| MihomoValidationError::new(MihomoValidationErrorKind::SpawnFailed))?;
 

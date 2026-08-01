@@ -88,7 +88,7 @@ rules:
         "MATCH,Main".to_owned(),
     ];
     let authoritative = AuthoritativeConfig::new("/private/tmp/hopash-core.sock", "runtime-secret");
-    let compiler = ConfigCompiler::bundled().expect("the bundled catalog should load");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
 
     let effective = compiler
         .compile(&snapshot, &rules, &authoritative, &staging_root)
@@ -164,59 +164,61 @@ rules:
 }
 
 #[test]
-fn closed_catalog_rejects_unknown_fields_at_supported_boundaries() {
-    let staging_root = temporary_root("closed-catalog");
-    let compiler = ConfigCompiler::bundled().expect("the bundled catalog should load");
-    let authoritative = AuthoritativeConfig::new("/tmp/core.sock", "secret");
-    let cases = [
-        ("unknown-root: true\n", "unknown-root"),
-        ("dns:\n  unknown-dns: true\n", "dns.unknown-dns"),
-        ("tun:\n  unknown-tun: true\n", "tun.unknown-tun"),
-        (
-            "sniffer:\n  unknown-sniffer: true\n",
-            "sniffer.unknown-sniffer",
-        ),
-        (
-            "proxy-providers:\n  remote:\n    type: http\n    url: https://example.com/p.yaml\n    unknown-provider: true\n",
-            "proxy-providers.remote.unknown-provider",
-        ),
-        (
-            "rule-providers:\n  local:\n    type: file\n    path: local.yaml\n    unknown-provider: true\n",
-            "rule-providers.local.unknown-provider",
-        ),
-        (
-            "geox-url:\n  unknown-database: https://example.com/data\n",
-            "geox-url.unknown-database",
-        ),
-        (
-            "sniffer:\n  sniff:\n    TLS:\n      ports: ['443']\n      unknown-option: true\n",
-            "sniffer.sniff.TLS.unknown-option",
-        ),
-        (
-            "proxies:\n  - {name: node, type: vmess, server: 127.0.0.1, port: 443, uuid: id, ws-opts: {unknown-option: true}}\n",
-            "proxies[0].ws-opts.unknown-option",
-        ),
-    ];
+fn mihomo_owned_fields_reach_core_validation_unchanged() {
+    let staging_root = temporary_root("mihomo-owned-fields");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
+    let validator = RecordingValidator::default();
 
-    for (yaml, expected_path) in cases {
-        let error = compiler
-            .compile(&snapshot(yaml), &[], &authoritative, &staging_root)
-            .expect_err("the catalog should reject unknown fields");
-        assert_eq!(
-            error,
-            ConfigError::UnsupportedField {
-                path: expected_path.to_owned()
-            }
-        );
-    }
+    compiler
+        .compile_validated(
+            &snapshot(
+                r#"
+future-top-level-option: enabled
+dns:
+  future-dns-option: enabled
+sniffer:
+  future-sniffer-option: enabled
+hosts:
+  example.test: {address: 127.0.0.1}
+proxy-providers:
+  remote:
+    type: http
+    url: https://example.test/provider.yaml
+    age-secret-key: AGE-SECRET-KEY-1FIXTURE
+"#,
+            ),
+            &[],
+            &AuthoritativeConfig::new("/tmp/core.sock", "secret"),
+            &staging_root,
+            &validator,
+        )
+        .expect("Mihomo-owned fields should be delegated to Core validation");
+
+    assert_eq!(validator.calls.get(), 1);
+    let validated: Value = serde_yaml_ng::from_str(
+        validator
+            .yaml
+            .borrow()
+            .as_deref()
+            .expect("the validator should receive the effective configuration"),
+    )
+    .expect("the effective configuration should remain valid YAML");
+    assert_eq!(validated["future-top-level-option"], "enabled");
+    assert_eq!(validated["dns"]["future-dns-option"], "enabled");
+    assert_eq!(validated["sniffer"]["future-sniffer-option"], "enabled");
+    assert_eq!(validated["hosts"]["example.test"]["address"], "127.0.0.1");
+    assert_eq!(
+        validated["proxy-providers"]["remote"]["age-secret-key"],
+        "AGE-SECRET-KEY-1FIXTURE"
+    );
 
     std::fs::remove_dir_all(staging_root).expect("the staging fixture should be removed");
 }
 
 #[test]
-fn catalog_enforces_required_fields_and_concrete_scalar_shapes() {
-    let staging_root = temporary_root("catalog-shapes");
-    let compiler = ConfigCompiler::bundled().expect("the bundled catalog should load");
+fn policy_enforces_hopash_owned_record_shapes() {
+    let staging_root = temporary_root("policy-shapes");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
     let authoritative = AuthoritativeConfig::new("/tmp/core.sock", "secret");
     let cases = [
         (
@@ -226,37 +228,23 @@ fn catalog_enforces_required_fields_and_concrete_scalar_shapes() {
             },
         ),
         (
-            "proxies:\n  - {name: node, type: ss, server: 127.0.0.1, port: 443, password: secret}\n",
+            "proxy-groups:\n  - {type: select, proxies: [DIRECT]}\n",
             ConfigError::MissingField {
-                path: "proxies[0].cipher".to_owned(),
+                path: "proxy-groups[0].name".to_owned(),
             },
         ),
         (
-            "proxy-groups:\n  - {name: Main, proxies: [DIRECT]}\n",
-            ConfigError::MissingDiscriminator {
-                path: "proxy-groups[0]".to_owned(),
-                field: "type".to_owned(),
-            },
-        ),
-        (
-            "dns:\n  enable: 'true'\n",
+            "proxy-groups:\n  - {name: Main, type: select, proxies: DIRECT}\n",
             ConfigError::InvalidShape {
-                path: "dns.enable".to_owned(),
-                expected: "a boolean",
-            },
-        ),
-        (
-            "hosts:\n  example.com: {address: 127.0.0.1}\n",
-            ConfigError::InvalidShape {
-                path: "hosts.example.com".to_owned(),
-                expected: "one of the catalog shapes",
+                path: "proxy-groups[0].proxies".to_owned(),
+                expected: "a sequence",
             },
         ),
     ];
 
     for (yaml, expected) in cases {
         let error = match compiler.compile(&snapshot(yaml), &[], &authoritative, &staging_root) {
-            Ok(_) => panic!("the invalid catalog shape should be rejected: {yaml}"),
+            Ok(_) => panic!("the invalid policy shape should be rejected: {yaml}"),
             Err(error) => error,
         };
         assert_eq!(error, expected, "{yaml}");
@@ -268,7 +256,7 @@ fn catalog_enforces_required_fields_and_concrete_scalar_shapes() {
 #[test]
 fn compiler_validates_rule_shape_policy_targets_and_rule_provider_references() {
     let staging_root = temporary_root("rule-references");
-    let compiler = ConfigCompiler::bundled().expect("the bundled catalog should load");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
     let authoritative = AuthoritativeConfig::new("/tmp/core.sock", "secret");
     let snapshot = snapshot(
         r#"
@@ -334,7 +322,7 @@ sub-rules:
 #[test]
 fn compiler_rejects_duplicate_targets_and_missing_group_members() {
     let staging_root = temporary_root("target-collisions");
-    let compiler = ConfigCompiler::bundled().expect("the bundled catalog should load");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
     let authoritative = AuthoritativeConfig::new("/tmp/core.sock", "secret");
 
     let duplicate = compiler
@@ -385,11 +373,11 @@ fn compiler_rejects_duplicate_targets_and_missing_group_members() {
 }
 
 #[test]
-fn provider_catalog_applies_fields_by_provider_type() {
+fn provider_policy_applies_fields_by_provider_type() {
     let staging_root = temporary_root("provider-types");
     std::fs::write(staging_root.join("local.yaml"), "payload: []\n")
         .expect("the local provider fixture should be written");
-    let compiler = ConfigCompiler::bundled().expect("the bundled catalog should load");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
     let error = compiler
         .compile(
             &snapshot(
@@ -412,11 +400,50 @@ fn provider_catalog_applies_fields_by_provider_type() {
 }
 
 #[test]
+fn provider_payload_is_delegated_for_file_and_http_sources() {
+    let staging_root = temporary_root("provider-payload");
+    std::fs::write(staging_root.join("local.yaml"), "proxies: []\n")
+        .expect("the local provider fixture should be written");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
+    let authoritative = AuthoritativeConfig::new("/tmp/core.sock", "secret");
+
+    let local = compiler
+        .compile(
+            &snapshot(
+                "proxy-providers:\n  local:\n    type: file\n    path: local.yaml\n    payload:\n      - {name: node, type: ss}\n",
+            ),
+            &[],
+            &authoritative,
+            &staging_root,
+        )
+        .expect("a file provider payload should reach Core validation");
+    let remote = compiler
+        .compile(
+            &snapshot(
+                "rule-providers:\n  remote:\n    type: http\n    url: https://example.test/rules.yaml\n    payload: [example.test]\n",
+            ),
+            &[],
+            &authoritative,
+            &staging_root,
+        )
+        .expect("an HTTP provider payload should reach Core validation");
+    let local: Value =
+        serde_yaml_ng::from_str(local.yaml()).expect("the local candidate should parse");
+    let remote: Value =
+        serde_yaml_ng::from_str(remote.yaml()).expect("the remote candidate should parse");
+
+    assert!(local["proxy-providers"]["local"]["payload"].is_sequence());
+    assert!(remote["rule-providers"]["remote"]["payload"].is_sequence());
+
+    std::fs::remove_dir_all(staging_root).expect("the staging fixture should be removed");
+}
+
+#[test]
 fn remote_providers_require_http_urls_and_local_providers_require_regular_files() {
     let staging_root = temporary_root("provider-sources");
     std::fs::create_dir(staging_root.join("directory.yaml"))
         .expect("the directory fixture should be created");
-    let compiler = ConfigCompiler::bundled().expect("the bundled catalog should load");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
     let authoritative = AuthoritativeConfig::new("/tmp/core.sock", "secret");
 
     for url in ["file:///tmp/provider.yaml", "relative/provider.yaml"] {
@@ -457,7 +484,7 @@ fn remote_providers_require_http_urls_and_local_providers_require_regular_files(
 #[test]
 fn compiler_removes_every_profile_owned_inbound_and_control_field() {
     let staging_root = temporary_root("managed-fields");
-    let compiler = ConfigCompiler::bundled().expect("the bundled catalog should load");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
     let authoritative = AuthoritativeConfig::new("/tmp/owned.sock", "owned-secret");
     let snapshot = snapshot(
         r#"
@@ -543,7 +570,7 @@ dns:
 #[test]
 fn compiler_requires_private_endpoint_inputs_and_a_directory_staging_root() {
     let staging_root = temporary_root("authoritative-inputs");
-    let compiler = ConfigCompiler::bundled().expect("the bundled catalog should load");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
     let snapshot = snapshot("{}\n");
 
     for (authoritative, field) in [
@@ -579,7 +606,7 @@ fn compiler_requires_private_endpoint_inputs_and_a_directory_staging_root() {
 #[test]
 fn persisted_configuration_validation_recompiles_with_its_session_values() {
     let staging_root = temporary_root("persisted-configuration");
-    let compiler = ConfigCompiler::bundled().expect("the bundled catalog should load");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
     let snapshot = snapshot("rules: [MATCH,DIRECT]\n");
     let rules = vec!["MATCH,DIRECT".to_owned()];
     let configuration = compiler
@@ -621,7 +648,7 @@ fn local_provider_paths_reject_traversal_external_absolute_paths_and_symlink_esc
         .expect("the provider directory should be created");
     std::os::unix::fs::symlink(&outside_file, staging_root.join("providers/escape.yaml"))
         .expect("the escaping symlink should be created");
-    let compiler = ConfigCompiler::bundled().expect("the bundled catalog should load");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
     let authoritative = AuthoritativeConfig::new("/tmp/core.sock", "secret");
 
     let traversal = compiler
@@ -675,7 +702,7 @@ fn local_provider_paths_reject_traversal_external_absolute_paths_and_symlink_esc
 #[test]
 fn equivalent_documents_produce_identical_yaml_and_policy_sha256() {
     let staging_root = temporary_root("deterministic-config");
-    let compiler = ConfigCompiler::bundled().expect("the bundled catalog should load");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
     let authoritative = AuthoritativeConfig::new("/tmp/core.sock", "secret");
     assert_eq!(compiler.compiler_policy_sha256().len(), 64);
     let first =
@@ -706,6 +733,7 @@ fn equivalent_documents_produce_identical_yaml_and_policy_sha256() {
     std::fs::remove_dir_all(staging_root).expect("the staging fixture should be removed");
 }
 
+#[derive(Default)]
 struct RecordingValidator {
     calls: Cell<usize>,
     yaml: RefCell<Option<String>>,
@@ -726,14 +754,92 @@ impl CoreConfigValidator for RecordingValidator {
 }
 
 #[test]
+fn vless_fingerprint_fields_reach_core_validation_unchanged() {
+    let staging_root = temporary_root("vless-fingerprints");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
+    let validator = RecordingValidator::default();
+
+    let effective = compiler
+        .compile_validated(
+            &snapshot(
+                r#"
+proxies:
+  - name: vless-fixture
+    type: vless
+    server: proxy.example.test
+    port: 443
+    uuid: 00000000-0000-4000-8000-000000000001
+    tls: true
+    fingerprint: "12:34:56:78:90:AB"
+    client-fingerprint: chrome
+"#,
+            ),
+            &[],
+            &AuthoritativeConfig::new("/tmp/core.sock", "secret"),
+            &staging_root,
+            &validator,
+        )
+        .expect("VLESS fingerprint fields should be delegated to Core validation");
+
+    assert_eq!(validator.calls.get(), 1);
+    assert_eq!(validator.yaml.borrow().as_deref(), Some(effective.yaml()));
+    let validated: Value = serde_yaml_ng::from_str(effective.yaml())
+        .expect("the effective configuration should remain valid YAML");
+    assert_eq!(
+        validated["proxies"][0]["fingerprint"].as_str(),
+        Some("12:34:56:78:90:AB")
+    );
+    assert_eq!(
+        validated["proxies"][0]["client-fingerprint"].as_str(),
+        Some("chrome")
+    );
+
+    std::fs::remove_dir_all(staging_root).expect("the staging fixture should be removed");
+}
+
+#[test]
+fn mihomo_native_proxy_types_and_options_are_delegated_to_core_validation() {
+    let staging_root = temporary_root("mihomo-native-proxy");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
+    let validator = RecordingValidator::default();
+
+    let effective = compiler
+        .compile_validated(
+            &snapshot(
+                r#"
+proxies:
+  - name: snell-fixture
+    type: snell
+    server: proxy.example.test
+    port: 44046
+    psk: fixture-key
+    version: 4
+    reuse: true
+"#,
+            ),
+            &[],
+            &AuthoritativeConfig::new("/tmp/core.sock", "secret"),
+            &staging_root,
+            &validator,
+        )
+        .expect("Mihomo-native proxy records should be delegated to Core validation");
+
+    assert_eq!(validator.calls.get(), 1);
+    assert_eq!(validator.yaml.borrow().as_deref(), Some(effective.yaml()));
+    let validated: Value = serde_yaml_ng::from_str(effective.yaml())
+        .expect("the effective configuration should remain valid YAML");
+    assert_eq!(validated["proxies"][0]["type"].as_str(), Some("snell"));
+    assert_eq!(validated["proxies"][0]["psk"].as_str(), Some("fixture-key"));
+    assert_eq!(validated["proxies"][0]["reuse"].as_bool(), Some(true));
+
+    std::fs::remove_dir_all(staging_root).expect("the staging fixture should be removed");
+}
+
+#[test]
 fn fake_core_validator_receives_compiled_candidate_and_staging_root() {
     let staging_root = temporary_root("core-validator");
-    let compiler = ConfigCompiler::bundled().expect("the bundled catalog should load");
-    let validator = RecordingValidator {
-        calls: Cell::new(0),
-        yaml: RefCell::new(None),
-        root: RefCell::new(None),
-    };
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
+    let validator = RecordingValidator::default();
     let effective = compiler
         .compile_validated(
             &snapshot("rules: ['MATCH,DIRECT']\n"),
@@ -775,7 +881,7 @@ impl CoreConfigValidator for RejectingValidator {
 #[test]
 fn compiler_propagates_core_validation_failure_with_safe_debug_output() {
     let staging_root = temporary_root("core-validator-error");
-    let compiler = ConfigCompiler::bundled().expect("the bundled catalog should load");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
     let error = compiler
         .compile_validated(
             &snapshot("rules: ['MATCH,DIRECT']\n"),
@@ -797,7 +903,7 @@ fn compiler_propagates_core_validation_failure_with_safe_debug_output() {
 #[test]
 fn compiler_types_keep_secrets_and_profile_yaml_out_of_debug_output() {
     let staging_root = temporary_root("config-debug");
-    let compiler = ConfigCompiler::bundled().expect("the bundled catalog should load");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
     let authoritative = AuthoritativeConfig::new("/tmp/core.sock", "runtime-secret");
     let effective = compiler
         .compile(
@@ -811,18 +917,20 @@ fn compiler_types_keep_secrets_and_profile_yaml_out_of_debug_output() {
         .expect("the sensitive fixture should compile");
 
     let providers_debug = format!("{:?}", effective.providers());
-    let unsupported = compiler
-        .compile(
+    let rejected = compiler
+        .compile_validated(
             &snapshot(
                 "proxies:\n  - name: node\n    type: profile-token\n    server: 127.0.0.1\n    port: 443\n",
             ),
             &[],
             &authoritative,
             &staging_root,
+            &RejectingValidator,
         )
-        .expect_err("the unsupported proxy type should be rejected");
+        .expect_err("Core validation should decide whether the proxy type is supported");
+    assert!(matches!(rejected, ConfigError::CoreValidationFailed(_)));
     let debug =
-        format!("{authoritative:?} {effective:?} {providers_debug} {unsupported:?} {unsupported}");
+        format!("{authoritative:?} {effective:?} {providers_debug} {rejected:?} {rejected}");
     for sensitive in [
         "runtime-secret",
         "proxy-password",
@@ -847,7 +955,7 @@ fn privileged_validation_rejects_forged_runtime_authority_and_provider_manifest(
     std::fs::write(staging_root.join("providers/local.yaml"), "payload: []\n")
         .expect("the provider fixture should be written");
     let authoritative = AuthoritativeConfig::new("/tmp/owned.sock", "owned-secret");
-    let compiler = ConfigCompiler::bundled().expect("the bundled catalog should load");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
     let effective = compiler
         .compile(
             &snapshot(

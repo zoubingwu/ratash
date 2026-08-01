@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::constants::MIHOMO_BINARY_MAX_BYTES;
 use crate::digest::is_lower_sha256_hex;
 use crate::lifecycle::{ProcessInspector, PsProcessInspector};
+use crate::mihomo_command::enforce_managed_runtime;
 
 pub const INTERNAL_CORE_GUARDIAN_MODE: &str = "__core-guardian";
 pub const CORE_GUARDIAN_PROTOCOL_VERSION: u16 = 1;
@@ -332,18 +333,21 @@ fn run_core_guardian_with_handshake_writer(
     verify_runtime_inputs(&invocation)?;
     let (cancel_reader, cancel_writer) = UnixStream::pair()
         .map_err(|_| io::Error::other("the Core guardian monitor could not start"))?;
+    let mut command = Command::new(&invocation.mihomo);
+    command
+        .arg("-d")
+        .arg(&invocation.working_directory)
+        .arg("-f")
+        .arg(&invocation.configuration)
+        .arg("-ext-ctl-unix")
+        .arg(&invocation.control_socket)
+        .current_dir(&invocation.working_directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    enforce_managed_runtime(&mut command);
     let mut child = ArmedChild::new(
-        Command::new(&invocation.mihomo)
-            .arg("-d")
-            .arg(&invocation.working_directory)
-            .arg("-f")
-            .arg(&invocation.configuration)
-            .arg("-ext-ctl-unix")
-            .arg(&invocation.control_socket)
-            .current_dir(&invocation.working_directory)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+        command
             .spawn()
             .map_err(|_| io::Error::other("the guarded Core could not start"))?,
     );

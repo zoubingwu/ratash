@@ -63,9 +63,10 @@
 - `src/persistence.rs` owns private content-addressed objects, recoverable transaction journals, the committed manifest pointer, and bounded reachability pruning after durable journal cleanup.
 - `src/state.rs` stages and hydrates the complete authoritative Supervisor state through immutable objects and the committed transaction pointer.
 - `src/transaction.rs` serializes every Runtime Generation producer, revalidates revisions, confirms Core identity and health, and converges failures to the committed pointer.
-- `src/config.rs` compiles Profile Snapshots through the bundled Mihomo field catalog, applies authoritative fields, and exposes both user-side Core validation and privileged authoritative-policy validation seams.
+- `src/config.rs` compiles Profile Snapshots through the bundled configuration policy, owns security-sensitive and authoritative fields, validates structural fields consumed by Hopash, and exposes both user-side Core validation and privileged authoritative-policy validation seams.
 - `src/validator.rs` verifies the pinned Mihomo binary and runs bounded `-t` validation inside the private staging root without starting the Core.
-- `fixtures/mihomo/v1.19.28/config-schema.yaml` is the closed field catalog bound to the bundled Core version.
+- `src/mihomo_command.rs` removes Mihomo configuration, lifecycle-hook, controller, secret, and path-safety override environment variables from validation and runtime processes.
+- `fixtures/mihomo/v1.19.28/config-policy.yaml` is the compact configuration policy bound to the bundled Core version. It records security-sensitive and authoritative field ownership plus the structural fields Hopash consumes; native Mihomo fields pass through to the pinned `mihomo -t` parser and semantic validator.
 - `src/core.rs` defines the authenticated CoreRuntime boundary, Mihomo adapter contract, versioned Proxy View, selection resolution, and fixed API codecs.
 - `src/core_service_ipc.rs` implements the versioned privileged CoreRuntime Unix socket protocol, kernel-identity-bound owner sessions, injectable dynamic-peer authorization, and secure Runtime Bundle ingress.
 - `src/core_service_ipc/authorization.rs` owns peer identity and authorization; `client.rs` owns the CoreRuntime client; `error.rs` owns shared transport, authorization, and protocol error translation; `ingress.rs` owns secure Runtime Bundle staging; `server.rs` owns dispatch and bounded lifecycle; `socket.rs` owns private socket setup and cleanup; `wire.rs` owns private protocol DTOs.
@@ -107,7 +108,7 @@
 - Profiles originate from remote HTTP(S) Subscription URLs. A Profile Snapshot is read-only and retains the latest validated content.
 - Exactly one Active Profile participates in Effective Configuration composition, Runtime Apply, proxy selection, and Delay Probes.
 - An Inactive Profile refresh updates stored state only. An Active Profile refresh commits after a successful Runtime Apply.
-- Treat every Profile Snapshot as untrusted input. Compile it against the field catalog for the bundled Mihomo version, reject unknown fields, remove inbound and external-control fields, and set application-owned values explicitly.
+- Treat every Profile Snapshot as untrusted input. Apply the bundled configuration policy to security-sensitive, authoritative, and Hopash-consumed structural fields; preserve Core-owned fields and require the pinned `mihomo -t` validator to accept the Effective Configuration.
 - The Local Rule Set fully replaces the Profile Snapshot's top-level `rules` field.
 - Rule mutations use complete, case-sensitive Rule Strings and the shared configuration transaction path.
 - Delay Probes cover the deduplicated Node set of the Active Profile only.

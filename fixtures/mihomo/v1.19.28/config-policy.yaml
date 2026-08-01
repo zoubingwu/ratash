@@ -1,0 +1,120 @@
+policy-version: 1
+core-version: v1.19.28
+additional-fields: core-passthrough
+top-level:
+  allow-lan: { kind: managed-replace }
+  authentication: { kind: managed-drop }
+  bind-address: { kind: managed-drop }
+  dns:
+    kind: mapping
+    additional-fields: core-passthrough
+    fields:
+      enable: { kind: managed-replace }
+      fallback: { kind: managed-replace }
+      listen: { kind: managed-drop }
+      listen-routing-mark: { kind: managed-drop }
+  external-controller: { kind: managed-drop }
+  external-controller-cors: { kind: managed-drop }
+  external-controller-pipe: { kind: managed-drop }
+  external-controller-routing-mark: { kind: managed-drop }
+  external-controller-tls: { kind: managed-drop }
+  external-controller-unix: { kind: managed-replace }
+  external-doh-server: { kind: managed-drop }
+  external-ui: { kind: managed-drop }
+  external-ui-name: { kind: managed-drop }
+  external-ui-url: { kind: managed-drop }
+  inbound-mptcp: { kind: managed-drop }
+  inbound-tfo: { kind: managed-drop }
+  interface-name: { kind: managed-drop }
+  iptables: { kind: managed-drop }
+  lan-allowed-ips: { kind: managed-drop }
+  lan-disallowed-ips: { kind: managed-drop }
+  listeners: { kind: managed-drop }
+  mixed-port: { kind: managed-drop }
+  mode: { kind: managed-replace }
+  ntp:
+    kind: mapping
+    additional-fields: core-passthrough
+    fields:
+      write-to-system: { kind: managed-drop }
+  port: { kind: managed-drop }
+  proxies:
+    kind: sequence
+    item: &proxy
+      kind: mapping
+      required: [name, type]
+      additional-fields: core-passthrough
+      fields:
+        name: { kind: string }
+        type: { kind: string }
+  proxy-groups:
+    kind: sequence
+    item:
+      kind: mapping
+      required: [name, type]
+      additional-fields: core-passthrough
+      fields:
+        name: { kind: string }
+        proxies: &string-sequence
+          kind: sequence
+          item: { kind: string }
+        type: { kind: string }
+        use: *string-sequence
+  proxy-providers:
+    kind: named-map
+    value:
+      kind: discriminated
+      discriminator: type
+      required: [type]
+      variant-required:
+        file: [path]
+        http: [url]
+        inline: [payload]
+      additional-fields: core-passthrough
+      common:
+        payload:
+          kind: sequence
+          item: *proxy
+        type: { kind: string }
+      variants:
+        file:
+          path: { kind: string }
+        http:
+          path: { kind: string }
+          url: { kind: string }
+        inline: {}
+  redir-port: { kind: managed-drop }
+  rule-providers:
+    kind: named-map
+    value:
+      kind: discriminated
+      discriminator: type
+      required: [type]
+      variant-required:
+        file: [path]
+        http: [url]
+        inline: [payload]
+      additional-fields: core-passthrough
+      common:
+        payload: *string-sequence
+        type: { kind: string }
+      variants:
+        file:
+          path: { kind: string }
+        http:
+          path: { kind: string }
+          url: { kind: string }
+        inline: {}
+  rules: { kind: managed-replace }
+  secret: { kind: managed-replace }
+  skip-auth-prefixes: { kind: managed-drop }
+  socks-port: { kind: managed-drop }
+  ss-config: { kind: managed-drop }
+  sub-rules:
+    kind: named-map
+    value: *string-sequence
+  tproxy-port: { kind: managed-drop }
+  tuic-server: { kind: managed-drop }
+  tun: { kind: managed-replace }
+  tunnels: { kind: managed-drop }
+  vmess-config: { kind: managed-drop }

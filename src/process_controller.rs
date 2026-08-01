@@ -23,6 +23,7 @@ use crate::core::{CoreControlEndpoint, MihomoAdapter, MihomoReadiness, ProcessOu
 use crate::core_guardian::{CoreGuardianHandshake, CoreGuardianInvocation, read_handshake};
 use crate::lifecycle::{ProcessInspector, PsProcessInspector};
 use crate::mihomo::UnixMihomoAdapter;
+use crate::mihomo_command::enforce_managed_runtime;
 use crate::service::{
     CoreProcessController, CoreProcessLog, CoreProcessLogBatch, OwnedProcessIdentity,
     ProcessIdentityProbe, ServicePlatformError, ServicePlatformErrorKind, SpawnedCoreProcess,
@@ -481,7 +482,8 @@ impl NativeCoreProcessController {
         endpoint: &CoreControlEndpoint,
     ) -> Result<SpawnedManagedChild, ServicePlatformError> {
         let generation_root = bundle.bundle().generation_root.as_path();
-        let mut child = Command::new(bundle.executable_path())
+        let mut command = Command::new(bundle.executable_path());
+        command
             .arg("-d")
             .arg(generation_root)
             .arg("-f")
@@ -491,7 +493,9 @@ impl NativeCoreProcessController {
             .current_dir(generation_root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        enforce_managed_runtime(&mut command);
+        let mut child = command
             .spawn()
             .map_err(|_| platform_error(ServicePlatformErrorKind::Spawn))?;
         let pid = child.id();

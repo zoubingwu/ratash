@@ -9,9 +9,9 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use url::Url;
 
-const BUNDLED_CATALOG: &str = include_str!("../fixtures/mihomo/v1.19.28/config-schema.yaml");
+const BUNDLED_POLICY: &str = include_str!("../fixtures/mihomo/v1.19.28/config-policy.yaml");
 pub const BUNDLED_CORE_VERSION: &str = "v1.19.28";
-const COMPILER_POLICY_REVISION: &str = "hopash-config-policy-v2";
+const COMPILER_POLICY_REVISION: &str = "hopash-config-policy-v3";
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct AuthoritativeConfig {
@@ -182,8 +182,8 @@ impl std::error::Error for CoreValidationError {}
 
 #[derive(Clone, Eq, PartialEq)]
 pub enum ConfigError {
-    CatalogInvalid,
-    CatalogVersionMismatch,
+    PolicyInvalid,
+    PolicyVersionMismatch,
     UnsupportedField {
         path: String,
     },
@@ -250,8 +250,8 @@ pub enum ConfigError {
 impl fmt::Debug for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let kind = match self {
-            Self::CatalogInvalid => "CatalogInvalid",
-            Self::CatalogVersionMismatch => "CatalogVersionMismatch",
+            Self::PolicyInvalid => "PolicyInvalid",
+            Self::PolicyVersionMismatch => "PolicyVersionMismatch",
             Self::UnsupportedField { .. } => "UnsupportedField",
             Self::UnsupportedVariant { .. } => "UnsupportedVariant",
             Self::InvalidShape { .. } => "InvalidShape",
@@ -280,16 +280,16 @@ impl fmt::Debug for ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CatalogInvalid => {
-                formatter.write_str("the bundled Mihomo field catalog is invalid")
+            Self::PolicyInvalid => {
+                formatter.write_str("the bundled configuration policy is invalid")
             }
-            Self::CatalogVersionMismatch => formatter
-                .write_str("the bundled Mihomo field catalog version does not match the Core"),
+            Self::PolicyVersionMismatch => formatter
+                .write_str("the bundled configuration policy version does not match the Core"),
             Self::UnsupportedField { .. } => {
-                formatter.write_str("the Profile Snapshot contains an unsupported field")
+                formatter.write_str("the Profile Snapshot violates the configuration policy")
             }
             Self::UnsupportedVariant { .. } => {
-                formatter.write_str("the Profile Snapshot contains an unsupported variant")
+                formatter.write_str("the Profile Snapshot uses an unsupported provider source")
             }
             Self::InvalidShape { .. } => {
                 formatter.write_str("the Profile Snapshot contains an invalid field shape")
@@ -365,20 +365,20 @@ impl std::error::Error for ConfigError {
 }
 
 pub struct ConfigCompiler {
-    catalog: FieldCatalog,
+    policy: ConfigPolicy,
     compiler_policy_sha256: String,
 }
 
 impl ConfigCompiler {
     pub fn bundled() -> Result<Self, ConfigError> {
-        let catalog: FieldCatalog =
-            serde_yaml_ng::from_str(BUNDLED_CATALOG).map_err(|_| ConfigError::CatalogInvalid)?;
-        if catalog.schema_version != 1 || catalog.core_version != BUNDLED_CORE_VERSION {
-            return Err(ConfigError::CatalogVersionMismatch);
+        let policy: ConfigPolicy =
+            serde_yaml_ng::from_str(BUNDLED_POLICY).map_err(|_| ConfigError::PolicyInvalid)?;
+        if policy.policy_version != 1 || policy.core_version != BUNDLED_CORE_VERSION {
+            return Err(ConfigError::PolicyVersionMismatch);
         }
         let compiler_policy_sha256 = policy_sha256();
         Ok(Self {
-            catalog,
+            policy,
             compiler_policy_sha256,
         })
     }
@@ -396,12 +396,12 @@ impl ConfigCompiler {
         staging_root: &Path,
     ) -> Result<EffectiveConfiguration, ConfigError> {
         validate_authoritative(authoritative)?;
-        self.catalog.validate(snapshot.document())?;
+        self.policy.validate(snapshot.document())?;
         validate_references(snapshot.document(), rules)?;
         let canonical_root = canonical_staging_root(staging_root)?;
         let mut document = snapshot.document().clone();
 
-        strip_managed_mapping(&mut document, &self.catalog.top_level);
+        strip_managed_mapping(&mut document, &self.policy.top_level);
 
         document.insert(
             "rules".into(),
@@ -449,14 +449,14 @@ impl ConfigCompiler {
                 .then_with(|| left.name.cmp(&right.name))
         });
 
-        self.catalog.validate(&document)?;
+        self.policy.validate(&document)?;
         let canonical = canonicalize(Value::Mapping(document));
         let yaml =
             serde_yaml_ng::to_string(&canonical).map_err(|_| ConfigError::SerializationFailed)?;
 
         Ok(EffectiveConfiguration {
             yaml,
-            core_version: self.catalog.core_version.clone(),
+            core_version: self.policy.core_version.clone(),
             compiler_policy_sha256: self.compiler_policy_sha256.clone(),
             providers,
         })
@@ -517,8 +517,8 @@ impl ConfigCompiler {
         let document = document
             .as_mapping()
             .ok_or(ConfigError::PersistedConfigurationInvalid)?;
-        self.catalog.validate(document)?;
-        validate_managed_fields_absent(document, &self.catalog.top_level, "")?;
+        self.policy.validate(document)?;
+        validate_managed_fields_absent(document, &self.policy.top_level, "")?;
 
         if document.get("mode").and_then(Value::as_str) != Some("rule")
             || document.get("allow-lan").and_then(Value::as_bool) != Some(false)
@@ -549,15 +549,17 @@ impl ConfigCompiler {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
-struct FieldCatalog {
-    schema_version: u16,
+struct ConfigPolicy {
+    policy_version: u16,
     core_version: String,
+    #[serde(default)]
+    additional_fields: AdditionalFields,
     top_level: BTreeMap<String, SchemaNode>,
 }
 
-impl FieldCatalog {
+impl ConfigPolicy {
     fn validate(&self, document: &Mapping) -> Result<(), ConfigError> {
-        validate_known_mapping(document, &self.top_level, "")
+        validate_known_mapping(document, &self.top_level, "", self.additional_fields)
     }
 }
 
@@ -614,14 +616,14 @@ fn validate_references(document: &Mapping, rules: &[String]) -> Result<(), Confi
         for (name, rules) in sub_rules {
             let name = name
                 .as_str()
-                .expect("the field catalog requires string sub-rule names");
+                .expect("the configuration policy requires string sub-rule names");
             let rules = rules
                 .as_sequence()
-                .expect("the field catalog requires sub-rule sequences");
+                .expect("the configuration policy requires sub-rule sequences");
             validate_rule_strings(
                 rules.iter().map(|rule| {
                     rule.as_str()
-                        .expect("the field catalog requires rule strings")
+                        .expect("the configuration policy requires rule strings")
                 }),
                 &child_path("sub-rules", name),
                 &policy_targets,
@@ -650,7 +652,7 @@ fn collect_record_names(
                 .as_mapping()
                 .and_then(|record| record.get("name"))
                 .and_then(Value::as_str)
-                .expect("the field catalog requires string record names");
+                .expect("the configuration policy requires string record names");
             if name.is_empty() {
                 return Err(ConfigError::EmptyName { path });
             }
@@ -668,7 +670,7 @@ fn collect_map_names(document: &Mapping, section: &str) -> Result<BTreeSet<Strin
         .map(|name| {
             let name = name
                 .as_str()
-                .expect("the field catalog requires string map keys");
+                .expect("the configuration policy requires string map keys");
             if name.is_empty() {
                 return Err(ConfigError::EmptyName {
                     path: section.to_owned(),
@@ -714,7 +716,7 @@ fn validate_group_references(
     for (index, group) in groups.iter().enumerate() {
         let group = group
             .as_mapping()
-            .expect("the field catalog requires proxy group mappings");
+            .expect("the configuration policy requires proxy group mappings");
         for (field, available, reference_kind) in [
             ("proxies", policy_targets, "proxy or Proxy Group"),
             ("use", proxy_provider_names, "proxy provider"),
@@ -725,7 +727,7 @@ fn validate_group_references(
             for (reference_index, reference) in references.iter().enumerate() {
                 let name = reference
                     .as_str()
-                    .expect("the field catalog requires string references");
+                    .expect("the configuration policy requires string references");
                 if !available.contains(name) {
                     return Err(ConfigError::UnavailableReference {
                         path: format!("proxy-groups[{index}].{field}[{reference_index}]"),
@@ -821,17 +823,26 @@ fn reserved_proxy_names() -> BTreeSet<String> {
     .collect()
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum AdditionalFields {
+    #[default]
+    Reject,
+    CorePassthrough,
+}
+
+impl AdditionalFields {
+    const fn are_core_passthrough(self) -> bool {
+        matches!(self, Self::CorePassthrough)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum SchemaNode {
-    Scalar,
     String,
-    Boolean,
-    Integer,
     ManagedDrop,
-    OneOf {
-        options: Vec<SchemaNode>,
-    },
+    ManagedReplace,
     Sequence {
         item: Box<SchemaNode>,
     },
@@ -839,6 +850,8 @@ enum SchemaNode {
         fields: BTreeMap<String, SchemaNode>,
         #[serde(default)]
         required: Vec<String>,
+        #[serde(default, rename = "additional-fields")]
+        additional_fields: AdditionalFields,
     },
     NamedMap {
         value: Box<SchemaNode>,
@@ -851,30 +864,16 @@ enum SchemaNode {
         required: Vec<String>,
         #[serde(default, rename = "variant-required")]
         variant_required: BTreeMap<String, Vec<String>>,
+        #[serde(default, rename = "additional-fields")]
+        additional_fields: AdditionalFields,
     },
 }
 
 fn validate_node(value: &Value, schema: &SchemaNode, path: &str) -> Result<(), ConfigError> {
     match schema {
-        SchemaNode::ManagedDrop => Ok(()),
-        SchemaNode::Scalar if is_scalar(value) => Ok(()),
-        SchemaNode::Scalar => Err(invalid_shape(path, "a scalar")),
+        SchemaNode::ManagedDrop | SchemaNode::ManagedReplace => Ok(()),
         SchemaNode::String if value.is_string() => Ok(()),
         SchemaNode::String => Err(invalid_shape(path, "a string")),
-        SchemaNode::Boolean if value.is_bool() => Ok(()),
-        SchemaNode::Boolean => Err(invalid_shape(path, "a boolean")),
-        SchemaNode::Integer if is_integer(value) => Ok(()),
-        SchemaNode::Integer => Err(invalid_shape(path, "an integer")),
-        SchemaNode::OneOf { options } => {
-            if options
-                .iter()
-                .any(|option| validate_node(value, option, path).is_ok())
-            {
-                Ok(())
-            } else {
-                Err(invalid_shape(path, "one of the catalog shapes"))
-            }
-        }
         SchemaNode::Sequence { item } => {
             let Value::Sequence(values) = value else {
                 return Err(invalid_shape(path, "a sequence"));
@@ -884,12 +883,16 @@ fn validate_node(value: &Value, schema: &SchemaNode, path: &str) -> Result<(), C
             }
             Ok(())
         }
-        SchemaNode::Mapping { fields, required } => {
+        SchemaNode::Mapping {
+            fields,
+            required,
+            additional_fields,
+        } => {
             let Value::Mapping(mapping) = value else {
                 return Err(invalid_shape(path, "a mapping"));
             };
             validate_required_fields(mapping, required, path)?;
-            validate_known_mapping(mapping, fields, path)
+            validate_known_mapping(mapping, fields, path, *additional_fields)
         }
         SchemaNode::NamedMap {
             value: value_schema,
@@ -916,6 +919,7 @@ fn validate_node(value: &Value, schema: &SchemaNode, path: &str) -> Result<(), C
             variants,
             required,
             variant_required,
+            additional_fields,
         } => {
             let Value::Mapping(mapping) = value else {
                 return Err(invalid_shape(path, "a mapping"));
@@ -942,13 +946,18 @@ fn validate_node(value: &Value, schema: &SchemaNode, path: &str) -> Result<(), C
                 let Some(key) = key.as_str() else {
                     return Err(invalid_shape(path, "a string-keyed mapping"));
                 };
-                let field_schema = common
-                    .get(key)
-                    .or_else(|| variant_fields.get(key))
-                    .ok_or_else(|| ConfigError::UnsupportedField {
-                        path: child_path(path, key),
-                    })?;
-                validate_node(value, field_schema, &child_path(path, key))?;
+                let field_path = child_path(path, key);
+                if let Some(field_schema) = common.get(key).or_else(|| variant_fields.get(key)) {
+                    validate_node(value, field_schema, &field_path)?;
+                    continue;
+                }
+                if variants
+                    .values()
+                    .any(|variant_fields| variant_fields.contains_key(key))
+                    || !additional_fields.are_core_passthrough()
+                {
+                    return Err(ConfigError::UnsupportedField { path: field_path });
+                }
             }
             Ok(())
         }
@@ -959,18 +968,18 @@ fn validate_known_mapping(
     mapping: &Mapping,
     fields: &BTreeMap<String, SchemaNode>,
     path: &str,
+    additional_fields: AdditionalFields,
 ) -> Result<(), ConfigError> {
     for (key, value) in mapping {
         let Some(key) = key.as_str() else {
             return Err(invalid_shape(path, "a string-keyed mapping"));
         };
         let field_path = child_path(path, key);
-        let schema = fields
-            .get(key)
-            .ok_or_else(|| ConfigError::UnsupportedField {
-                path: field_path.clone(),
-            })?;
-        validate_node(value, schema, &field_path)?;
+        if let Some(schema) = fields.get(key) {
+            validate_node(value, schema, &field_path)?;
+        } else if !additional_fields.are_core_passthrough() {
+            return Err(ConfigError::UnsupportedField { path: field_path });
+        }
     }
     Ok(())
 }
@@ -992,7 +1001,7 @@ fn validate_required_fields(
 
 fn strip_managed_mapping(mapping: &mut Mapping, fields: &BTreeMap<String, SchemaNode>) {
     for (field, schema) in fields {
-        if matches!(schema, SchemaNode::ManagedDrop) {
+        if matches!(schema, SchemaNode::ManagedDrop | SchemaNode::ManagedReplace) {
             mapping.remove(field.as_str());
         } else if let Some(value) = mapping.get_mut(field.as_str()) {
             strip_managed_node(value, schema);
@@ -1037,7 +1046,7 @@ fn strip_managed_node(value: &mut Value, schema: &SchemaNode) {
                 return;
             };
             for (field, schema) in common.iter().chain(variant) {
-                if matches!(schema, SchemaNode::ManagedDrop) {
+                if matches!(schema, SchemaNode::ManagedDrop | SchemaNode::ManagedReplace) {
                     mapping.remove(field.as_str());
                 } else if let Some(value) = mapping.get_mut(field.as_str()) {
                     strip_managed_node(value, schema);
@@ -1058,11 +1067,12 @@ fn validate_managed_fields_absent(
             continue;
         };
         let field_path = child_path(path, field);
-        if matches!(schema, SchemaNode::ManagedDrop) {
-            if !matches!(field_path.as_str(), "external-controller-unix" | "secret") {
+        match schema {
+            SchemaNode::ManagedDrop => {
                 return Err(ConfigError::PersistedConfigurationInvalid);
             }
-            continue;
+            SchemaNode::ManagedReplace => continue,
+            _ => {}
         }
         validate_managed_node_absent(value, schema, &field_path)?;
     }
@@ -1076,6 +1086,7 @@ fn validate_managed_node_absent(
 ) -> Result<(), ConfigError> {
     match (value, schema) {
         (_, SchemaNode::ManagedDrop) => Err(ConfigError::PersistedConfigurationInvalid),
+        (_, SchemaNode::ManagedReplace) => Ok(()),
         (Value::Sequence(values), SchemaNode::Sequence { item }) => {
             for (index, value) in values.iter().enumerate() {
                 validate_managed_node_absent(value, item, &format!("{path}[{index}]"))?;
@@ -1117,10 +1128,9 @@ fn validate_managed_node_absent(
                 let field = field
                     .as_str()
                     .ok_or(ConfigError::PersistedConfigurationInvalid)?;
-                let schema = common
-                    .get(field)
-                    .or_else(|| variant.get(field))
-                    .ok_or(ConfigError::PersistedConfigurationInvalid)?;
+                let Some(schema) = common.get(field).or_else(|| variant.get(field)) else {
+                    continue;
+                };
                 let field_path = child_path(path, field);
                 if matches!(schema, SchemaNode::ManagedDrop) {
                     return Err(ConfigError::PersistedConfigurationInvalid);
@@ -1128,13 +1138,6 @@ fn validate_managed_node_absent(
                 validate_managed_node_absent(value, schema, &field_path)?;
             }
             Ok(())
-        }
-        (_, SchemaNode::OneOf { options }) => {
-            let option = options
-                .iter()
-                .find(|option| validate_node(value, option, path).is_ok())
-                .ok_or(ConfigError::PersistedConfigurationInvalid)?;
-            validate_managed_node_absent(value, option, path)
         }
         _ => Ok(()),
     }
@@ -1198,7 +1201,7 @@ fn classify_provider_section(
     for (name, provider) in providers {
         let name = name
             .as_str()
-            .expect("the field catalog already requires string provider names")
+            .expect("the configuration policy already requires string provider names")
             .to_owned();
         let Value::Mapping(provider) = provider else {
             return Err(invalid_shape(&child_path(section_name, &name), "a mapping"));
@@ -1251,7 +1254,7 @@ fn classify_provider_section(
             Some("inline") => {
                 provider.remove("path");
             }
-            _ => unreachable!("the field catalog already validates provider types"),
+            _ => unreachable!("the configuration policy already validates provider types"),
         }
     }
     Ok(())
@@ -1345,25 +1348,14 @@ fn invalid_shape(path: &str, expected: &'static str) -> ConfigError {
     }
 }
 
-fn is_scalar(value: &Value) -> bool {
-    matches!(value, Value::Bool(_) | Value::Number(_) | Value::String(_))
-}
-
-fn is_integer(value: &Value) -> bool {
-    match value {
-        Value::Number(number) => number.as_i64().is_some() || number.as_u64().is_some(),
-        _ => false,
-    }
-}
-
 fn policy_sha256() -> String {
     let managed = b"rules=local\nmode=rule\nallow-lan=false\ntun.enable=true\ntun.stack=gvisor\ntun.auto-route=true\ntun.strict-route=false\ntun.auto-detect-interface=true\ntun.dns-hijack=any:53\ndns.enable=true\ndns.fallback=[]";
     let mut policy = Vec::with_capacity(
-        COMPILER_POLICY_REVISION.len() + BUNDLED_CATALOG.len() + managed.len() + 2,
+        COMPILER_POLICY_REVISION.len() + BUNDLED_POLICY.len() + managed.len() + 2,
     );
     policy.extend_from_slice(COMPILER_POLICY_REVISION.as_bytes());
     policy.push(0);
-    policy.extend_from_slice(BUNDLED_CATALOG.as_bytes());
+    policy.extend_from_slice(BUNDLED_POLICY.as_bytes());
     policy.push(0);
     policy.extend_from_slice(managed);
     sha256_hex(&policy)

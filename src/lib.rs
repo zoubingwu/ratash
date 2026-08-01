@@ -20,6 +20,7 @@ pub mod ipc;
 pub mod ipc_runtime;
 pub mod lifecycle;
 pub mod mihomo;
+mod mihomo_command;
 pub mod persistence;
 pub mod process_controller;
 pub mod production;

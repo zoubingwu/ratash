@@ -169,13 +169,6 @@ pub(super) fn map_config_error(error: ConfigError) -> ApplicationError {
             "The configuration contains an unavailable Policy Target",
             false,
         ),
-        ConfigError::UnsupportedField { .. } | ConfigError::UnsupportedVariant { .. } => {
-            ApplicationError::new(
-                ErrorCode::ProfileFieldUnsupported,
-                "The Profile contains a field unsupported by the bundled Mihomo version",
-                false,
-            )
-        }
         _ => ApplicationError::new(ErrorCode::ExternalOperationFailed, error.to_string(), false),
     }
 }

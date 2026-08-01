@@ -1257,34 +1257,42 @@ fn startup_apply_exposes_pending_runtime_recovery_health() {
 }
 
 #[test]
-fn profile_add_reports_the_stable_error_for_an_unsupported_catalog_field() {
-    let harness = Harness::new("unsupported-profile-field");
+fn profile_add_accepts_core_owned_fields_for_runtime_apply() {
+    let harness = Harness::new("core-owned-profile-field");
+    let mut body = fixture_profile("node-a");
+    body.extend_from_slice(b"clash-for-android:\n  append-system-dns: true\n");
     harness.source.push(Ok(FetchedProfile {
-        body: b"unsupported-top-level-field: true\n".to_vec(),
-        metadata_name: Some("Unsupported".to_owned()),
+        body,
+        metadata_name: Some("Core Owned".to_owned()),
     }));
     let supervisor = harness.open();
 
-    let error = supervisor
+    let ApplicationOutput::ProfileMutation(added) = supervisor
         .execute(ApplicationOperation::ProfileAdd {
             subscription_url: SubscriptionUrl::parse(
-                "https://example.test/unsupported-profile.yaml",
+                "https://example.test/core-owned-profile.yaml",
             )
             .expect("the URL should be valid"),
         })
-        .expect_err("the unsupported Profile field should be rejected");
+        .expect("the Core-owned Profile field should reach Runtime Apply")
+    else {
+        panic!("Profile add should return a mutation output")
+    };
 
     assert_eq!(
-        error.code,
-        hopash::error::ErrorCode::ProfileFieldUnsupported
+        added.action,
+        hopash::application::ProfileMutationAction::Added
     );
+    assert!(added.profile.active);
     assert_eq!(
-        error.message,
-        "The Profile contains a field unsupported by the bundled Mihomo version"
+        added
+            .runtime_apply
+            .as_ref()
+            .and_then(|apply| apply.committed_generation),
+        Some(RuntimeGeneration(1))
     );
-    assert!(!error.retryable);
-    assert_eq!(harness.transactions.apply_count.load(Ordering::Relaxed), 0);
-    assert!(profile_list(&supervisor).is_empty());
+    assert_eq!(harness.transactions.apply_count.load(Ordering::Relaxed), 1);
+    assert_eq!(profile_list(&supervisor).len(), 1);
 }
 
 #[test]
