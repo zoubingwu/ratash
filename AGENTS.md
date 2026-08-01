@@ -48,6 +48,7 @@
 - `src/application.rs` defines transport-independent operations, outputs, errors, and the application service seam.
 - `src/background.rs` owns bounded Profile refresh, delay-probe, and generation-scoped Mihomo telemetry workers with wakeable shutdown and reconnect backoff.
 - `src/supervisor.rs` coordinates copy-on-write Profile, proxy, latency, rule, refresh, probe, telemetry, cause-scoped Wrapper health reasons and diagnostic transitions, public Core health projection, and bounded list-page projection through injected persistence, Runtime Apply, Profile source, and Core ports.
+- `src/supervisor/ports.rs` defines injected Supervisor boundaries; `transactions.rs` owns candidate assembly and transaction execution; `projections.rs` owns transport-independent status and list projection; `errors.rs` owns safe error translation; `outcomes.rs` owns operation result types; `tests.rs` owns focused unit fixtures.
 - `src/domain.rs` defines shared lifecycle, identity, status, and validated value types.
 - `src/diagnostics.rs` owns safe typed Wrapper diagnostic categories, structured transition records, and bounded tail and gap semantics.
 - `src/contract.rs` owns the versioned JSON V1 envelope and explicit status DTO projection.
