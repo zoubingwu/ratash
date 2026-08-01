@@ -10,7 +10,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,7 +29,6 @@ pub const CORE_GUARDIAN_PROTOCOL_VERSION: u16 = 1;
 const HANDSHAKE_MAX_BYTES: usize = 1_024;
 const START_IDENTITY_MAX_BYTES: usize = 512;
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
-const CHILD_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 struct ArmedChild {
     child: Child,
@@ -43,37 +42,32 @@ enum ControlEvent {
     Canceled,
 }
 
+enum SupervisionEvent {
+    Child(io::Result<()>),
+    Control(io::Result<ControlEvent>),
+}
+
 struct ControlMonitor {
     cancel: UnixStream,
-    events: Receiver<io::Result<ControlEvent>>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl ControlMonitor {
-    fn start(cancel: UnixStream, wake: UnixStream) -> io::Result<Self> {
-        let (event_sender, events) = mpsc::sync_channel(1);
+    fn start(
+        cancel: UnixStream,
+        wake: UnixStream,
+        events: SyncSender<SupervisionEvent>,
+    ) -> io::Result<Self> {
         let handle = thread::Builder::new()
             .name("hopash-core-guardian-control".to_owned())
             .spawn(move || {
-                let _ = event_sender.send(monitor_control_pipe(cancel));
+                let _ = events.send(SupervisionEvent::Control(monitor_control_pipe(cancel)));
             })
             .map_err(|_| io::Error::other("the Core guardian monitor could not start"))?;
         Ok(Self {
             cancel: wake,
-            events,
             handle: Some(handle),
         })
-    }
-
-    fn receive(&self, timeout: Duration) -> io::Result<Option<ControlEvent>> {
-        match self.events.recv_timeout(timeout) {
-            Ok(Ok(event)) => Ok(Some(event)),
-            Ok(Err(error)) => Err(error),
-            Err(RecvTimeoutError::Timeout) => Ok(None),
-            Err(RecvTimeoutError::Disconnected) => {
-                Err(io::Error::other("the Core guardian monitor disconnected"))
-            }
-        }
     }
 
     fn finish(mut self) -> io::Result<()> {
@@ -353,7 +347,9 @@ fn run_core_guardian_with_handshake_writer(
             .map_err(|_| io::Error::other("the guarded Core could not start"))?,
     );
     let pid = child.id();
-    let control_monitor = ControlMonitor::start(cancel_reader, cancel_writer)?;
+    let (event_sender, events) = mpsc::sync_channel(2);
+    let control_monitor =
+        ControlMonitor::start(cancel_reader, cancel_writer, event_sender.clone())?;
     let process_start_identity = match discover_identity(pid) {
         Ok(identity) => identity,
         Err(error) => {
@@ -387,12 +383,18 @@ fn run_core_guardian_with_handshake_writer(
 
     let stdout_forwarder = thread::spawn(move || forward(child_stdout, io::stdout()));
     let stderr_forwarder = thread::spawn(move || forward(child_stderr, io::stderr()));
+    let child_waiter = thread::Builder::new()
+        .name("hopash-core-guardian-child".to_owned())
+        .spawn(move || {
+            let result = child.wait().map(|_| ());
+            let _ = event_sender.send(SupervisionEvent::Child(result));
+        })
+        .map_err(|_| io::Error::other("the Core guardian child waiter could not start"))?;
 
-    let wait_result = supervise_child(
-        &mut child,
-        |timeout| control_monitor.receive(timeout),
-        ArmedChild::terminate_and_reap,
-    );
+    let wait_result = supervise_child(pid, &events, signal_guarded_child);
+    let child_result = child_waiter
+        .join()
+        .map_err(|_| io::Error::other("the Core guardian child waiter failed"));
     let control_result = control_monitor.finish();
     let stdout_result = stdout_forwarder
         .join()
@@ -401,6 +403,7 @@ fn run_core_guardian_with_handshake_writer(
         .join()
         .map_err(|_| io::Error::other("the guarded Core output forwarder failed"))?;
     wait_result
+        .and(child_result)
         .and(control_result)
         .and(stdout_result)
         .and(stderr_result)
@@ -408,33 +411,69 @@ fn run_core_guardian_with_handshake_writer(
 }
 
 fn supervise_child(
-    child: &mut ArmedChild,
-    mut receive_control: impl FnMut(Duration) -> io::Result<Option<ControlEvent>>,
-    mut terminate: impl FnMut(&mut ArmedChild) -> io::Result<()>,
+    pid: u32,
+    events: &Receiver<SupervisionEvent>,
+    mut signal: impl FnMut(u32, Signal) -> io::Result<()>,
 ) -> io::Result<()> {
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) => {}
-            Err(_) => {
-                let _ = terminate(child);
-                return Err(io::Error::other("the guarded Core could not be reaped"));
-            }
+    match events.recv() {
+        Ok(SupervisionEvent::Child(result)) => result,
+        Ok(SupervisionEvent::Control(Ok(ControlEvent::ParentEof))) => {
+            terminate_guarded_child(pid, events, &mut signal)
         }
-        match receive_control(CHILD_EXIT_POLL_INTERVAL) {
-            Ok(Some(ControlEvent::ParentEof)) => return terminate(child),
-            Ok(Some(ControlEvent::Canceled)) => {
-                let _ = terminate(child);
+        Ok(SupervisionEvent::Control(Ok(ControlEvent::Canceled))) => {
+            let _ = terminate_guarded_child(pid, events, &mut signal);
+            Err(io::Error::other(
+                "the Core guardian monitor stopped unexpectedly",
+            ))
+        }
+        Ok(SupervisionEvent::Control(Err(_))) | Err(_) => {
+            let _ = terminate_guarded_child(pid, events, &mut signal);
+            Err(io::Error::other("the Core guardian monitor failed"))
+        }
+    }
+}
+
+fn terminate_guarded_child(
+    pid: u32,
+    events: &Receiver<SupervisionEvent>,
+    signal: &mut impl FnMut(u32, Signal) -> io::Result<()>,
+) -> io::Result<()> {
+    signal(pid, Signal::SIGTERM)?;
+    let deadline = Instant::now() + TERMINATION_GRACE;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match events.recv_timeout(remaining) {
+            Ok(SupervisionEvent::Child(result)) => return result,
+            Ok(SupervisionEvent::Control(_)) if !remaining.is_zero() => {}
+            Ok(SupervisionEvent::Control(_)) | Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(io::Error::other(
-                    "the Core guardian monitor stopped unexpectedly",
+                    "the Core guardian child waiter disconnected",
                 ));
             }
-            Ok(None) => {}
+        }
+    }
+    signal(pid, Signal::SIGKILL)?;
+    loop {
+        match events.recv() {
+            Ok(SupervisionEvent::Child(result)) => return result,
+            Ok(SupervisionEvent::Control(_)) => {}
             Err(_) => {
-                let _ = terminate(child);
-                return Err(io::Error::other("the Core guardian monitor failed"));
+                return Err(io::Error::other(
+                    "the Core guardian child waiter disconnected",
+                ));
             }
         }
+    }
+}
+
+fn signal_guarded_child(pid: u32, signal: Signal) -> io::Result<()> {
+    let pid = i32::try_from(pid)
+        .map(Pid::from_raw)
+        .map_err(|_| io::Error::other("the guarded Core PID is invalid"))?;
+    match kill(pid, signal) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
     }
 }
 
@@ -730,40 +769,29 @@ mod tests {
 
     #[test]
     fn ordinary_exit_wins_a_queued_parent_eof_without_post_reap_termination() {
-        let mut child = ArmedChild::new(
-            Command::new("/bin/sh")
-                .arg("-c")
-                .arg("exit 0")
-                .spawn()
-                .expect("the ordinary-exit fixture should start"),
-        );
-        child
-            .wait()
-            .expect("the ordinary-exit fixture should be reaped");
+        let (sender, events) = mpsc::sync_channel(2);
+        sender
+            .send(SupervisionEvent::Child(Ok(())))
+            .expect("the child exit should queue");
+        sender
+            .send(SupervisionEvent::Control(Ok(ControlEvent::ParentEof)))
+            .expect("the parent EOF should queue");
         let mut unrelated = FixtureChild(
             Command::new("/bin/sleep")
                 .arg("30")
                 .spawn()
                 .expect("the unrelated fixture should start"),
         );
-        let mut control_was_read = false;
-        let mut termination_was_called = false;
+        let unrelated_pid = unrelated.0.id();
+        let mut signaled = false;
 
-        supervise_child(
-            &mut child,
-            |_| {
-                control_was_read = true;
-                Ok(Some(ControlEvent::ParentEof))
-            },
-            |_| {
-                termination_was_called = true;
-                Ok(())
-            },
-        )
-        .expect("the already-reaped Core should complete cleanly");
+        supervise_child(unrelated_pid, &events, |_, _| {
+            signaled = true;
+            Ok(())
+        })
+        .expect("the queued child exit should complete cleanly");
 
-        assert!(!control_was_read);
-        assert!(!termination_was_called);
+        assert!(!signaled);
         assert!(
             unrelated
                 .0
@@ -771,5 +799,33 @@ mod tests {
                 .expect("the unrelated fixture should be inspectable")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn idle_supervision_blocks_until_a_child_or_control_event() {
+        let (sender, events) = mpsc::sync_channel(2);
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let result = supervise_child(42, &events, |_, _| Ok(()));
+            done_sender
+                .send(result)
+                .expect("the supervision result should send");
+        });
+        assert!(
+            done_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "idle supervision should remain blocked without an event"
+        );
+
+        sender
+            .send(SupervisionEvent::Child(Ok(())))
+            .expect("the child exit should wake supervision");
+
+        done_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the child event should finish supervision")
+            .expect("the child event should succeed");
+        worker.join().expect("the supervision worker should join");
     }
 }
