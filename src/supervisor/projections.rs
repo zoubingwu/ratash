@@ -1,23 +1,37 @@
 //! Projects authoritative Supervisor state into application and status DTOs.
 
-use super::{
-    ActiveProfileSummary, ApplicationError, ApplicationLatencyFreshness,
-    ApplicationLatencyProbeStatus, Availability, BTreeMap, CORE_LOG_LINE_MAX_BYTES,
-    CoreDiagnosticCategory, CoreInstanceGeneration, CoreLifecycle, CoreProbeStatus,
-    CoreRestartStatus, CoreRuntimeLifecycle, CoreRuntimeStatus, CoreRuntimeTunReason, CoreStatus,
-    DefaultHasher, ErrorCode, Hash, Hasher, LOG_CAPACITY, LatencySummary, LogTail,
-    ManagedCoreHandle, NodeRecordId, NodeRowMemberV1, NodeSelection, NodeSource,
-    PolicyTargetValidation, ProbeGeneration, ProbeObservation, ProbeQueueStatus, ProbeStatus,
-    Profile, ProfileCatalog, ProfileId, ProfileRefreshFailure, ProfileRefreshStage,
-    ProfileRefreshState, ProfileSummary, ProxyAvailability, ProxyGroupId, ProxyGroupSummary,
-    ProxyMemberKind, ProxyNodeRow, ProxyNodeSource, ProxyView, RefreshContext, RefreshStage,
-    RuleSummary, RuntimeApplySnapshot, RuntimeDiagnosticCategory, RuntimeGeneration, SampleState,
-    SelectedNodeSummary, SelectionError, SelectorCandidate, SelectorIdentity, SelectorKind,
-    StatusSnapshot, StreamHealthSet, StreamState, SupervisorHealthReason, SupervisorLifecycle,
-    SupervisorState, SupervisorStatus, TRAFFIC_SERIES_CAPACITY, TelemetryStore, TrafficSample,
-    TunReason, TunStatus, WrapperDiagnosticContext, internal_error, no_active_profile,
-    selector_not_found,
+use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+use crate::application::{
+    ApplicationError, LatencyFreshness as ApplicationLatencyFreshness,
+    LatencyProbeStatus as ApplicationLatencyProbeStatus, LatencySummary, PolicyTargetValidation,
+    ProfileRefreshFailure, ProfileRefreshStage, ProfileRefreshState, ProfileSummary,
+    ProxyAvailability, ProxyGroupSummary, ProxyMemberKind, ProxyNodeRow, ProxyNodeSource,
+    RuleSummary, SelectorCandidate, SelectorIdentity, SelectorKind,
 };
+use crate::constants::{CORE_LOG_LINE_MAX_BYTES, LOG_CAPACITY, TRAFFIC_SERIES_CAPACITY};
+use crate::core::{
+    Availability, CoreRuntimeDiagnosticCategory as RuntimeDiagnosticCategory, CoreRuntimeLifecycle,
+    CoreRuntimeStatus, CoreRuntimeTunReason, ManagedCoreHandle, NodeRowMemberV1, NodeSelection,
+    NodeSource, ProbeObservation, ProbeStatus as CoreProbeStatus, ProxyView, SelectionError,
+};
+use crate::diagnostics::WrapperDiagnosticContext;
+use crate::domain::{
+    ActiveProfileSummary, CoreDiagnosticCategory, CoreInstanceGeneration, CoreLifecycle,
+    CoreRestartStatus, CoreStatus, NodeRecordId, ProbeGeneration, ProbeQueueStatus, ProfileId,
+    ProxyGroupId, RuntimeApplySnapshot, RuntimeGeneration, SampleState, SelectedNodeSummary,
+    StatusSnapshot, StreamHealthSet, StreamState, SupervisorHealthReason, SupervisorLifecycle,
+    SupervisorStatus, TrafficSample, TunReason, TunStatus,
+};
+use crate::error::ErrorCode;
+use crate::profile::{Profile, ProfileCatalog, RefreshContext, RefreshStage};
+use crate::scheduler::ProbeStatus;
+use crate::telemetry::{LogTail, TelemetryStore};
+
+use super::SupervisorState;
+use super::errors::{internal_error, no_active_profile, selector_not_found};
 
 pub(super) fn profile_summary(profile: &Profile, active: Option<ProfileId>) -> ProfileSummary {
     ProfileSummary {

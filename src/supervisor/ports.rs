@@ -1,9 +1,16 @@
 //! Defines external Supervisor adapters and application-facing ports.
 
-use super::{
-    Arc, CoreRuntime, CoreRuntimeStatus, ManagedCoreHandle, MihomoAdapter, MihomoError,
-    MihomoErrorKind, NodeSelection, ProfileSource, ProxyView, SubscriptionUrl, bounded_message, io,
+use std::io;
+use std::sync::Arc;
+
+use crate::core::{
+    CoreRuntime, CoreRuntimeStatus, ManagedCoreHandle, MihomoAdapter, MihomoError, MihomoErrorKind,
+    NodeSelection, ProxyView,
 };
+use crate::domain::SubscriptionUrl;
+use crate::profile_source::ProfileSource;
+
+use super::errors::bounded_message;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FetchedProfile {

@@ -1,11 +1,16 @@
 //! Projects transaction outcomes into runtime apply and recovery results.
 
-use super::{
-    ApplicationRecoveryOutcome, ConfigTransactionSuccess, RecoveryStatus, RuntimeApplyOutcome,
-    RuntimeApplyPhase, RuntimeApplySnapshot, RuntimeApplyStatus, RuntimeGeneration,
-    RuntimeRecoverySnapshot, RuntimeRecoveryStatus, SupervisorTransactionFailure,
-    TransactionRecoveryOutcome,
+use crate::application::{
+    RecoveryOutcome as ApplicationRecoveryOutcome, RecoveryStatus, RuntimeApplyOutcome,
+    RuntimeApplyStatus,
 };
+use crate::domain::{
+    RuntimeApplyPhase, RuntimeApplySnapshot, RuntimeGeneration, RuntimeRecoverySnapshot,
+    RuntimeRecoveryStatus,
+};
+use crate::transaction::{ConfigTransactionSuccess, RecoveryOutcome as TransactionRecoveryOutcome};
+
+use super::transactions::SupervisorTransactionFailure;
 
 pub(super) fn successful_runtime_apply_snapshot(
     success: ConfigTransactionSuccess,

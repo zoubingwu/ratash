@@ -1,13 +1,20 @@
 //! Maps domain and transaction failures into stable application errors.
 
-use super::{
-    ApplicationError, ApplicationErrorDetails, ApplicationRulePlacement, ConfigError,
-    ConfigTransactionErrorKind, ErrorCode, ProfileCatalog, ProfileId, ProfileSelectorError,
-    RULE_STRING_MAX_BYTES, RefreshStage, RulePlacement, RuleSetError, RuleString,
-    RuntimeApplyFailureDetails, RuntimeApplyFailureStage, SelectionError, SelectorCandidate,
-    SelectorKind, SupervisorTransactionFailure, SupervisorTransactionFailureKind,
-    application_recovery, parse_rule,
+use crate::application::{
+    ApplicationError, ApplicationErrorDetails, RulePlacement as ApplicationRulePlacement,
+    RuntimeApplyFailureDetails, RuntimeApplyFailureStage, SelectorCandidate, SelectorKind,
 };
+use crate::config::ConfigError;
+use crate::constants::RULE_STRING_MAX_BYTES;
+use crate::core::SelectionError;
+use crate::domain::ProfileId;
+use crate::error::ErrorCode;
+use crate::profile::{ProfileCatalog, ProfileSelectorError, RefreshStage};
+use crate::rule::{RulePlacement, RuleSetError, RuleString, parse_rule};
+use crate::transaction::ConfigTransactionErrorKind;
+
+use super::outcomes::application_recovery;
+use super::transactions::{SupervisorTransactionFailure, SupervisorTransactionFailureKind};
 
 pub(super) fn checked_rule(value: String) -> Result<RuleString, ApplicationError> {
     let rule = RuleString::new(value, RULE_STRING_MAX_BYTES).map_err(|_| invalid_rule_error())?;

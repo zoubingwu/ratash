@@ -1,75 +1,46 @@
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet};
-use std::hash::{Hash, Hasher};
-use std::io;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, TryLockError};
 
 use crate::application::{
-    ApplicationClient, ApplicationError, ApplicationErrorDetails, ApplicationOperation,
-    ApplicationOutput, Clock, LatencyFreshness as ApplicationLatencyFreshness, LatencyListOutcome,
-    LatencyProbeStatus as ApplicationLatencyProbeStatus, LatencyShowOutcome, LatencySummary,
-    PolicyTargetValidation, ProfileListOutcome, ProfileListPageOutcome, ProfileMutationAction,
-    ProfileMutationOutcome, ProfileRefreshFailure, ProfileRefreshStage, ProfileRefreshState,
-    ProfileSummary, ProxyAvailability, ProxyGroupSummary, ProxyListOutcome, ProxyListPageOutcome,
-    ProxyMemberKind, ProxyNodeRow, ProxyNodeSource, ProxySelectionOutcome,
-    RecoveryOutcome as ApplicationRecoveryOutcome, RecoveryStatus, RuleListOutcome,
-    RuleListPageOutcome, RuleMutationAction, RuleMutationOutcome,
-    RulePlacement as ApplicationRulePlacement, RuleSummary, RuntimeApplyFailureDetails,
-    RuntimeApplyFailureStage, RuntimeApplyOutcome, RuntimeApplyStatus, SelectorCandidate,
-    SelectorIdentity, SelectorKind,
+    ApplicationClient, ApplicationError, ApplicationOperation, ApplicationOutput, Clock,
+    LatencyListOutcome, LatencyShowOutcome, ProfileListOutcome, ProfileListPageOutcome,
+    ProfileMutationAction, ProfileMutationOutcome, ProxyListOutcome, ProxyListPageOutcome,
+    ProxySelectionOutcome, RecoveryOutcome as ApplicationRecoveryOutcome, RecoveryStatus,
+    RuleListOutcome, RuleListPageOutcome, RuleMutationAction, RuleMutationOutcome,
+    SelectorIdentity,
 };
 use crate::config::{
-    AuthoritativeConfig, ConfigCompiler, ConfigError, CoreConfigValidator, EffectiveConfiguration,
+    AuthoritativeConfig, ConfigCompiler, CoreConfigValidator, EffectiveConfiguration,
 };
 use crate::constants::{
-    CORE_LOG_LINE_MAX_BYTES, IPC_LIST_PAGE_SIZE, LOG_CAPACITY, PROBE_TIMEOUT, PROBE_URL,
-    PROFILE_COUNT_MAX, PROFILE_REFRESH_INTERVAL, RULE_STRING_MAX_BYTES,
-    SELECTION_RESTORE_ATTEMPT_LIMIT, TRAFFIC_SERIES_CAPACITY, WRAPPER_DIAGNOSTIC_CAPACITY,
+    IPC_LIST_PAGE_SIZE, PROBE_TIMEOUT, PROBE_URL, PROFILE_COUNT_MAX, PROFILE_REFRESH_INTERVAL,
+    RULE_STRING_MAX_BYTES, SELECTION_RESTORE_ATTEMPT_LIMIT, WRAPPER_DIAGNOSTIC_CAPACITY,
     YAML_MAX_DEPTH,
 };
-use crate::core::{
-    Availability, CoreRuntime, CoreRuntimeDiagnosticCategory as RuntimeDiagnosticCategory,
-    CoreRuntimeLifecycle, CoreRuntimeStatus, CoreRuntimeTunReason, DelayProbeRequest, DelayTarget,
-    ManagedCoreHandle, MihomoAdapter, MihomoError, MihomoErrorKind, NodeRowMemberV1, NodeSelection,
-    NodeSource, ProbeObservation, ProbeStatus as CoreProbeStatus, ProxyView, RuntimeBundle,
-    SelectionError,
-};
-use crate::diagnostics::{
-    WrapperDiagnosticContext, WrapperDiagnosticRing, WrapperDiagnosticState, WrapperDiagnosticTail,
-};
+use crate::core::{DelayProbeRequest, DelayTarget, ManagedCoreHandle, ProxyView};
+use crate::diagnostics::{WrapperDiagnosticRing, WrapperDiagnosticState, WrapperDiagnosticTail};
 use crate::domain::{
-    ActiveProfileSummary, CoreDiagnosticCategory, CoreInstanceGeneration, CoreLifecycle,
-    CoreRestartStatus, CoreStatus, NodeRecordId, ProbeGeneration, ProbeQueueStatus, ProfileId,
-    ProxyGroupId, RuntimeApplyPhase, RuntimeApplySnapshot, RuntimeGeneration,
-    RuntimeRecoverySnapshot, RuntimeRecoveryStatus, SampleState, SelectedNodeSummary,
-    StatusSnapshot, StreamHealthSet, StreamState, SubscriptionUrl, SupervisorHealthReason,
-    SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason, TunStatus,
+    ActiveProfileSummary, CoreInstanceGeneration, ProbeGeneration, ProfileId, RuntimeApplyPhase,
+    RuntimeApplySnapshot, RuntimeGeneration, RuntimeRecoverySnapshot, StatusSnapshot,
+    StreamHealthSet, StreamState, SubscriptionUrl, SupervisorHealthReason, SupervisorLifecycle,
+    SupervisorStatus, TrafficSample,
 };
 use crate::error::ErrorCode;
 use crate::profile::{
-    Profile, ProfileCatalog, ProfileRevision, ProfileSelectorError, ProfileSnapshot,
-    RefreshContext, RefreshFailure, RefreshStage, SnapshotLimits, derive_profile_name,
+    Profile, ProfileCatalog, ProfileRevision, ProfileSnapshot, RefreshContext, RefreshFailure,
+    RefreshStage, SnapshotLimits, derive_profile_name,
 };
-use crate::profile_source::ProfileSource;
-use crate::rule::{
-    LocalRuleSet, RulePlacement, RuleSetError, RuleString, RuleStringError, parse_rule,
-};
-use crate::runtime_bundle::{RuntimeBundleStageErrorKind, RuntimeBundleStager};
+use crate::rule::{LocalRuleSet, RulePlacement, RuleString, RuleStringError};
 use crate::scheduler::{
-    ProbeCompletion, ProbeCompletionStatus, ProbeScheduler, ProbeStatus, ProbeTask,
-    ProfileRefreshScheduler, RefreshCompletion, RefreshCompletionStatus, RefreshTask,
+    ProbeCompletion, ProbeCompletionStatus, ProbeScheduler, ProbeTask, ProfileRefreshScheduler,
+    RefreshCompletion, RefreshCompletionStatus, RefreshTask,
 };
-use crate::state::{AuthoritativeState, AuthoritativeStateStore, StateStoreErrorKind};
+use crate::state::AuthoritativeStateStore;
 use crate::telemetry::{LogLevel, LogSource, LogTail, TelemetryStore};
-use crate::transaction::{
-    CandidateRevisionSource, CandidateRevisions, ConfigTransactionCandidate,
-    ConfigTransactionCoordinator, ConfigTransactionError, ConfigTransactionErrorKind,
-    ConfigTransactionSuccess, RecoveryOutcome as TransactionRecoveryOutcome,
-    RuleConfigTransactionReservation,
-};
+use crate::transaction::{CandidateRevisions, ConfigTransactionSuccess};
 
 // -----------------------------------------------------------------------------
 // External application ports
@@ -97,11 +68,11 @@ use errors::{
     bounded_message, checked_rule, core_error, internal_error, invalid_rule_error,
     map_config_error, map_profile_error, map_rule_error, map_rule_placement, map_selection_error,
     map_transaction_error, no_active_profile, refresh_stage_for_transaction_failure,
-    resolve_profile, rule_busy_error, selector_not_found,
+    resolve_profile, rule_busy_error,
 };
 use outcomes::{
-    application_recovery, failed_runtime_apply_snapshot, recovery_requires_degraded,
-    runtime_apply_not_required, runtime_apply_success, successful_runtime_apply_snapshot,
+    failed_runtime_apply_snapshot, recovery_requires_degraded, runtime_apply_not_required,
+    runtime_apply_success, successful_runtime_apply_snapshot,
 };
 use projections::{
     CoreHealthProjection, disconnected_stream_health, effective_group_order, empty_log_tail,

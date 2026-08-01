@@ -1,12 +1,19 @@
 //! Coordinates persisted Supervisor transactions and Runtime Bundle staging.
 
-use super::{
-    Arc, AuthoritativeState, AuthoritativeStateStore, CandidateRevisionSource, CandidateRevisions,
-    ConfigTransactionCandidate, ConfigTransactionCoordinator, ConfigTransactionError,
-    ConfigTransactionErrorKind, ConfigTransactionSuccess, EffectiveConfiguration, LocalRuleSet,
-    Mutex, MutexGuard, ProfileCatalog, RuleConfigTransactionReservation, RuntimeBundle,
-    RuntimeBundleStageErrorKind, RuntimeBundleStager, RuntimeGeneration, StateStoreErrorKind,
-    TransactionRecoveryOutcome, TryLockError,
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+
+use crate::config::EffectiveConfiguration;
+use crate::core::RuntimeBundle;
+use crate::domain::RuntimeGeneration;
+use crate::profile::ProfileCatalog;
+use crate::rule::LocalRuleSet;
+use crate::runtime_bundle::{RuntimeBundleStageErrorKind, RuntimeBundleStager};
+use crate::state::{AuthoritativeState, AuthoritativeStateStore, StateStoreErrorKind};
+use crate::transaction::{
+    CandidateRevisionSource, CandidateRevisions, ConfigTransactionCandidate,
+    ConfigTransactionCoordinator, ConfigTransactionError, ConfigTransactionErrorKind,
+    ConfigTransactionSuccess, RecoveryOutcome as TransactionRecoveryOutcome,
+    RuleConfigTransactionReservation,
 };
 
 pub struct SupervisorTransactionRequest<'a> {
