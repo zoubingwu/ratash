@@ -1090,11 +1090,8 @@ fn client_rejects_a_response_with_a_different_request_id() {
             "protocol_version": 1,
             "request_id": request["request_id"].as_u64().expect("request ID") + 1,
             "outcome": {
-                "outcome": "success",
-                "payload": {
-                    "operation": "status",
-                    "payload": { "managed_core": null }
-                }
+                "outcome": "failure",
+                "payload": { "kind": "unavailable" }
             }
         });
         write_frame(&mut stream, &response).expect("the raw correlation response should be sent");

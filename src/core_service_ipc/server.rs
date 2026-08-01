@@ -748,10 +748,10 @@ mod accept_loop_tests {
             let (mut stream, _) = listener
                 .accept()
                 .expect("the deadline fixture should accept the client");
-            thread::sleep(Duration::from_millis(140));
+            thread::sleep(Duration::from_millis(250));
             let request: WireRequest =
                 read_frame(&mut stream).expect("the deadline fixture should read the request");
-            thread::sleep(Duration::from_millis(140));
+            thread::sleep(Duration::from_millis(750));
             let session = OwnerSession {
                 proof: OwnerSessionProof::new("fixture-session", "fixture-token"),
                 protocol_version: CORE_RUNTIME_PROTOCOL_VERSION,
@@ -767,7 +767,7 @@ mod accept_loop_tests {
             );
             let _ = write_frame(&mut stream, &response);
         });
-        let timeout = Duration::from_millis(220);
+        let timeout = Duration::from_millis(750);
         let client = CoreServiceClient::with_service_uid_and_timeouts(
             &socket_path,
             nix::unistd::geteuid().as_raw(),
