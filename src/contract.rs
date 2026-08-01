@@ -5,9 +5,10 @@ pub use crate::error::{ErrorCode, ProcessExitCode};
 use crate::application::{self, ApplicationError, ApplicationErrorDetails, ApplicationOutput};
 use crate::domain::{
     ActiveProfileSummary, ApplyState, CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus,
-    CoreStatus, LatencySample, ProbeQueueStatus, SampleState, SelectedNodeSummary, StatusSnapshot,
-    StreamHealthSet, StreamState, SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason,
-    TunStatus,
+    CoreStatus, LatencySample, ProbeQueueStatus, RuntimeApplyPhase, RuntimeApplySnapshot,
+    RuntimeRecoverySnapshot, RuntimeRecoveryStatus, SampleState, SelectedNodeSummary,
+    StatusSnapshot, StreamHealthSet, StreamState, SupervisorLifecycle, SupervisorStatus,
+    TrafficSample, TunReason, TunStatus,
 };
 
 pub const SCHEMA_VERSION: u16 = 1;
@@ -804,6 +805,7 @@ impl From<application::RecoveryOutcome> for RecoveryViewV1 {
 pub enum RecoveryStatusViewV1 {
     NotRequired,
     Succeeded,
+    Pending,
     Failed,
 }
 
@@ -812,6 +814,7 @@ impl From<application::RecoveryStatus> for RecoveryStatusViewV1 {
         match status {
             application::RecoveryStatus::NotRequired => Self::NotRequired,
             application::RecoveryStatus::Succeeded => Self::Succeeded,
+            application::RecoveryStatus::Pending => Self::Pending,
             application::RecoveryStatus::Failed => Self::Failed,
         }
     }
@@ -877,6 +880,7 @@ pub struct StatusViewV1 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_generation: Option<String>,
     pub apply_state: ApplyStateViewV1,
+    pub runtime_apply: StatusRuntimeApplyViewV1,
     pub selection_restore_pending: bool,
     pub probe_queue: ProbeQueueViewV1,
     pub stream_health: StreamHealthViewV1,
@@ -898,9 +902,98 @@ impl From<StatusSnapshot> for StatusViewV1 {
                 .runtime_generation
                 .map(|generation| generation.0.to_string()),
             apply_state: snapshot.apply_state.into(),
+            runtime_apply: snapshot.runtime_apply.into(),
             selection_restore_pending: snapshot.selection_restore_pending,
             probe_queue: snapshot.probe_queue.into(),
             stream_health: snapshot.stream_health.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StatusRuntimeApplyViewV1 {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_generation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committed_generation: Option<String>,
+    pub phase: RuntimeApplyPhaseViewV1,
+    pub recovery: StatusRuntimeRecoveryViewV1,
+}
+
+impl From<RuntimeApplySnapshot> for StatusRuntimeApplyViewV1 {
+    fn from(snapshot: RuntimeApplySnapshot) -> Self {
+        Self {
+            candidate_generation: snapshot
+                .candidate_generation
+                .map(|generation| generation.0.to_string()),
+            committed_generation: snapshot
+                .committed_generation
+                .map(|generation| generation.0.to_string()),
+            phase: snapshot.phase.into(),
+            recovery: snapshot.recovery.into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeApplyPhaseViewV1 {
+    Idle,
+    Applying,
+    Succeeded,
+    Recovering,
+    Failed,
+}
+
+impl From<RuntimeApplyPhase> for RuntimeApplyPhaseViewV1 {
+    fn from(phase: RuntimeApplyPhase) -> Self {
+        match phase {
+            RuntimeApplyPhase::Idle => Self::Idle,
+            RuntimeApplyPhase::Applying => Self::Applying,
+            RuntimeApplyPhase::Succeeded => Self::Succeeded,
+            RuntimeApplyPhase::Recovering => Self::Recovering,
+            RuntimeApplyPhase::Failed => Self::Failed,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StatusRuntimeRecoveryViewV1 {
+    pub status: StatusRuntimeRecoveryStateViewV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restored_generation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl From<RuntimeRecoverySnapshot> for StatusRuntimeRecoveryViewV1 {
+    fn from(snapshot: RuntimeRecoverySnapshot) -> Self {
+        Self {
+            status: snapshot.status.into(),
+            restored_generation: snapshot
+                .restored_generation
+                .map(|generation| generation.0.to_string()),
+            message: snapshot.message,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusRuntimeRecoveryStateViewV1 {
+    NotRequired,
+    Succeeded,
+    Pending,
+    Failed,
+}
+
+impl From<RuntimeRecoveryStatus> for StatusRuntimeRecoveryStateViewV1 {
+    fn from(status: RuntimeRecoveryStatus) -> Self {
+        match status {
+            RuntimeRecoveryStatus::NotRequired => Self::NotRequired,
+            RuntimeRecoveryStatus::Succeeded => Self::Succeeded,
+            RuntimeRecoveryStatus::Pending => Self::Pending,
+            RuntimeRecoveryStatus::Failed => Self::Failed,
         }
     }
 }

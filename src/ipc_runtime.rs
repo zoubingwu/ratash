@@ -38,7 +38,8 @@ use crate::constants::{
 use crate::domain::{
     ActiveProfileSummary, ApplyState, CoreDiagnosticCategory, CoreInstanceGeneration,
     CoreLifecycle, CoreRestartStatus, CoreStatus, LatencySample, LocalRuleSetRevision,
-    NodeRecordId, ProbeGeneration, ProbeQueueStatus, ProfileId, ProxyGroupId, RuntimeGeneration,
+    NodeRecordId, ProbeGeneration, ProbeQueueStatus, ProfileId, ProxyGroupId, RuntimeApplyPhase,
+    RuntimeApplySnapshot, RuntimeGeneration, RuntimeRecoverySnapshot, RuntimeRecoveryStatus,
     SampleState, SelectedNodeSummary, StatusSnapshot, StreamHealthSet, StreamState,
     SubscriptionUrl, SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason, TunStatus,
 };
@@ -1228,6 +1229,7 @@ fn decode_runtime_apply_failure(
     let status = match recovery.get("status")?.as_str()? {
         "not_required" => RecoveryStatus::NotRequired,
         "succeeded" => RecoveryStatus::Succeeded,
+        "pending" => RecoveryStatus::Pending,
         "failed" => RecoveryStatus::Failed,
         _ => return None,
     };
@@ -2899,7 +2901,7 @@ wire_enum!(
 wire_enum!(
     WireRecoveryStatus,
     RecoveryStatus,
-    [NotRequired, Succeeded, Failed]
+    [NotRequired, Succeeded, Pending, Failed]
 );
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -3033,6 +3035,8 @@ struct WireStatusSnapshot {
     runtime_generation: Option<u64>,
     apply_state: WireApplyState,
     #[serde(default)]
+    runtime_apply: Option<WireRuntimeApplySnapshot>,
+    #[serde(default)]
     selection_restore_pending: bool,
     #[serde(default)]
     probe_queue: WireProbeQueueStatus,
@@ -3053,6 +3057,7 @@ impl From<StatusSnapshot> for WireStatusSnapshot {
             connection_count: status.connection_count,
             runtime_generation: status.runtime_generation.map(|generation| generation.0),
             apply_state: status.apply_state.into(),
+            runtime_apply: Some(status.runtime_apply.into()),
             selection_restore_pending: status.selection_restore_pending,
             probe_queue: status.probe_queue.into(),
             stream_health: status.stream_health.into(),
@@ -3064,6 +3069,22 @@ impl TryFrom<WireStatusSnapshot> for StatusSnapshot {
     type Error = WireConversionError;
 
     fn try_from(status: WireStatusSnapshot) -> Result<Self, Self::Error> {
+        let runtime_generation = status.runtime_generation.map(RuntimeGeneration);
+        let apply_state: ApplyState = status.apply_state.into();
+        let runtime_apply = status.runtime_apply.map_or_else(
+            || RuntimeApplySnapshot {
+                candidate_generation: None,
+                committed_generation: runtime_generation,
+                phase: match apply_state {
+                    ApplyState::Idle => RuntimeApplyPhase::Idle,
+                    ApplyState::Applying => RuntimeApplyPhase::Applying,
+                    ApplyState::Recovering => RuntimeApplyPhase::Recovering,
+                    ApplyState::Failed => RuntimeApplyPhase::Failed,
+                },
+                recovery: RuntimeRecoverySnapshot::default(),
+            },
+            Into::into,
+        );
         Ok(Self {
             supervisor: status.supervisor.into(),
             core: status.core.into(),
@@ -3074,12 +3095,70 @@ impl TryFrom<WireStatusSnapshot> for StatusSnapshot {
             latency: status.latency.map(TryInto::try_into).transpose()?,
             traffic: status.traffic.into(),
             connection_count: status.connection_count,
-            runtime_generation: status.runtime_generation.map(RuntimeGeneration),
-            apply_state: status.apply_state.into(),
+            runtime_generation,
+            apply_state,
+            runtime_apply,
             selection_restore_pending: status.selection_restore_pending,
             probe_queue: status.probe_queue.try_into()?,
             stream_health: status.stream_health.into(),
         })
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct WireRuntimeApplySnapshot {
+    candidate_generation: Option<u64>,
+    committed_generation: Option<u64>,
+    phase: WireRuntimeApplyPhase,
+    recovery: WireRuntimeRecoverySnapshot,
+}
+
+impl From<RuntimeApplySnapshot> for WireRuntimeApplySnapshot {
+    fn from(snapshot: RuntimeApplySnapshot) -> Self {
+        Self {
+            candidate_generation: snapshot.candidate_generation.map(|generation| generation.0),
+            committed_generation: snapshot.committed_generation.map(|generation| generation.0),
+            phase: snapshot.phase.into(),
+            recovery: snapshot.recovery.into(),
+        }
+    }
+}
+
+impl From<WireRuntimeApplySnapshot> for RuntimeApplySnapshot {
+    fn from(snapshot: WireRuntimeApplySnapshot) -> Self {
+        Self {
+            candidate_generation: snapshot.candidate_generation.map(RuntimeGeneration),
+            committed_generation: snapshot.committed_generation.map(RuntimeGeneration),
+            phase: snapshot.phase.into(),
+            recovery: snapshot.recovery.into(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct WireRuntimeRecoverySnapshot {
+    status: WireRuntimeRecoveryStatus,
+    restored_generation: Option<u64>,
+    message: Option<String>,
+}
+
+impl From<RuntimeRecoverySnapshot> for WireRuntimeRecoverySnapshot {
+    fn from(snapshot: RuntimeRecoverySnapshot) -> Self {
+        Self {
+            status: snapshot.status.into(),
+            restored_generation: snapshot.restored_generation.map(|generation| generation.0),
+            message: snapshot.message,
+        }
+    }
+}
+
+impl From<WireRuntimeRecoverySnapshot> for RuntimeRecoverySnapshot {
+    fn from(snapshot: WireRuntimeRecoverySnapshot) -> Self {
+        Self {
+            status: snapshot.status.into(),
+            restored_generation: snapshot.restored_generation.map(RuntimeGeneration),
+            message: snapshot.message,
+        }
     }
 }
 
@@ -3551,6 +3630,17 @@ impl From<WireApplyState> for ApplyState {
         }
     }
 }
+
+wire_enum!(
+    WireRuntimeApplyPhase,
+    RuntimeApplyPhase,
+    [Idle, Applying, Succeeded, Recovering, Failed]
+);
+wire_enum!(
+    WireRuntimeRecoveryStatus,
+    RuntimeRecoveryStatus,
+    [NotRequired, Succeeded, Pending, Failed]
+);
 
 #[derive(Debug, Deserialize, Serialize)]
 struct WireStreamHealthSet {

@@ -784,6 +784,7 @@ fn recovery_status(status: application::RecoveryStatus) -> &'static str {
     match status {
         application::RecoveryStatus::NotRequired => "not_required",
         application::RecoveryStatus::Succeeded => "succeeded",
+        application::RecoveryStatus::Pending => "pending",
         application::RecoveryStatus::Failed => "failed",
     }
 }

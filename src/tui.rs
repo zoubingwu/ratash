@@ -26,8 +26,8 @@ use crate::constants::{
     TRAFFIC_SERIES_CAPACITY,
 };
 use crate::domain::{
-    CoreDiagnosticCategory, NodeRecordId, ProfileId, ProxyGroupId, SampleState, StatusSnapshot,
-    TunReason,
+    CoreDiagnosticCategory, NodeRecordId, ProfileId, ProxyGroupId, RuntimeApplyPhase,
+    RuntimeRecoveryStatus, SampleState, StatusSnapshot, TunReason,
 };
 use crate::ipc::RequestId;
 use crate::telemetry::{CoreLogRecord, LogLevel, LogSource};
@@ -1953,7 +1953,7 @@ fn render_navigation(state: &AppState, area: Rect, buffer: &mut Buffer) {
 fn render_overview(state: &AppState, area: Rect, buffer: &mut Buffer) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
         .split(area);
     let connection = connection_label(state.connection);
     let body = if let Some(status) = &state.status {
@@ -2045,11 +2045,34 @@ fn render_overview(state: &AppState, area: Rect, buffer: &mut Buffer) {
         });
         let tun_effective = if status.tun.effective { "on" } else { "off" };
         let tun_capable = if status.tun.capable { "yes" } else { "no" };
+        let candidate_generation = status
+            .runtime_apply
+            .candidate_generation
+            .map_or_else(|| "-".to_owned(), |generation| generation.0.to_string());
+        let committed_generation = status
+            .runtime_apply
+            .committed_generation
+            .map_or_else(|| "-".to_owned(), |generation| generation.0.to_string());
+        let restored_generation = status
+            .runtime_apply
+            .recovery
+            .restored_generation
+            .map_or_else(|| "-".to_owned(), |generation| generation.0.to_string());
+        let recovery_detail = status
+            .runtime_apply
+            .recovery
+            .message
+            .as_deref()
+            .map_or_else(String::new, |message| {
+                format!("\nWhy: {}", terminal_safe(message))
+            });
         format!(
-            "Connection: {connection}\nSupervisor: {:?}\nCore: {:?}\nRestart: {restart_pending}, tries={}, wait={restart_backoff}\nDiagnostic: {restart_diagnostic}\nTUN: {tun_effective}, cap={tun_capable}, {tun_reason}\nActive Profile: {}\nPrimary Group: {}\nCurrent Node: {}\nSelection Restore: {selection_restore}\nLatency: {delay}\nSampled At: {sampled_at}\nFreshness: {freshness}\nProbe: {probe_status} (generation {probe_generation})\nProbe Queue: {probe_queue_state}, queued {}, in-flight {}, stale {:.1}%\nProbe Window: oldest {oldest_due}, full pass {} ms\nConnections: {} | Uptime: {}s",
+            "Connection: {connection}\nSupervisor: {:?} | Core: {:?}\nRestart: {restart_pending}, tries={}, wait={restart_backoff}\nDiagnostic: {restart_diagnostic}\nTUN: {tun_effective}, cap={tun_capable}, {tun_reason}\nApply: {}, candidate={candidate_generation}, committed={committed_generation}\nRecovery: {}, restored={restored_generation}{recovery_detail}\nProfile: {} | Group: {}\nNode: {} | Latency: {delay}\nSelection Restore: {selection_restore}\nSampled At: {sampled_at}\nFreshness: {freshness}\nProbe: {probe_status} (generation {probe_generation})\nProbe Queue: {probe_queue_state}, queued {}, in-flight {}, stale {:.1}%\nProbe Window: oldest {oldest_due}, full pass {} ms\nConnections: {} | Uptime: {}s",
             status.supervisor.lifecycle,
             status.core.lifecycle,
             status.core.restart.attempts,
+            runtime_apply_phase_title(status.runtime_apply.phase),
+            runtime_recovery_status_title(status.runtime_apply.recovery.status),
             active_profile,
             primary_group,
             current_node,
@@ -2088,6 +2111,25 @@ fn render_overview(state: &AppState, area: Rect, buffer: &mut Buffer) {
         .data(&download)
         .style(Style::default().fg(Color::Green))
         .render(traffic[1], buffer);
+}
+
+fn runtime_apply_phase_title(phase: RuntimeApplyPhase) -> &'static str {
+    match phase {
+        RuntimeApplyPhase::Idle => "idle",
+        RuntimeApplyPhase::Applying => "applying",
+        RuntimeApplyPhase::Succeeded => "succeeded",
+        RuntimeApplyPhase::Recovering => "recovering",
+        RuntimeApplyPhase::Failed => "failed",
+    }
+}
+
+fn runtime_recovery_status_title(status: RuntimeRecoveryStatus) -> &'static str {
+    match status {
+        RuntimeRecoveryStatus::NotRequired => "not_required",
+        RuntimeRecoveryStatus::Succeeded => "succeeded",
+        RuntimeRecoveryStatus::Pending => "pending",
+        RuntimeRecoveryStatus::Failed => "failed",
+    }
 }
 
 fn visible_proxy_groups(state: &ProxiesState, area: Rect) -> Vec<(usize, &ProxyGroupRow, Rect)> {

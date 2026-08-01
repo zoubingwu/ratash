@@ -38,6 +38,52 @@ pub enum ApplyState {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RuntimeApplyPhase {
+    #[default]
+    Idle,
+    Applying,
+    Succeeded,
+    Recovering,
+    Failed,
+}
+
+impl RuntimeApplyPhase {
+    #[must_use]
+    pub const fn compatibility_state(self) -> ApplyState {
+        match self {
+            Self::Idle | Self::Succeeded => ApplyState::Idle,
+            Self::Applying => ApplyState::Applying,
+            Self::Recovering => ApplyState::Recovering,
+            Self::Failed => ApplyState::Failed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RuntimeRecoveryStatus {
+    #[default]
+    NotRequired,
+    Succeeded,
+    Pending,
+    Failed,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeRecoverySnapshot {
+    pub status: RuntimeRecoveryStatus,
+    pub restored_generation: Option<RuntimeGeneration>,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeApplySnapshot {
+    pub candidate_generation: Option<RuntimeGeneration>,
+    pub committed_generation: Option<RuntimeGeneration>,
+    pub phase: RuntimeApplyPhase,
+    pub recovery: RuntimeRecoverySnapshot,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SampleState {
     Fresh,
@@ -409,6 +455,7 @@ pub struct StatusSnapshot {
     pub connection_count: u64,
     pub runtime_generation: Option<RuntimeGeneration>,
     pub apply_state: ApplyState,
+    pub runtime_apply: RuntimeApplySnapshot,
     pub selection_restore_pending: bool,
     pub probe_queue: ProbeQueueStatus,
     pub stream_health: StreamHealthSet,

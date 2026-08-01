@@ -34,11 +34,12 @@ use crate::core::{
     SelectionError,
 };
 use crate::domain::{
-    ActiveProfileSummary, ApplyState, CoreDiagnosticCategory, CoreInstanceGeneration,
-    CoreLifecycle, CoreRestartStatus, CoreStatus, NodeRecordId, ProbeGeneration, ProbeQueueStatus,
-    ProfileId, ProxyGroupId, RuntimeGeneration, SampleState, SelectedNodeSummary, StatusSnapshot,
-    StreamHealthSet, StreamState, SubscriptionUrl, SupervisorLifecycle, SupervisorStatus,
-    TrafficSample, TunReason, TunStatus,
+    ActiveProfileSummary, CoreDiagnosticCategory, CoreInstanceGeneration, CoreLifecycle,
+    CoreRestartStatus, CoreStatus, NodeRecordId, ProbeGeneration, ProbeQueueStatus, ProfileId,
+    ProxyGroupId, RuntimeApplyPhase, RuntimeApplySnapshot, RuntimeGeneration,
+    RuntimeRecoverySnapshot, RuntimeRecoveryStatus, SampleState, SelectedNodeSummary,
+    StatusSnapshot, StreamHealthSet, StreamState, SubscriptionUrl, SupervisorLifecycle,
+    SupervisorStatus, TrafficSample, TunReason, TunStatus,
 };
 use crate::error::ErrorCode;
 use crate::profile::{
@@ -628,6 +629,7 @@ pub struct Supervisor {
     state: Mutex<SupervisorState>,
     activation: Mutex<ActivationQueue>,
     apply_in_progress: AtomicBool,
+    last_runtime_apply: Mutex<RuntimeApplySnapshot>,
     last_status: Mutex<StatusSnapshot>,
 }
 
@@ -701,6 +703,10 @@ impl Supervisor {
             current_revisions(&profiles, &local_rules, effective_configuration.as_ref());
         dependencies.transactions.set_current_revisions(revisions);
         let mut runtime_generation = committed_generation;
+        let mut startup_runtime_apply = RuntimeApplySnapshot {
+            committed_generation,
+            ..RuntimeApplySnapshot::default()
+        };
         let mut startup_degraded = false;
         if let Some(configuration) = effective_configuration.as_ref() {
             let generation = dependencies
@@ -718,7 +724,8 @@ impl Supervisor {
                 });
             let success = result.map_err(map_transaction_error)?;
             startup_degraded = recovery_requires_degraded(success.recovery);
-            runtime_generation = Some(generation);
+            runtime_generation = Some(success.committed_generation);
+            startup_runtime_apply = successful_runtime_apply_snapshot(success);
         } else {
             let _ = dependencies
                 .transactions
@@ -726,8 +733,12 @@ impl Supervisor {
                 .map_err(map_transaction_error)?;
         }
         let started_at_unix_ms = dependencies.clock.now_unix_ms();
-        let initial_status =
-            initial_status_snapshot(started_at_unix_ms, &profiles, runtime_generation);
+        let initial_status = initial_status_snapshot(
+            started_at_unix_ms,
+            &profiles,
+            runtime_generation,
+            startup_runtime_apply.clone(),
+        );
         let supervisor = Self {
             clock: dependencies.clock,
             started_at_unix_ms,
@@ -758,6 +769,7 @@ impl Supervisor {
             }),
             activation: Mutex::new(ActivationQueue::default()),
             apply_in_progress: AtomicBool::new(false),
+            last_runtime_apply: Mutex::new(startup_runtime_apply),
             last_status: Mutex::new(initial_status),
         };
         supervisor.reconcile_runtime_state()?;
@@ -847,7 +859,7 @@ impl Supervisor {
                 }
             };
             let generation = next_runtime_generation(state.runtime_generation)?;
-            let _apply = self.begin_apply();
+            let _apply = self.begin_apply(generation, state.runtime_generation);
             let result = self.apply_candidate(
                 &profiles,
                 &state.local_rules,
@@ -859,14 +871,22 @@ impl Supervisor {
                 .as_ref()
                 .err()
                 .map_or(RefreshStage::Apply, refresh_stage_for_transaction_failure);
-            if let Err(error) = settle_transaction(&mut state, result) {
-                drop(state);
-                self.record_refresh_failure(profile_id, context, failure_stage, &error.message)?;
-                return Err(error);
-            }
+            let success = match self.settle_transaction(&mut state, result) {
+                Ok(success) => success,
+                Err(error) => {
+                    drop(state);
+                    self.record_refresh_failure(
+                        profile_id,
+                        context,
+                        failure_stage,
+                        &error.message,
+                    )?;
+                    return Err(error);
+                }
+            };
             state.profiles = profiles;
             state.effective_configuration = Some(configuration);
-            state.runtime_generation = Some(generation);
+            state.runtime_generation = Some(success.committed_generation);
             let revision = state
                 .profiles
                 .get(profile_id)
@@ -1088,7 +1108,8 @@ impl Supervisor {
                     .now_unix_ms()
                     .saturating_sub(self.started_at_unix_ms)
                     / 1_000;
-                status.apply_state = self.current_apply_state();
+                status.runtime_apply = self.current_runtime_apply();
+                status.apply_state = status.runtime_apply.phase.compatibility_state();
                 return Ok(status);
             }
             Err(TryLockError::Poisoned(_)) => return Err(internal_error()),
@@ -1138,6 +1159,7 @@ impl Supervisor {
             .and_then(TelemetryStore::connection_count)
             .unwrap_or_default();
         let probe_queue = probe_queue_status(state.probes.metrics(self.clock.now_unix_ms()));
+        let runtime_apply = self.current_runtime_apply();
         let status = StatusSnapshot {
             supervisor: SupervisorStatus {
                 lifecycle: if state.degraded || core_health.degraded {
@@ -1157,7 +1179,8 @@ impl Supervisor {
             traffic,
             connection_count,
             runtime_generation: state.runtime_generation,
-            apply_state: self.current_apply_state(),
+            apply_state: runtime_apply.phase.compatibility_state(),
+            runtime_apply,
             selection_restore_pending: state.selection_restore_pending,
             probe_queue,
             stream_health: state.stream_health.clone(),
@@ -1166,18 +1189,66 @@ impl Supervisor {
         Ok(status)
     }
 
-    fn begin_apply(&self) -> ApplyActivity<'_> {
+    fn begin_apply(
+        &self,
+        candidate_generation: RuntimeGeneration,
+        committed_generation: Option<RuntimeGeneration>,
+    ) -> ApplyActivity<'_> {
+        *self
+            .last_runtime_apply
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = RuntimeApplySnapshot {
+            candidate_generation: Some(candidate_generation),
+            committed_generation,
+            phase: RuntimeApplyPhase::Applying,
+            recovery: RuntimeRecoverySnapshot::default(),
+        };
         self.apply_in_progress.store(true, Ordering::Release);
         ApplyActivity {
             in_progress: &self.apply_in_progress,
         }
     }
 
-    fn current_apply_state(&self) -> ApplyState {
+    fn current_runtime_apply(&self) -> RuntimeApplySnapshot {
+        let mut status = self
+            .last_runtime_apply
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         if self.apply_in_progress.load(Ordering::Acquire) {
-            ApplyState::Applying
-        } else {
-            ApplyState::Idle
+            status.phase = RuntimeApplyPhase::Applying;
+        }
+        status
+    }
+
+    fn settle_transaction(
+        &self,
+        state: &mut SupervisorState,
+        result: Result<ConfigTransactionSuccess, SupervisorTransactionFailure>,
+    ) -> Result<ConfigTransactionSuccess, ApplicationError> {
+        match result {
+            Ok(success) => {
+                if recovery_requires_degraded(success.recovery) {
+                    state.degraded = true;
+                }
+                *self
+                    .last_runtime_apply
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    successful_runtime_apply_snapshot(success);
+                Ok(success)
+            }
+            Err(error) => {
+                if recovery_requires_degraded(error.recovery) {
+                    state.degraded = true;
+                }
+                *self
+                    .last_runtime_apply
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    failed_runtime_apply_snapshot(error);
+                Err(map_transaction_error(error))
+            }
         }
     }
 
@@ -1250,14 +1321,14 @@ impl Supervisor {
             let strings = rule_strings(&local_rules)?;
             let configuration = self.compile(profile, &strings)?;
             let generation = RuntimeGeneration(1);
-            let _apply = self.begin_apply();
+            let _apply = self.begin_apply(generation, state.runtime_generation);
             let result =
                 self.apply_candidate(&profiles, &local_rules, &configuration, generation, false);
-            let success = settle_transaction(&mut state, result)?;
+            let success = self.settle_transaction(&mut state, result)?;
             state.profiles = profiles;
             state.local_rules = local_rules;
             state.effective_configuration = Some(configuration);
-            state.runtime_generation = Some(generation);
+            state.runtime_generation = Some(success.committed_generation);
             let (revision, next_refresh_at_unix_ms) = state
                 .profiles
                 .get(profile_id)
@@ -1363,7 +1434,7 @@ impl Supervisor {
         let rules = rule_strings(&state.local_rules)?;
         let configuration = self.compile(profile, &rules)?;
         let generation = next_runtime_generation(state.runtime_generation)?;
-        let _apply = self.begin_apply();
+        let _apply = self.begin_apply(generation, state.runtime_generation);
         let result = self.apply_candidate(
             &profiles,
             &state.local_rules,
@@ -1371,10 +1442,10 @@ impl Supervisor {
             generation,
             false,
         );
-        let success = settle_transaction(&mut state, result)?;
+        let success = self.settle_transaction(&mut state, result)?;
         state.profiles = profiles;
         state.effective_configuration = Some(configuration);
-        state.runtime_generation = Some(generation);
+        state.runtime_generation = Some(success.committed_generation);
         state.cached_proxy_view = None;
         self.reset_runtime_state(&mut state);
         let profile = state.profiles.get(profile_id).ok_or_else(internal_error)?;
@@ -1616,7 +1687,7 @@ impl Supervisor {
         let rules = rule_strings(&local_rules)?;
         let configuration = self.compile(active, &rules)?;
         let generation = next_runtime_generation(state.runtime_generation)?;
-        let _apply = self.begin_apply();
+        let _apply = self.begin_apply(generation, state.runtime_generation);
         let result = self.apply_candidate(
             &state.profiles,
             &local_rules,
@@ -1624,10 +1695,10 @@ impl Supervisor {
             generation,
             true,
         );
-        let success = settle_transaction(&mut state, result)?;
+        let success = self.settle_transaction(&mut state, result)?;
         state.local_rules = local_rules;
         state.effective_configuration = Some(configuration);
-        state.runtime_generation = Some(generation);
+        state.runtime_generation = Some(success.committed_generation);
         Ok(ApplicationOutput::RuleMutation(RuleMutationOutcome {
             action,
             changed_rule,
@@ -2749,23 +2820,54 @@ fn transaction_failure_stage(kind: SupervisorTransactionFailureKind) -> RuntimeA
     }
 }
 
-fn settle_transaction(
-    state: &mut SupervisorState,
-    result: Result<ConfigTransactionSuccess, SupervisorTransactionFailure>,
-) -> Result<ConfigTransactionSuccess, ApplicationError> {
-    match result {
-        Ok(success) => {
-            if recovery_requires_degraded(success.recovery) {
-                state.degraded = true;
-            }
-            Ok(success)
+fn successful_runtime_apply_snapshot(success: ConfigTransactionSuccess) -> RuntimeApplySnapshot {
+    let phase = match success.recovery {
+        TransactionRecoveryOutcome::NotRequired | TransactionRecoveryOutcome::Converged { .. } => {
+            RuntimeApplyPhase::Succeeded
         }
-        Err(error) => {
-            if recovery_requires_degraded(error.recovery) {
-                state.degraded = true;
-            }
-            Err(map_transaction_error(error))
-        }
+        TransactionRecoveryOutcome::Pending { .. } => RuntimeApplyPhase::Recovering,
+        TransactionRecoveryOutcome::Failed { .. } => RuntimeApplyPhase::Failed,
+    };
+    RuntimeApplySnapshot {
+        candidate_generation: Some(success.candidate_generation),
+        committed_generation: Some(success.committed_generation),
+        phase,
+        recovery: runtime_recovery_snapshot(success.recovery),
+    }
+}
+
+fn failed_runtime_apply_snapshot(error: SupervisorTransactionFailure) -> RuntimeApplySnapshot {
+    let phase = if matches!(error.recovery, TransactionRecoveryOutcome::Pending { .. }) {
+        RuntimeApplyPhase::Recovering
+    } else {
+        RuntimeApplyPhase::Failed
+    };
+    RuntimeApplySnapshot {
+        candidate_generation: error.candidate_generation,
+        committed_generation: error.committed_generation,
+        phase,
+        recovery: runtime_recovery_snapshot(error.recovery),
+    }
+}
+
+fn runtime_recovery_snapshot(recovery: TransactionRecoveryOutcome) -> RuntimeRecoverySnapshot {
+    match recovery {
+        TransactionRecoveryOutcome::NotRequired => RuntimeRecoverySnapshot::default(),
+        TransactionRecoveryOutcome::Converged { generation } => RuntimeRecoverySnapshot {
+            status: RuntimeRecoveryStatus::Succeeded,
+            restored_generation: generation,
+            message: Some("Committed Runtime Generation recovery succeeded".to_owned()),
+        },
+        TransactionRecoveryOutcome::Pending { target } => RuntimeRecoverySnapshot {
+            status: RuntimeRecoveryStatus::Pending,
+            restored_generation: target,
+            message: Some("Committed Runtime Generation cleanup is pending".to_owned()),
+        },
+        TransactionRecoveryOutcome::Failed { target } => RuntimeRecoverySnapshot {
+            status: RuntimeRecoveryStatus::Failed,
+            restored_generation: target,
+            message: Some("Committed Runtime Generation recovery failed".to_owned()),
+        },
     }
 }
 
@@ -2805,14 +2907,14 @@ fn application_recovery(recovery: TransactionRecoveryOutcome) -> ApplicationReco
             message: Some("The committed Runtime Generation was confirmed".to_owned()),
         },
         TransactionRecoveryOutcome::Pending { target } => ApplicationRecoveryOutcome {
-            status: RecoveryStatus::Failed,
+            status: RecoveryStatus::Pending,
             restored_generation: target,
-            message: Some("Committed state cleanup is pending".to_owned()),
+            message: Some("Committed Runtime Generation cleanup is pending".to_owned()),
         },
         TransactionRecoveryOutcome::Failed { target } => ApplicationRecoveryOutcome {
             status: RecoveryStatus::Failed,
             restored_generation: target,
-            message: Some("Committed state recovery failed".to_owned()),
+            message: Some("Committed Runtime Generation recovery failed".to_owned()),
         },
     }
 }
@@ -2834,6 +2936,7 @@ fn initial_status_snapshot(
     started_at_unix_ms: u64,
     profiles: &ProfileCatalog,
     runtime_generation: Option<RuntimeGeneration>,
+    runtime_apply: RuntimeApplySnapshot,
 ) -> StatusSnapshot {
     let active_profile = profiles
         .active_profile_id()
@@ -2876,7 +2979,8 @@ fn initial_status_snapshot(
         traffic: unavailable_traffic(),
         connection_count: 0,
         runtime_generation,
-        apply_state: ApplyState::Idle,
+        apply_state: runtime_apply.phase.compatibility_state(),
+        runtime_apply,
         selection_restore_pending: false,
         probe_queue: ProbeQueueStatus::default(),
         stream_health: disconnected_stream_health(),

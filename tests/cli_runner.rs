@@ -195,9 +195,9 @@ fn runtime_apply_failures_expose_stage_generations_and_recovery() {
             committed_generation: Some(hopash::domain::RuntimeGeneration(11)),
             stage: hopash::application::RuntimeApplyFailureStage::IndeterminateApply,
             recovery: hopash::application::RecoveryOutcome {
-                status: hopash::application::RecoveryStatus::Succeeded,
+                status: hopash::application::RecoveryStatus::Pending,
                 restored_generation: Some(hopash::domain::RuntimeGeneration(11)),
-                message: Some("The committed Runtime Generation was confirmed".to_owned()),
+                message: Some("Committed Runtime Generation cleanup is pending".to_owned()),
             },
         },
     )));
@@ -226,7 +226,7 @@ fn runtime_apply_failures_expose_stage_generations_and_recovery() {
     assert_eq!(details["stage"], "indeterminate_apply");
     assert_eq!(details["candidate_generation"], "12");
     assert_eq!(details["committed_generation"], "11");
-    assert_eq!(details["recovery"]["status"], "succeeded");
+    assert_eq!(details["recovery"]["status"], "pending");
     assert_eq!(details["recovery"]["restored_generation"], "11");
 
     let human_client = RecordingClient {
@@ -251,7 +251,7 @@ fn runtime_apply_failures_expose_stage_generations_and_recovery() {
     assert!(diagnostic.contains("Runtime Apply Stage: indeterminate_apply"));
     assert!(diagnostic.contains("Candidate Generation: 12"));
     assert!(diagnostic.contains("Committed Generation: 11"));
-    assert!(diagnostic.contains("Recovery: succeeded"));
+    assert!(diagnostic.contains("Recovery: pending"));
 }
 
 #[test]

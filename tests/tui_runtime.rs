@@ -13,8 +13,8 @@ use hopash::application::{
 use hopash::constants::LOG_CAPACITY;
 use hopash::domain::{
     ActiveProfileSummary, ApplyState, CoreLifecycle, CoreStatus, NodeRecordId, ProbeQueueStatus,
-    ProfileId, ProxyGroupId, SampleState, StatusSnapshot, StreamHealthSet, StreamState,
-    SupervisorLifecycle, SupervisorStatus, TrafficSample, TunStatus,
+    ProfileId, ProxyGroupId, RuntimeApplySnapshot, SampleState, StatusSnapshot, StreamHealthSet,
+    StreamState, SupervisorLifecycle, SupervisorStatus, TrafficSample, TunStatus,
 };
 use hopash::ipc::RequestId;
 use hopash::tui::{
@@ -953,6 +953,7 @@ fn status(upload: u64) -> StatusSnapshot {
         connection_count: 0,
         runtime_generation: None,
         apply_state: ApplyState::Idle,
+        runtime_apply: RuntimeApplySnapshot::default(),
         selection_restore_pending: false,
         probe_queue: ProbeQueueStatus::default(),
         stream_health: StreamHealthSet {

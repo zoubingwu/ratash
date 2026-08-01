@@ -17,7 +17,8 @@ use hopash::constants::{
 };
 use hopash::domain::{
     ActiveProfileSummary, ApplyState, CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus,
-    CoreStatus, NodeRecordId, ProbeQueueStatus, ProfileId, ProxyGroupId, RuntimeGeneration,
+    CoreStatus, NodeRecordId, ProbeQueueStatus, ProfileId, ProxyGroupId, RuntimeApplyPhase,
+    RuntimeApplySnapshot, RuntimeGeneration, RuntimeRecoverySnapshot, RuntimeRecoveryStatus,
     SampleState, SelectedNodeSummary, StatusSnapshot, StreamHealthSet, StreamState,
     SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason, TunStatus,
 };
@@ -98,6 +99,33 @@ fn overview_renders_core_restart_and_tun_diagnostics() {
     assert!(text.contains("Restart: on, tries=2, wait=4000 ms"));
     assert!(text.contains("Diagnostic: core_restart_limit_reached"));
     assert!(text.contains("TUN: off, cap=no, permission_denied"));
+    assert!(text.contains("Connections: 3 | Uptime: 60s"));
+}
+
+#[test]
+fn compact_overview_renders_runtime_apply_recovery() {
+    let mut state = connected_state();
+    let status = state
+        .status
+        .as_mut()
+        .expect("the connected fixture should have status");
+    status.apply_state = ApplyState::Recovering;
+    status.runtime_apply = RuntimeApplySnapshot {
+        candidate_generation: Some(RuntimeGeneration(2)),
+        committed_generation: Some(RuntimeGeneration(1)),
+        phase: RuntimeApplyPhase::Recovering,
+        recovery: RuntimeRecoverySnapshot {
+            status: RuntimeRecoveryStatus::Pending,
+            restored_generation: Some(RuntimeGeneration(1)),
+            message: Some("Committed Runtime Generation cleanup is pending".to_owned()),
+        },
+    };
+
+    let (text, _) = render_with_backend(&state, 80, 24);
+
+    assert!(text.contains("Apply: recovering, candidate=2, committed=1"));
+    assert!(text.contains("Recovery: pending, restored=1"));
+    assert!(text.contains("Why: Committed Runtime Generation cleanup is pending"));
     assert!(text.contains("Connections: 3 | Uptime: 60s"));
 }
 
@@ -1289,6 +1317,12 @@ fn status_snapshot() -> StatusSnapshot {
         connection_count: 3,
         runtime_generation: Some(RuntimeGeneration(1)),
         apply_state: ApplyState::Idle,
+        runtime_apply: RuntimeApplySnapshot {
+            candidate_generation: Some(RuntimeGeneration(1)),
+            committed_generation: Some(RuntimeGeneration(1)),
+            phase: RuntimeApplyPhase::Succeeded,
+            ..RuntimeApplySnapshot::default()
+        },
         selection_restore_pending: false,
         probe_queue: ProbeQueueStatus::default(),
         stream_health: StreamHealthSet {

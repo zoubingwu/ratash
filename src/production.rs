@@ -364,6 +364,7 @@ fn stopped_status(
             connection_count: 0,
             runtime_generation: None,
             apply_state: ApplyState::Idle,
+            runtime_apply: crate::domain::RuntimeApplySnapshot::default(),
             selection_restore_pending: false,
             probe_queue: crate::domain::ProbeQueueStatus::default(),
             stream_health: StreamHealthSet {

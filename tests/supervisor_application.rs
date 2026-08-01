@@ -10,8 +10,8 @@ use hopash::core::{
     ProxyMember, ProxyNode, ProxyView, ProxyViewOrderSource,
 };
 use hopash::domain::{
-    CoreInstanceGeneration, NodeRecordId, ProxyGroupId, RuntimeGeneration, StreamState,
-    SubscriptionUrl,
+    ApplyState, CoreInstanceGeneration, NodeRecordId, ProxyGroupId, RuntimeApplyPhase,
+    RuntimeGeneration, RuntimeRecoveryStatus, StreamState, SubscriptionUrl,
 };
 use hopash::state::{AuthoritativeState, AuthoritativeStateStore};
 use hopash::supervisor::{
@@ -896,6 +896,14 @@ fn zero_profile_supervisor_is_ready_without_contacting_the_core() {
     );
     assert!(status.active_profile.is_none());
     assert!(status.runtime_generation.is_none());
+    assert_eq!(status.apply_state, ApplyState::Idle);
+    assert_eq!(status.runtime_apply.phase, RuntimeApplyPhase::Idle);
+    assert!(status.runtime_apply.candidate_generation.is_none());
+    assert!(status.runtime_apply.committed_generation.is_none());
+    assert_eq!(
+        status.runtime_apply.recovery.status,
+        RuntimeRecoveryStatus::NotRequired
+    );
 }
 
 #[test]
@@ -1109,6 +1117,16 @@ fn first_profile_add_commits_rules_runtime_probes_and_reopens_from_persistence()
         panic!("status should return a Status output")
     };
     assert_eq!(status.runtime_generation, Some(RuntimeGeneration(2)));
+    assert_eq!(status.apply_state, ApplyState::Idle);
+    assert_eq!(status.runtime_apply.phase, RuntimeApplyPhase::Succeeded);
+    assert_eq!(
+        status.runtime_apply.candidate_generation,
+        Some(RuntimeGeneration(2))
+    );
+    assert_eq!(
+        status.runtime_apply.committed_generation,
+        Some(RuntimeGeneration(2))
+    );
     assert_eq!(harness.transactions.apply_count.load(Ordering::Relaxed), 2);
 }
 
@@ -1303,6 +1321,17 @@ fn failed_first_profile_apply_preserves_the_zero_profile_state() {
         hopash::domain::CoreLifecycle::Unconfigured
     );
     assert!(status.runtime_generation.is_none());
+    assert_eq!(status.apply_state, ApplyState::Failed);
+    assert_eq!(status.runtime_apply.phase, RuntimeApplyPhase::Failed);
+    assert_eq!(
+        status.runtime_apply.candidate_generation,
+        Some(RuntimeGeneration(1))
+    );
+    assert!(status.runtime_apply.committed_generation.is_none());
+    assert_eq!(
+        status.runtime_apply.recovery.status,
+        RuntimeRecoveryStatus::NotRequired
+    );
 }
 
 #[test]
@@ -1336,7 +1365,7 @@ fn committed_apply_with_pending_cleanup_swaps_state_and_reports_degraded_recover
     );
     assert_eq!(
         apply.recovery.status,
-        hopash::application::RecoveryStatus::Failed
+        hopash::application::RecoveryStatus::Pending
     );
     assert_eq!(
         apply.recovery.restored_generation,
@@ -1354,6 +1383,28 @@ fn committed_apply_with_pending_cleanup_swaps_state_and_reports_degraded_recover
         hopash::domain::SupervisorLifecycle::Degraded
     );
     assert_eq!(status.runtime_generation, Some(RuntimeGeneration(1)));
+    assert_eq!(status.apply_state, ApplyState::Recovering);
+    assert_eq!(status.runtime_apply.phase, RuntimeApplyPhase::Recovering);
+    assert_eq!(
+        status.runtime_apply.candidate_generation,
+        Some(RuntimeGeneration(1))
+    );
+    assert_eq!(
+        status.runtime_apply.committed_generation,
+        Some(RuntimeGeneration(1))
+    );
+    assert_eq!(
+        status.runtime_apply.recovery.status,
+        RuntimeRecoveryStatus::Pending
+    );
+    assert_eq!(
+        status.runtime_apply.recovery.restored_generation,
+        Some(RuntimeGeneration(1))
+    );
+    assert_eq!(
+        status.runtime_apply.recovery.message.as_deref(),
+        Some("Committed Runtime Generation cleanup is pending")
+    );
     assert!(added.profile.active);
 }
 
@@ -1396,6 +1447,49 @@ fn failed_runtime_recovery_marks_the_supervisor_degraded_and_retains_rules() {
     assert_eq!(status.core.lifecycle, hopash::domain::CoreLifecycle::Ready);
     assert!(status.tun.effective);
     assert_eq!(status.runtime_generation, Some(RuntimeGeneration(1)));
+    assert_eq!(status.apply_state, ApplyState::Failed);
+    assert_eq!(status.runtime_apply.phase, RuntimeApplyPhase::Failed);
+    assert_eq!(
+        status.runtime_apply.candidate_generation,
+        Some(RuntimeGeneration(2))
+    );
+    assert_eq!(
+        status.runtime_apply.committed_generation,
+        Some(RuntimeGeneration(1))
+    );
+    assert_eq!(
+        status.runtime_apply.recovery.status,
+        RuntimeRecoveryStatus::Failed
+    );
+    assert_eq!(
+        status.runtime_apply.recovery.restored_generation,
+        Some(RuntimeGeneration(1))
+    );
+
+    supervisor
+        .execute(ApplicationOperation::RuleAdd {
+            rule: "DOMAIN,example.org,DIRECT".to_owned(),
+            placement: hopash::application::RulePlacement::Prepend,
+        })
+        .expect("a later Runtime Apply should succeed");
+    let recovered_status = get_status(&supervisor);
+    assert_eq!(recovered_status.apply_state, ApplyState::Idle);
+    assert_eq!(
+        recovered_status.runtime_apply.phase,
+        RuntimeApplyPhase::Succeeded
+    );
+    assert_eq!(
+        recovered_status.runtime_apply.candidate_generation,
+        Some(RuntimeGeneration(2))
+    );
+    assert_eq!(
+        recovered_status.runtime_apply.committed_generation,
+        Some(RuntimeGeneration(2))
+    );
+    assert_eq!(
+        recovered_status.runtime_apply.recovery.status,
+        RuntimeRecoveryStatus::NotRequired
+    );
 }
 
 #[test]
@@ -1439,7 +1533,16 @@ fn status_reports_applying_while_a_transaction_owns_authoritative_state() {
     let ApplicationOutput::Status(status) = observed else {
         panic!("status should return Status")
     };
-    assert_eq!(status.apply_state, hopash::domain::ApplyState::Applying);
+    assert_eq!(status.apply_state, ApplyState::Applying);
+    assert_eq!(status.runtime_apply.phase, RuntimeApplyPhase::Applying);
+    assert_eq!(
+        status.runtime_apply.candidate_generation,
+        Some(RuntimeGeneration(2))
+    );
+    assert_eq!(
+        status.runtime_apply.committed_generation,
+        Some(RuntimeGeneration(1))
+    );
 }
 
 #[test]
@@ -1579,6 +1682,19 @@ fn profile_activation_and_removal_swap_authority_only_after_commit() {
         activated
             .runtime_apply
             .and_then(|apply| apply.committed_generation),
+        Some(RuntimeGeneration(2))
+    );
+    let activation_status = get_status(&supervisor);
+    assert_eq!(
+        activation_status.runtime_apply.phase,
+        RuntimeApplyPhase::Succeeded
+    );
+    assert_eq!(
+        activation_status.runtime_apply.candidate_generation,
+        Some(RuntimeGeneration(2))
+    );
+    assert_eq!(
+        activation_status.runtime_apply.committed_generation,
         Some(RuntimeGeneration(2))
     );
 
@@ -2243,6 +2359,15 @@ fn inactive_and_active_refreshes_follow_distinct_commit_paths_and_record_apply_f
         panic!("status should return Status")
     };
     assert_eq!(status.runtime_generation, Some(RuntimeGeneration(2)));
+    assert_eq!(status.runtime_apply.phase, RuntimeApplyPhase::Succeeded);
+    assert_eq!(
+        status.runtime_apply.candidate_generation,
+        Some(RuntimeGeneration(2))
+    );
+    assert_eq!(
+        status.runtime_apply.committed_generation,
+        Some(RuntimeGeneration(2))
+    );
 
     harness.clock.now.store(35_000, Ordering::Relaxed);
     harness.queue_profile("Primary", "node-a");
@@ -2294,6 +2419,15 @@ fn inactive_and_active_refreshes_follow_distinct_commit_paths_and_record_apply_f
         panic!("status should return Status")
     };
     assert_eq!(status.runtime_generation, Some(RuntimeGeneration(2)));
+    assert_eq!(status.runtime_apply.phase, RuntimeApplyPhase::Failed);
+    assert_eq!(
+        status.runtime_apply.candidate_generation,
+        Some(RuntimeGeneration(3))
+    );
+    assert_eq!(
+        status.runtime_apply.committed_generation,
+        Some(RuntimeGeneration(2))
+    );
 }
 
 #[test]

@@ -1,6 +1,9 @@
 use hopash::application::{ApplicationService, Clock};
 use hopash::contract::{JsonEnvelope, StatusViewV1};
-use hopash::domain::{CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus};
+use hopash::domain::{
+    ApplyState, CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus, RuntimeApplyPhase,
+    RuntimeApplySnapshot, RuntimeGeneration, RuntimeRecoverySnapshot, RuntimeRecoveryStatus,
+};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -67,6 +70,12 @@ fn zero_profile_status_serializes_the_complete_v1_contract() {
                 },
                 "connection_count": 0,
                 "apply_state": "idle",
+                "runtime_apply": {
+                    "phase": "idle",
+                    "recovery": {
+                        "status": "not_required"
+                    }
+                },
                 "selection_restore_pending": false,
                 "probe_queue": {
                     "active_node_count": 0,
@@ -109,6 +118,40 @@ fn core_restart_status_serializes_stable_public_diagnostics() {
                 "attempts": 2,
                 "backoff_ms": 4000,
                 "diagnostic": "core_restart_limit_reached"
+            }
+        })
+    );
+}
+
+#[test]
+fn runtime_apply_status_serializes_generations_phase_and_recovery() {
+    let mut status = ApplicationService::new().status();
+    status.apply_state = ApplyState::Recovering;
+    status.runtime_apply = RuntimeApplySnapshot {
+        candidate_generation: Some(RuntimeGeneration(9)),
+        committed_generation: Some(RuntimeGeneration(8)),
+        phase: RuntimeApplyPhase::Recovering,
+        recovery: RuntimeRecoverySnapshot {
+            status: RuntimeRecoveryStatus::Pending,
+            restored_generation: Some(RuntimeGeneration(8)),
+            message: Some("Committed Runtime Generation cleanup is pending".to_owned()),
+        },
+    };
+
+    let value = serde_json::to_value(StatusViewV1::from(status))
+        .expect("Runtime Apply status should serialize");
+
+    assert_eq!(value["apply_state"], json!("recovering"));
+    assert_eq!(
+        value["runtime_apply"],
+        json!({
+            "candidate_generation": "9",
+            "committed_generation": "8",
+            "phase": "recovering",
+            "recovery": {
+                "status": "pending",
+                "restored_generation": "8",
+                "message": "Committed Runtime Generation cleanup is pending"
             }
         })
     );

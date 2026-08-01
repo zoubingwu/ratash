@@ -22,7 +22,8 @@ use hopash::application::{
 use hopash::constants::IPC_FRAME_MAX_BYTES;
 use hopash::domain::{
     CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus, LocalRuleSetRevision, NodeRecordId,
-    ProbeGeneration, ProfileId, ProxyGroupId, RuntimeGeneration, SubscriptionUrl,
+    ProbeGeneration, ProfileId, ProxyGroupId, RuntimeApplyPhase, RuntimeApplySnapshot,
+    RuntimeGeneration, RuntimeRecoverySnapshot, RuntimeRecoveryStatus, SubscriptionUrl,
 };
 use hopash::error::ErrorCode;
 use hopash::ipc::{
@@ -217,7 +218,7 @@ fn one_shot_client_executes_through_the_authenticated_server() {
 }
 
 #[test]
-fn core_restart_health_round_trips_through_typed_ipc() {
+fn runtime_apply_and_core_health_round_trip_through_typed_ipc() {
     let socket = TempSocket::new("core-restart-round-trip");
     let mut expected = ApplicationService::new().status();
     expected.core.lifecycle = CoreLifecycle::Starting;
@@ -226,6 +227,17 @@ fn core_restart_health_round_trips_through_typed_ipc() {
         attempts: 2,
         backoff_ms: Some(4_000),
         diagnostic: Some(CoreDiagnosticCategory::RestartLimitReached),
+    };
+    expected.apply_state = hopash::domain::ApplyState::Recovering;
+    expected.runtime_apply = RuntimeApplySnapshot {
+        candidate_generation: Some(RuntimeGeneration(9)),
+        committed_generation: Some(RuntimeGeneration(8)),
+        phase: RuntimeApplyPhase::Recovering,
+        recovery: RuntimeRecoverySnapshot {
+            status: RuntimeRecoveryStatus::Pending,
+            restored_generation: Some(RuntimeGeneration(8)),
+            message: Some("Committed Runtime Generation cleanup is pending".to_owned()),
+        },
     };
     let mut server = IpcServer::start(
         socket.path(),
@@ -272,6 +284,11 @@ fn legacy_status_without_core_restart_decodes_with_inactive_defaults() {
         .and_then(serde_json::Value::as_object_mut)
         .expect("the captured response should contain Core status");
     assert!(core.remove("restart").is_some());
+    let status = legacy_response
+        .pointer_mut("/data/data")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("the captured response should contain status");
+    assert!(status.remove("runtime_apply").is_some());
 
     let legacy_socket = TempSocket::new("legacy-status-response");
     let listener = bind_private_listener(legacy_socket.path())
@@ -291,6 +308,7 @@ fn legacy_status_without_core_restart_decodes_with_inactive_defaults() {
         panic!("legacy response should return status")
     };
     assert_eq!(status.core.restart, CoreRestartStatus::default());
+    assert_eq!(status.runtime_apply, RuntimeApplySnapshot::default());
     fixture.join().expect("legacy fixture should stop");
 }
 
@@ -421,9 +439,9 @@ fn runtime_apply_failure_details_round_trip_over_ipc() {
             committed_generation: Some(RuntimeGeneration(8)),
             stage: RuntimeApplyFailureStage::Health,
             recovery: RecoveryOutcome {
-                status: RecoveryStatus::Failed,
+                status: RecoveryStatus::Pending,
                 restored_generation: Some(RuntimeGeneration(8)),
-                message: Some("Committed state recovery failed".to_owned()),
+                message: Some("Committed Runtime Generation cleanup is pending".to_owned()),
             },
         },
     )));
