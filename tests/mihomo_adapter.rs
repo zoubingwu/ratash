@@ -213,10 +213,11 @@ fn handler(
 }
 
 fn finish_http_response(stream: &mut UnixStream) {
-    stream
-        .shutdown(Shutdown::Write)
-        .expect("fixture response should finish cleanly");
-    wait_for_client_shutdown(stream);
+    match stream.shutdown(Shutdown::Write) {
+        Ok(()) => wait_for_client_shutdown(stream),
+        Err(error) if error.kind() == io::ErrorKind::NotConnected => {}
+        Err(error) => panic!("fixture response should finish cleanly: {error}"),
+    }
 }
 
 fn response(status: &str, content_type: Option<&str>, body: &[u8]) -> Vec<u8> {
