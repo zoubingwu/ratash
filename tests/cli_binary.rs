@@ -19,7 +19,7 @@ fn version_flag_prints_the_package_version() {
         .expect("hopash --version should start");
 
     assert!(output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "hopash 0.1.0\n");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "hopash 0.1.1\n");
     assert!(output.stderr.is_empty());
 }
 

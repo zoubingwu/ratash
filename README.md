@@ -25,7 +25,7 @@ The personal trust policy requires `/usr/local` and `/usr/local/bin` to be root-
 Copy the matching `*-local-unsigned.pkg` and `.pkg.sha256` files to the target Mac. Verify and install them from the download directory:
 
 ```sh
-PACKAGE='hopash-0.1.0-aarch64-apple-darwin-local-unsigned.pkg'
+PACKAGE='hopash-0.1.1-aarch64-apple-darwin-local-unsigned.pkg'
 shasum -a 256 -c "$PACKAGE.sha256"
 sudo env HOPASH_OWNER_UID="$(id -u)" /usr/sbin/installer -allowUntrusted -pkg "$PACKAGE" -target /
 ```
@@ -34,13 +34,13 @@ sudo env HOPASH_OWNER_UID="$(id -u)" /usr/sbin/installer -allowUntrusted -pkg "$
 
 Download the `.pkg` and matching `.pkg.sha256` file for your Mac from [GitHub Releases](../../releases/latest):
 
-- Apple Silicon: `hopash-0.1.0-aarch64-apple-darwin.pkg`
-- Intel: `hopash-0.1.0-x86_64-apple-darwin.pkg`
+- Apple Silicon: `hopash-0.1.1-aarch64-apple-darwin.pkg`
+- Intel: `hopash-0.1.1-x86_64-apple-darwin.pkg`
 
 Verify and install the package from its download directory:
 
 ```sh
-PACKAGE='hopash-0.1.0-aarch64-apple-darwin.pkg'
+PACKAGE='hopash-0.1.1-aarch64-apple-darwin.pkg'
 shasum -a 256 -c "$PACKAGE.sha256"
 sudo env HOPASH_OWNER_UID="$(id -u)" /usr/sbin/installer -pkg "$PACKAGE" -target /
 ```
