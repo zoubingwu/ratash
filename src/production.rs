@@ -953,13 +953,13 @@ fn run_owned_supervisor(
 
     let process_signal = ProcessSignalSource::new()
         .map_err(|_| startup_internal("The Supervisor signal listener could not start"))?;
-    while !drain.is_requested() {
-        if process_signal.shutdown_requested() {
-            drain.request();
-            break;
-        }
-        drain.wait(Duration::from_millis(100));
-    }
+    let shutdown_waker = RuntimeWaker::default();
+    wait_for_supervisor_shutdown(
+        drain.as_ref(),
+        &process_signal,
+        &shutdown_waker,
+        shutdown_waker.clone(),
+    );
 
     run_shutdown_sequence(
         || background.shutdown().map_err(io::Error::other),
@@ -988,6 +988,26 @@ fn run_owned_supervisor(
             "The Supervisor shutdown did not complete cleanly",
         )
     })
+}
+
+fn wait_for_supervisor_shutdown(
+    drain: &DrainController,
+    signal: &dyn ProcessShutdownSignal,
+    waiter: &dyn RuntimeWaiter,
+    waker: RuntimeWaker,
+) {
+    signal.install_waker(waker.clone());
+    drain.install_waker(waker);
+    loop {
+        let checkpoint = waiter.checkpoint();
+        if signal.shutdown_requested() {
+            drain.request();
+        }
+        if drain.is_requested() {
+            return;
+        }
+        waiter.wait(checkpoint, None);
+    }
 }
 
 struct OwnerSessionGuard {
@@ -1060,6 +1080,7 @@ struct DrainState {
 struct DrainController {
     state: Mutex<DrainState>,
     ready: Condvar,
+    waker: Mutex<Option<RuntimeWaker>>,
 }
 
 impl DrainController {
@@ -1070,6 +1091,25 @@ impl DrainController {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.requested = true;
         self.ready.notify_all();
+        drop(state);
+        if let Some(waker) = self
+            .waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            waker.wake();
+        }
+    }
+
+    fn install_waker(&self, waker: RuntimeWaker) {
+        *self
+            .waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(waker.clone());
+        if self.is_requested() {
+            waker.wake();
+        }
     }
 
     fn is_requested(&self) -> bool {
@@ -1101,20 +1141,6 @@ impl DrainController {
         let _guard = self
             .ready
             .wait_while(state, |state| state.active_mutations > 0)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-    }
-
-    fn wait(&self, timeout: Duration) {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.requested {
-            return;
-        }
-        let _guard = self
-            .ready
-            .wait_timeout_while(state, timeout, |state| !state.requested)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
 }
@@ -1770,6 +1796,72 @@ mod tests {
                 .as_slice(),
             &[Some(CORE_SERVICE_LIVENESS_INTERVAL)]
         );
+    }
+
+    #[test]
+    fn supervisor_shutdown_wait_has_no_periodic_deadline() {
+        let signal = Arc::new(TestShutdownSignal::default());
+        let waiter = RequestingWaiter {
+            signal: Arc::clone(&signal),
+            timeouts: Mutex::new(Vec::new()),
+        };
+        let drain = DrainController::default();
+
+        wait_for_supervisor_shutdown(&drain, signal.as_ref(), &waiter, RuntimeWaker::default());
+
+        assert!(drain.is_requested());
+        assert_eq!(
+            waiter
+                .timeouts
+                .lock()
+                .expect("the timeout log should lock")
+                .as_slice(),
+            &[None]
+        );
+    }
+
+    #[test]
+    fn drain_request_wakes_an_idle_supervisor_wait() {
+        let signal = Arc::new(TestShutdownSignal::default());
+        let drain = Arc::new(DrainController::default());
+        let worker_signal = Arc::clone(&signal);
+        let worker_drain = Arc::clone(&drain);
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let wake = RuntimeWaker::default();
+            wait_for_supervisor_shutdown(
+                worker_drain.as_ref(),
+                worker_signal.as_ref(),
+                &wake,
+                wake.clone(),
+            );
+            done_sender
+                .send(())
+                .expect("the fixture should report shutdown");
+        });
+        let install_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if drain
+                .waker
+                .lock()
+                .expect("the drain waker should lock")
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < install_deadline,
+                "the shutdown wait should install its drain waker"
+            );
+            thread::yield_now();
+        }
+
+        drain.request();
+
+        done_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the drain request should wake the idle wait");
+        worker.join().expect("the shutdown waiter should join");
     }
 
     #[test]
