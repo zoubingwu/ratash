@@ -9,7 +9,8 @@ use hopash::core::{
     ProxyViewOrderSource,
 };
 use hopash::domain::{
-    CoreInstanceGeneration, NodeRecordId, RuntimeGeneration, StreamState, SubscriptionUrl,
+    CoreInstanceGeneration, NodeRecordId, ProxyGroupId, RuntimeGeneration, StreamState,
+    SubscriptionUrl,
 };
 use hopash::state::{AuthoritativeState, AuthoritativeStateStore};
 use hopash::supervisor::{
@@ -629,6 +630,7 @@ fn fixture_proxy_view() -> ProxyView {
         order_source: ProxyViewOrderSource::EffectiveConfiguration,
         provider_state: ProviderState::Ready,
         groups: vec![ProxyGroup {
+            id: ProxyGroupId::for_name("Main"),
             name: "Main".to_owned(),
             proxy_type: "Selector".to_owned(),
             availability: Availability::Available,
@@ -694,6 +696,7 @@ fn two_node_proxy_view() -> ProxyView {
         order_source: ProxyViewOrderSource::EffectiveConfiguration,
         provider_state: ProviderState::Ready,
         groups: vec![ProxyGroup {
+            id: ProxyGroupId::for_name("Main"),
             name: "Main".to_owned(),
             proxy_type: "Selector".to_owned(),
             availability: Availability::Available,
@@ -741,6 +744,7 @@ fn oversized_proxy_view() -> ProxyView {
         order_source: ProxyViewOrderSource::EffectiveConfiguration,
         provider_state: ProviderState::Ready,
         groups: vec![ProxyGroup {
+            id: ProxyGroupId::for_name("Main"),
             name: "Main".to_owned(),
             proxy_type: "Selector".to_owned(),
             availability: Availability::Available,
@@ -773,6 +777,7 @@ fn duplicate_node_name_proxy_view() -> ProxyView {
         order_source: ProxyViewOrderSource::EffectiveConfiguration,
         provider_state: ProviderState::Ready,
         groups: vec![ProxyGroup {
+            id: ProxyGroupId::for_name("Main"),
             name: "Main".to_owned(),
             proxy_type: "Selector".to_owned(),
             availability: Availability::Available,
@@ -1642,15 +1647,17 @@ fn proxy_selection_persists_after_core_success_and_compensates_on_failure() {
     harness.queue_profile("Primary", "node-a");
     let supervisor = harness.open();
     add_profile(&supervisor, "https://example.test/primary.yaml");
+    let group_id = ProxyGroupId::for_name("Main");
 
     let ApplicationOutput::Proxies(proxies) = supervisor
         .execute(ApplicationOperation::ProxyList {
-            group: "Main".to_owned(),
+            group: group_id.as_str().to_owned(),
         })
-        .expect("Proxy list should succeed")
+        .expect("Proxy list by opaque group ID should succeed")
     else {
         panic!("Proxy list should return Proxies")
     };
+    assert_eq!(proxies.group.id, group_id);
     assert_eq!(proxies.nodes.len(), 2);
     let node_b = proxies
         .nodes
@@ -1661,13 +1668,15 @@ fn proxy_selection_persists_after_core_success_and_compensates_on_failure() {
 
     let ApplicationOutput::ProxySelection(selected) = supervisor
         .execute(ApplicationOperation::ProxySelect {
-            group: "Main".to_owned(),
+            group: group_id.as_str().to_owned(),
             node: node_b.as_str().to_owned(),
         })
-        .expect("selection by opaque ID should succeed")
+        .expect("selection by opaque group and Node IDs should succeed")
     else {
         panic!("Proxy select should return ProxySelection")
     };
+    assert_eq!(selected.group_id, group_id);
+    assert_eq!(selected.group, "Main");
     assert_eq!(selected.selected_node.id, node_b.as_str());
     assert_eq!(
         selected.previous_node.expect("previous selection").name,
@@ -1841,6 +1850,7 @@ fn proxy_rows_preserve_group_and_unresolved_member_states() {
         },
     ]);
     view.groups.push(ProxyGroup {
+        id: ProxyGroupId::for_name("Nested"),
         name: "Nested".to_owned(),
         proxy_type: "Selector".to_owned(),
         availability: Availability::Available,
@@ -1851,6 +1861,7 @@ fn proxy_rows_preserve_group_and_unresolved_member_states() {
     });
     view.groups.extend([
         ProxyGroup {
+            id: ProxyGroupId::for_name("GLOBAL"),
             name: "GLOBAL".to_owned(),
             proxy_type: "Selector".to_owned(),
             availability: Availability::Available,
@@ -1860,6 +1871,7 @@ fn proxy_rows_preserve_group_and_unresolved_member_states() {
             members: Vec::new(),
         },
         ProxyGroup {
+            id: ProxyGroupId::for_name("Fallback"),
             name: "Fallback".to_owned(),
             proxy_type: "Fallback".to_owned(),
             availability: Availability::Available,

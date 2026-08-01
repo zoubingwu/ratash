@@ -1,8 +1,8 @@
 use crate::domain::{
     ApplyState, CoreLifecycle, CoreStatus, LocalRuleSetRevision, NodeRecordId, ProbeGeneration,
-    ProbeQueueStatus, ProfileId, RuntimeGeneration, SampleState, StatusSnapshot, StreamHealthSet,
-    StreamState, SubscriptionUrl, SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason,
-    TunStatus,
+    ProbeQueueStatus, ProfileId, ProxyGroupId, RuntimeGeneration, SampleState, StatusSnapshot,
+    StreamHealthSet, StreamState, SubscriptionUrl, SupervisorLifecycle, SupervisorStatus,
+    TrafficSample, TunReason, TunStatus,
 };
 use crate::error::ErrorCode;
 use std::fmt;
@@ -284,6 +284,7 @@ pub struct ProxyNodeRow {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProxyGroupSummary {
+    pub id: ProxyGroupId,
     pub name: String,
     pub proxy_type: String,
     pub selectable: bool,
@@ -305,6 +306,7 @@ pub struct SelectorIdentity {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProxySelectionOutcome {
+    pub group_id: ProxyGroupId,
     pub group: String,
     pub previous_node: Option<SelectorIdentity>,
     pub selected_node: SelectorIdentity,

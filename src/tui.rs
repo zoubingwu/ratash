@@ -25,7 +25,7 @@ use crate::constants::{
     LOG_CAPACITY, MAX_ACTIVE_NODES, MINIMUM_TERMINAL_HEIGHT, MINIMUM_TERMINAL_WIDTH,
     TRAFFIC_SERIES_CAPACITY,
 };
-use crate::domain::{NodeRecordId, ProfileId, SampleState, StatusSnapshot};
+use crate::domain::{NodeRecordId, ProfileId, ProxyGroupId, SampleState, StatusSnapshot};
 use crate::ipc::RequestId;
 use crate::telemetry::{CoreLogRecord, LogLevel, LogSource};
 
@@ -128,6 +128,7 @@ pub struct ConnectionState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProxyRow {
+    pub group_id: ProxyGroupId,
     pub group: String,
     pub node_id: Option<NodeRecordId>,
     pub name: String,
@@ -142,6 +143,7 @@ pub struct ProxyRow {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProxyGroupRow {
+    pub id: ProxyGroupId,
     pub name: String,
     pub proxy_type: String,
     pub selected_node: Option<String>,
@@ -262,7 +264,7 @@ pub struct ProxiesState {
     pub rows: Vec<ProxyRow>,
     pub selected_group: Option<String>,
     pub group_load_pending: Option<PendingProxyGroupLoad>,
-    pub selection_pending: Option<(String, NodeRecordId)>,
+    pub selection_pending: Option<(ProxyGroupId, NodeRecordId)>,
     pub selected: usize,
     pub scroll: usize,
     pub filter: String,
@@ -273,7 +275,7 @@ pub struct ProxiesState {
 pub struct PendingProxyGroupLoad {
     pub request_id: RequestId,
     pub connection_generation: u64,
-    pub group: String,
+    pub group_id: ProxyGroupId,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -676,7 +678,7 @@ pub enum UiIntent {
     FocusSearch,
     PreviousProxyGroup,
     NextProxyGroup,
-    ShowProxyGroup(String),
+    ShowProxyGroup(ProxyGroupId),
     InputCharacter(char),
     Backspace,
     Escape,
@@ -685,7 +687,7 @@ pub enum UiIntent {
     ActivateSelected,
     ActivateProfile(ProfileId),
     SelectNode {
-        group: String,
+        group_id: ProxyGroupId,
         node_id: NodeRecordId,
     },
     ScrollUp,
@@ -715,13 +717,13 @@ pub enum Command {
     SelectNode {
         request_id: RequestId,
         connection_generation: u64,
-        group: String,
+        group_id: ProxyGroupId,
         node_id: NodeRecordId,
     },
     FetchProxyGroup {
         request_id: RequestId,
         connection_generation: u64,
-        group: String,
+        group_id: ProxyGroupId,
     },
     FetchLogTail {
         connection_generation: u64,
@@ -960,7 +962,7 @@ fn apply_intent(state: &mut AppState, intent: UiIntent) -> Vec<Command> {
         }
         UiIntent::PreviousProxyGroup => move_proxy_group(state, -1),
         UiIntent::NextProxyGroup => move_proxy_group(state, 1),
-        UiIntent::ShowProxyGroup(group) => issue_proxy_group_load(state, group),
+        UiIntent::ShowProxyGroup(group_id) => issue_proxy_group_load(state, group_id),
         UiIntent::InputCharacter(character) => {
             append_search(state, character);
             Vec::new()
@@ -987,7 +989,9 @@ fn apply_intent(state: &mut AppState, intent: UiIntent) -> Vec<Command> {
         }
         UiIntent::ActivateSelected => activate_selected(state),
         UiIntent::ActivateProfile(profile_id) => issue_profile_activation(state, profile_id),
-        UiIntent::SelectNode { group, node_id } => issue_node_selection(state, group, node_id),
+        UiIntent::SelectNode { group_id, node_id } => {
+            issue_node_selection(state, group_id, node_id)
+        }
         UiIntent::SetProxySort(sort) => {
             state.proxies.sort = sort;
             state.proxies.selected = 0;
@@ -1070,16 +1074,19 @@ fn move_proxy_group(state: &mut AppState, delta: isize) -> Vec<Command> {
     Vec::new()
 }
 
-fn issue_proxy_group_load(state: &mut AppState, group: String) -> Vec<Command> {
-    if let Some(index) = state
+fn issue_proxy_group_load(state: &mut AppState, group_id: ProxyGroupId) -> Vec<Command> {
+    let Some((index, group_name)) = state
         .proxies
         .groups
         .iter()
-        .position(|candidate| candidate.name == group)
-    {
-        state.proxies.group_cursor = index;
-    }
-    if state.proxies.selected_group.as_deref() == Some(group.as_str())
+        .enumerate()
+        .find(|(_, candidate)| candidate.id == group_id)
+        .map(|(index, group)| (index, group.name.clone()))
+    else {
+        return Vec::new();
+    };
+    state.proxies.group_cursor = index;
+    if state.proxies.selected_group.as_deref() == Some(group_name.as_str())
         && state.proxies.group_load_pending.is_none()
     {
         return Vec::new();
@@ -1089,12 +1096,12 @@ fn issue_proxy_group_load(state: &mut AppState, group: String) -> Vec<Command> {
     state.proxies.group_load_pending = Some(PendingProxyGroupLoad {
         request_id,
         connection_generation: state.connection.generation,
-        group: group.clone(),
+        group_id: group_id.clone(),
     });
     commands.push(Command::FetchProxyGroup {
         request_id,
         connection_generation: state.connection.generation,
-        group,
+        group_id,
     });
     commands
 }
@@ -1146,10 +1153,10 @@ fn activate_selected(state: &mut AppState) -> Vec<Command> {
             .and_then(|row| {
                 row.node_id
                     .clone()
-                    .map(|node_id| (row.group.clone(), node_id))
+                    .map(|node_id| (row.group_id.clone(), node_id))
             })
-            .map_or_else(Vec::new, |(group, node_id)| {
-                issue_node_selection(state, group, node_id)
+            .map_or_else(Vec::new, |(group_id, node_id)| {
+                issue_node_selection(state, group_id, node_id)
             }),
         Page::Profiles => filtered_profiles(&state.profiles)
             .get(state.profiles.selected)
@@ -1181,7 +1188,7 @@ fn issue_profile_activation(state: &mut AppState, profile_id: ProfileId) -> Vec<
 
 fn issue_node_selection(
     state: &mut AppState,
-    group: String,
+    group_id: ProxyGroupId,
     node_id: NodeRecordId,
 ) -> Vec<Command> {
     let request_id = state.take_request_id();
@@ -1191,12 +1198,19 @@ fn issue_node_selection(
         connection_generation: state.connection.generation,
         kind: PendingOperationKind::SelectNode,
     });
-    state.proxies.selected_group = Some(group.clone());
-    state.proxies.selection_pending = Some((group.clone(), node_id.clone()));
+    if let Some(group) = state
+        .proxies
+        .groups
+        .iter()
+        .find(|group| group.id == group_id)
+    {
+        state.proxies.selected_group = Some(group.name.clone());
+    }
+    state.proxies.selection_pending = Some((group_id.clone(), node_id.clone()));
     commands.push(Command::SelectNode {
         request_id,
         connection_generation: state.connection.generation,
-        group,
+        group_id,
         node_id,
     });
     commands
@@ -1516,7 +1530,7 @@ fn selected_intent(state: &AppState) -> Option<UiIntent> {
                 .proxies
                 .groups
                 .get(state.proxies.group_cursor)
-                .map(|group| UiIntent::ShowProxyGroup(group.name.clone()));
+                .map(|group| UiIntent::ShowProxyGroup(group.id.clone()));
         }
         Focus::FooterHelp => return Some(UiIntent::ToggleHelp),
         Focus::FooterQuit => return Some(UiIntent::Quit),
@@ -1528,7 +1542,7 @@ fn selected_intent(state: &AppState) -> Option<UiIntent> {
             .get(state.proxies.selected)
             .and_then(|row| {
                 row.node_id.clone().map(|node_id| UiIntent::SelectNode {
-                    group: row.group.clone(),
+                    group_id: row.group_id.clone(),
                     node_id,
                 })
             }),
@@ -1796,7 +1810,7 @@ fn interaction_map(
         for (_, group, area) in visible_proxy_groups(&state.proxies, group_area) {
             interactions.push(Interaction {
                 area,
-                intent: UiIntent::ShowProxyGroup(group.name.clone()),
+                intent: UiIntent::ShowProxyGroup(group.id.clone()),
             });
         }
     }
@@ -1822,7 +1836,7 @@ fn interaction_map(
                             1,
                         ),
                         intent: UiIntent::SelectNode {
-                            group: row.group.clone(),
+                            group_id: row.group_id.clone(),
                             node_id,
                         },
                     });
@@ -2091,7 +2105,7 @@ fn proxy_group_chip_label(state: &ProxiesState, group: &ProxyGroupRow) -> String
     let marker = if state
         .group_load_pending
         .as_ref()
-        .is_some_and(|pending| pending.group == group.name)
+        .is_some_and(|pending| pending.group_id == group.id)
     {
         "[pending]"
     } else if state.selected_group.as_deref() == Some(group.name.as_str()) {
@@ -2148,7 +2162,7 @@ fn render_proxy_groups(state: &AppState, area: Rect, buffer: &mut Buffer) {
             .proxies
             .group_load_pending
             .as_ref()
-            .is_some_and(|load| load.group == group.name);
+            .is_some_and(|load| load.group_id == group.id);
         let focused = index == state.proxies.group_cursor;
         let style = if pending {
             Style::default()
@@ -2223,8 +2237,8 @@ fn render_proxies(state: &AppState, regions: &LayoutRegions, buffer: &mut Buffer
                     .proxies
                     .selection_pending
                     .as_ref()
-                    .is_some_and(|(group, node_id)| {
-                        group == &row.group && row.node_id.as_ref() == Some(node_id)
+                    .is_some_and(|(group_id, node_id)| {
+                        group_id == &row.group_id && row.node_id.as_ref() == Some(node_id)
                     });
             let marker = match (row.selected, pending) {
                 (true, true) => "[current][pending]",

@@ -1,4 +1,4 @@
-use hopash::domain::{NodeRecordId, ProfileId, SubscriptionUrl};
+use hopash::domain::{NodeRecordId, ProfileId, ProxyGroupId, SubscriptionUrl};
 
 #[test]
 fn subscription_url_accepts_http_and_https_at_the_domain_boundary() {
@@ -100,6 +100,24 @@ fn node_record_ids_are_deterministic_and_source_aware() {
         core
     );
     assert!(NodeRecordId::parse("node_v1_invalid").is_err());
+}
+
+#[test]
+fn proxy_group_ids_are_stable_opaque_and_round_trip_through_text() {
+    let automatic = ProxyGroupId::for_name("Automatic");
+
+    assert_eq!(
+        automatic.as_str(),
+        "group_v1_d06398df81b2e85f5b7b89ec63befdda5d65ad8ebbd9a9da46eda1d0d61b0b6e"
+    );
+    assert_eq!(automatic, ProxyGroupId::for_name("Automatic"));
+    assert_ne!(automatic, ProxyGroupId::for_name("automatic"));
+    assert!(!automatic.as_str().contains("Automatic"));
+    assert_eq!(
+        ProxyGroupId::parse(automatic.as_str()).expect("generated ID should parse"),
+        automatic
+    );
+    assert!(ProxyGroupId::parse("group_v1_invalid").is_err());
 }
 
 #[test]

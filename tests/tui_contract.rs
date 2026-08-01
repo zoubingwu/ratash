@@ -17,7 +17,7 @@ use hopash::constants::{
 };
 use hopash::domain::{
     ActiveProfileSummary, ApplyState, CoreLifecycle, CoreStatus, NodeRecordId, ProbeQueueStatus,
-    ProfileId, RuntimeGeneration, SampleState, SelectedNodeSummary, StatusSnapshot,
+    ProfileId, ProxyGroupId, RuntimeGeneration, SampleState, SelectedNodeSummary, StatusSnapshot,
     StreamHealthSet, StreamState, SupervisorLifecycle, SupervisorStatus, TrafficSample, TunStatus,
 };
 use hopash::ipc::RequestId;
@@ -79,6 +79,7 @@ fn proxy_rows_without_stable_node_ids_are_visible_and_read_only() {
     let mut state = connected_state();
     state.page = Page::Proxies;
     state.proxies.rows = vec![ProxyRow {
+        group_id: ProxyGroupId::for_name("Automatic"),
         group: "Automatic".to_owned(),
         node_id: None,
         name: "Missing member".to_owned(),
@@ -241,8 +242,9 @@ fn keyboard_and_mouse_proxy_group_switches_share_the_same_intent() {
     state.proxies.groups.push(manual_proxy_group());
     state.proxies.group_cursor = 1;
     let (_, map) = render_with_backend(&state, 140, 30);
+    let manual_group_id = ProxyGroupId::for_name("Manual");
     let manual_hit = hit_for(&map, |intent| {
-        *intent == UiIntent::ShowProxyGroup("Manual".to_owned())
+        *intent == UiIntent::ShowProxyGroup(manual_group_id.clone())
     });
     let next_hit = hit_for(&map, |intent| *intent == UiIntent::NextProxyGroup);
     state.publish_interaction_map(map);
@@ -276,7 +278,7 @@ fn keyboard_and_mouse_proxy_group_switches_share_the_same_intent() {
             UiEvent::Intent(keyboard.expect("focused Proxy Group should switch"))
         )
         .as_slice(),
-        [Command::FetchProxyGroup { group, .. }] if group == "Manual"
+        [Command::FetchProxyGroup { group_id, .. }] if group_id == &manual_group_id
     ));
 }
 
@@ -492,7 +494,7 @@ fn proxy_group_browsing_keeps_mutations_and_discards_late_group_results() {
 
     let group_commands = update(
         &mut state,
-        UiEvent::Intent(UiIntent::ShowProxyGroup("Manual".to_owned())),
+        UiEvent::Intent(UiIntent::ShowProxyGroup(ProxyGroupId::for_name("Manual"))),
     );
     let (group_request_id, group_generation) = proxy_group_identity(&group_commands);
     assert_eq!(group_generation, generation);
@@ -555,7 +557,7 @@ fn proxy_group_load_and_mutation_states_are_visually_distinct() {
 
     let group_commands = update(
         &mut state,
-        UiEvent::Intent(UiIntent::ShowProxyGroup("Manual".to_owned())),
+        UiEvent::Intent(UiIntent::ShowProxyGroup(ProxyGroupId::for_name("Manual"))),
     );
     let (request_id, generation) = proxy_group_identity(&group_commands);
     update(
@@ -572,7 +574,9 @@ fn proxy_group_load_and_mutation_states_are_visually_distinct() {
 
     let failed_commands = update(
         &mut state,
-        UiEvent::Intent(UiIntent::ShowProxyGroup("Automatic".to_owned())),
+        UiEvent::Intent(UiIntent::ShowProxyGroup(ProxyGroupId::for_name(
+            "Automatic",
+        ))),
     );
     let (failed_request_id, failed_generation) = proxy_group_identity(&failed_commands);
     update(
@@ -1269,6 +1273,7 @@ fn status_snapshot() -> StatusSnapshot {
 
 fn proxy(name: &str, selected: bool) -> ProxyRow {
     ProxyRow {
+        group_id: ProxyGroupId::for_name("Automatic"),
         group: "Automatic".to_owned(),
         node_id: Some(NodeRecordId::for_core(name)),
         name: name.to_owned(),
@@ -1292,6 +1297,7 @@ fn proxy(name: &str, selected: bool) -> ProxyRow {
 
 fn proxy_group() -> ProxyGroupRow {
     ProxyGroupRow {
+        id: ProxyGroupId::for_name("Automatic"),
         name: "Automatic".to_owned(),
         proxy_type: "Selector".to_owned(),
         selected_node: Some("Tokyo".to_owned()),
@@ -1300,6 +1306,7 @@ fn proxy_group() -> ProxyGroupRow {
 
 fn manual_proxy_group() -> ProxyGroupRow {
     ProxyGroupRow {
+        id: ProxyGroupId::for_name("Manual"),
         name: "Manual".to_owned(),
         proxy_type: "Selector".to_owned(),
         selected_node: Some("Paris".to_owned()),
@@ -1308,6 +1315,7 @@ fn manual_proxy_group() -> ProxyGroupRow {
 
 fn manual_proxy_snapshot() -> ProxyGroupSnapshot {
     let mut paris = proxy("Paris", true);
+    paris.group_id = ProxyGroupId::for_name("Manual");
     paris.group = "Manual".to_owned();
     ProxyGroupSnapshot {
         group: manual_proxy_group(),

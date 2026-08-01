@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 use crate::domain::{
-    CoreInstanceGeneration, LatencySample, NodeRecordId, RuntimeGeneration, SampleState,
+    CoreInstanceGeneration, LatencySample, NodeRecordId, ProxyGroupId, RuntimeGeneration,
+    SampleState,
 };
 
 pub const PROXY_VIEW_SCHEMA_VERSION: u8 = 1;
@@ -342,6 +343,7 @@ impl ProxyMember {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProxyGroup {
+    pub id: ProxyGroupId,
     pub name: String,
     pub proxy_type: String,
     pub availability: Availability,
@@ -865,6 +867,7 @@ fn build_proxy_view(
                     .collect();
                 ProxyGroup {
                     core_internal: is_core_internal(&name),
+                    id: ProxyGroupId::for_name(&name),
                     name,
                     selectable: proxy.proxy_type.eq_ignore_ascii_case("selector"),
                     proxy_type: proxy.proxy_type,

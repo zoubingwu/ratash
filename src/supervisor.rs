@@ -34,9 +34,9 @@ use crate::core::{
 };
 use crate::domain::{
     ActiveProfileSummary, ApplyState, CoreInstanceGeneration, CoreLifecycle, CoreStatus,
-    NodeRecordId, ProbeGeneration, ProbeQueueStatus, ProfileId, RuntimeGeneration, SampleState,
-    SelectedNodeSummary, StatusSnapshot, StreamHealthSet, StreamState, SubscriptionUrl,
-    SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason, TunStatus,
+    NodeRecordId, ProbeGeneration, ProbeQueueStatus, ProfileId, ProxyGroupId, RuntimeGeneration,
+    SampleState, SelectedNodeSummary, StatusSnapshot, StreamHealthSet, StreamState,
+    SubscriptionUrl, SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason, TunStatus,
 };
 use crate::error::ErrorCode;
 use crate::profile::{
@@ -1423,18 +1423,14 @@ impl Supervisor {
         }))
     }
 
-    fn proxy_list(&self, group_name: &str) -> Result<ApplicationOutput, ApplicationError> {
+    fn proxy_list(&self, group_selector: &str) -> Result<ApplicationOutput, ApplicationError> {
         let mut state = self.state.lock().map_err(|_| internal_error())?;
         let (core, view) = self.load_proxy_view(&mut state)?;
         ensure_telemetry(&mut state, core.instance_generation)?;
-        let group = view
-            .groups
-            .iter()
-            .find(|group| group.name == group_name)
-            .ok_or_else(|| selector_not_found(SelectorKind::ProxyGroup, "Proxy Group"))?;
+        let group = resolve_proxy_group(&view, group_selector)?;
         let observations = probe_observations(&state, &view, self.clock.now_unix_ms());
         let rows = view
-            .node_rows(group_name, &observations)
+            .node_rows(&group.name, &observations)
             .map_err(map_selection_error)?
             .into_iter()
             .map(proxy_row)
@@ -1454,19 +1450,20 @@ impl Supervisor {
 
     fn proxy_select(
         &self,
-        group_name: &str,
+        group_selector: &str,
         node_selector: &str,
     ) -> Result<ApplicationOutput, ApplicationError> {
         let mut state = self.state.lock().map_err(|_| internal_error())?;
         let (core, view) = self.load_proxy_view(&mut state)?;
-        let selection =
-            selection_by_selector(&view, group_name, node_selector).map_err(map_selection_error)?;
-        let previous = view
-            .groups
-            .iter()
-            .find(|group| group.name == group_name)
-            .and_then(|group| group.selected_name.as_deref())
-            .and_then(|name| selection_by_selector(&view, group_name, name).ok());
+        let group = resolve_proxy_group(&view, group_selector)?;
+        let group_id = group.id.clone();
+        let group_name = group.name.clone();
+        let selection = selection_by_selector(&view, &group_name, node_selector)
+            .map_err(map_selection_error)?;
+        let previous = group
+            .selected_name
+            .as_deref()
+            .and_then(|name| selection_by_selector(&view, &group_name, name).ok());
         self.core
             .select_node(&core, &selection)
             .map_err(|_| core_error("Mihomo rejected the Node selection"))?;
@@ -1477,7 +1474,7 @@ impl Supervisor {
             .get_mut(active_id)
             .ok_or_else(internal_error)?
             .selections
-            .insert(group_name.to_owned(), selection.record_id.clone());
+            .insert(group_name.clone(), selection.record_id.clone());
         if self
             .persist_metadata(&profiles, &state.local_rules, &state)
             .is_err()
@@ -1503,7 +1500,8 @@ impl Supervisor {
         state.selection_restore_pending = false;
         state.selection_restore_attempts_remaining = 0;
         Ok(ApplicationOutput::ProxySelection(ProxySelectionOutcome {
-            group: group_name.to_owned(),
+            group_id,
+            group: group_name,
             previous_node: previous.map(|previous| SelectorIdentity {
                 id: previous.record_id.as_str().to_owned(),
                 name: previous.node_name,
@@ -2130,6 +2128,23 @@ fn effective_group_order(profiles: &ProfileCatalog) -> Result<Vec<String>, Appli
         .collect())
 }
 
+fn resolve_proxy_group<'a>(
+    view: &'a ProxyView,
+    selector: &str,
+) -> Result<&'a crate::core::ProxyGroup, ApplicationError> {
+    if let Ok(id) = ProxyGroupId::parse(selector) {
+        return view
+            .groups
+            .iter()
+            .find(|group| group.id == id)
+            .ok_or_else(|| selector_not_found(SelectorKind::ProxyGroup, "Proxy Group"));
+    }
+    view.groups
+        .iter()
+        .find(|group| group.name == selector)
+        .ok_or_else(|| selector_not_found(SelectorKind::ProxyGroup, "Proxy Group"))
+}
+
 fn selection_by_selector(
     view: &ProxyView,
     group_name: &str,
@@ -2206,6 +2221,7 @@ fn proxy_group_summary(view: &ProxyView, group: &crate::core::ProxyGroup) -> Pro
             name: selection.node_name,
         });
     ProxyGroupSummary {
+        id: group.id.clone(),
         name: group.name.clone(),
         proxy_type: group.proxy_type.clone(),
         selectable: group.selectable,

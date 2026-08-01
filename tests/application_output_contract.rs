@@ -10,8 +10,8 @@ use hopash::application::{
 };
 use hopash::contract::{ApiError, ApplicationOutputViewV1, JsonEnvelope};
 use hopash::domain::{
-    LocalRuleSetRevision, NodeRecordId, ProbeGeneration, ProfileId, RuntimeGeneration,
-    SubscriptionUrl,
+    LocalRuleSetRevision, NodeRecordId, ProbeGeneration, ProfileId, ProxyGroupId,
+    RuntimeGeneration, SubscriptionUrl,
 };
 use hopash::error::ErrorCode;
 
@@ -73,9 +73,11 @@ fn lifecycle_and_profile_outputs_use_versioned_safe_json() {
 fn proxy_and_latency_outputs_preserve_resolution_and_probe_state() {
     let candidate_a = NodeRecordId::for_provider("provider-a", "Shared");
     let candidate_b = NodeRecordId::for_provider("provider-b", "Shared");
+    let group_id = ProxyGroupId::for_name("Main");
     let proxies = JsonEnvelope::success(ApplicationOutputViewV1::from(ApplicationOutput::Proxies(
         ProxyListOutcome {
             group: ProxyGroupSummary {
+                id: group_id.clone(),
                 name: "Main".to_owned(),
                 proxy_type: "Selector".to_owned(),
                 selectable: true,
@@ -85,6 +87,7 @@ fn proxy_and_latency_outputs_preserve_resolution_and_probe_state() {
                 }),
             },
             groups: vec![ProxyGroupSummary {
+                id: group_id.clone(),
                 name: "Main".to_owned(),
                 proxy_type: "Selector".to_owned(),
                 selectable: true,
@@ -111,6 +114,7 @@ fn proxy_and_latency_outputs_preserve_resolution_and_probe_state() {
     )));
     let proxy_json = serde_json::to_value(proxies).expect("Proxy output should serialize");
     assert_eq!(proxy_json["data"]["nodes"][0]["member_kind"], "ambiguous");
+    assert_eq!(proxy_json["data"]["groups"][0]["id"], group_id.as_str());
     assert_eq!(proxy_json["data"]["groups"][0]["name"], "Main");
     assert_eq!(
         proxy_json["data"]["groups"][0]["selected_node"]["id"],
@@ -127,6 +131,7 @@ fn proxy_and_latency_outputs_preserve_resolution_and_probe_state() {
 
     let selection = JsonEnvelope::success(ApplicationOutputViewV1::from(
         ApplicationOutput::ProxySelection(ProxySelectionOutcome {
+            group_id: group_id.clone(),
             group: "Main".to_owned(),
             previous_node: None,
             selected_node: SelectorIdentity {
@@ -142,6 +147,7 @@ fn proxy_and_latency_outputs_preserve_resolution_and_probe_state() {
         }),
     ));
     let selection_json = serde_json::to_value(selection).expect("selection should serialize");
+    assert_eq!(selection_json["data"]["group_id"], group_id.as_str());
     assert_eq!(selection_json["data"]["group"], "Main");
     assert_eq!(selection_json["data"]["persisted"], true);
     assert_eq!(selection_json["data"]["recovery"]["status"], "not_required");

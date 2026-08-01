@@ -38,7 +38,7 @@ use crate::constants::{
 use crate::domain::{
     ActiveProfileSummary, ApplyState, CoreInstanceGeneration, CoreLifecycle, CoreStatus,
     LatencySample, LocalRuleSetRevision, NodeRecordId, ProbeGeneration, ProbeQueueStatus,
-    ProfileId, RuntimeGeneration, SampleState, SelectedNodeSummary, StatusSnapshot,
+    ProfileId, ProxyGroupId, RuntimeGeneration, SampleState, SelectedNodeSummary, StatusSnapshot,
     StreamHealthSet, StreamState, SubscriptionUrl, SupervisorLifecycle, SupervisorStatus,
     TrafficSample, TunReason, TunStatus,
 };
@@ -2256,7 +2256,7 @@ impl TryFrom<WireApplicationOutput> for ApplicationOutput {
                 Ok(Self::Proxies(ProxyListOutcome::try_from(outcome)?))
             }
             WireApplicationOutput::ProxySelection(outcome) => {
-                Ok(Self::ProxySelection(outcome.into()))
+                Ok(Self::ProxySelection(outcome.try_into()?))
             }
             WireApplicationOutput::Latencies(outcome) => {
                 Ok(Self::Latencies(LatencyListOutcome::try_from(outcome)?))
@@ -2580,6 +2580,7 @@ impl From<WireSelectorIdentity> for SelectorIdentity {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct WireProxyGroupSummary {
+    id: String,
     name: String,
     proxy_type: String,
     selectable: bool,
@@ -2589,6 +2590,7 @@ struct WireProxyGroupSummary {
 impl From<ProxyGroupSummary> for WireProxyGroupSummary {
     fn from(value: ProxyGroupSummary) -> Self {
         Self {
+            id: value.id.as_str().to_owned(),
             name: value.name,
             proxy_type: value.proxy_type,
             selectable: value.selectable,
@@ -2597,14 +2599,17 @@ impl From<ProxyGroupSummary> for WireProxyGroupSummary {
     }
 }
 
-impl From<WireProxyGroupSummary> for ProxyGroupSummary {
-    fn from(value: WireProxyGroupSummary) -> Self {
-        Self {
+impl TryFrom<WireProxyGroupSummary> for ProxyGroupSummary {
+    type Error = WireConversionError;
+
+    fn try_from(value: WireProxyGroupSummary) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: ProxyGroupId::parse(&value.id).map_err(|_| WireConversionError)?,
             name: value.name,
             proxy_type: value.proxy_type,
             selectable: value.selectable,
             selected_node: value.selected_node.map(Into::into),
-        }
+        })
     }
 }
 
@@ -2631,8 +2636,12 @@ impl TryFrom<WireProxyListOutcome> for ProxyListOutcome {
 
     fn try_from(value: WireProxyListOutcome) -> Result<Self, Self::Error> {
         Ok(Self {
-            group: value.group.into(),
-            groups: value.groups.into_iter().map(Into::into).collect(),
+            group: value.group.try_into()?,
+            groups: value
+                .groups
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
             nodes: value
                 .nodes
                 .into_iter()
@@ -2644,6 +2653,7 @@ impl TryFrom<WireProxyListOutcome> for ProxyListOutcome {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct WireProxySelectionOutcome {
+    group_id: String,
     group: String,
     previous_node: Option<WireSelectorIdentity>,
     selected_node: WireSelectorIdentity,
@@ -2654,6 +2664,7 @@ struct WireProxySelectionOutcome {
 impl From<ProxySelectionOutcome> for WireProxySelectionOutcome {
     fn from(value: ProxySelectionOutcome) -> Self {
         Self {
+            group_id: value.group_id.as_str().to_owned(),
             group: value.group,
             previous_node: value.previous_node.map(Into::into),
             selected_node: value.selected_node.into(),
@@ -2663,15 +2674,18 @@ impl From<ProxySelectionOutcome> for WireProxySelectionOutcome {
     }
 }
 
-impl From<WireProxySelectionOutcome> for ProxySelectionOutcome {
-    fn from(value: WireProxySelectionOutcome) -> Self {
-        Self {
+impl TryFrom<WireProxySelectionOutcome> for ProxySelectionOutcome {
+    type Error = WireConversionError;
+
+    fn try_from(value: WireProxySelectionOutcome) -> Result<Self, Self::Error> {
+        Ok(Self {
+            group_id: ProxyGroupId::parse(&value.group_id).map_err(|_| WireConversionError)?,
             group: value.group,
             previous_node: value.previous_node.map(Into::into),
             selected_node: value.selected_node.into(),
             persisted: value.persisted,
             recovery: value.recovery.into(),
-        }
+        })
     }
 }
 

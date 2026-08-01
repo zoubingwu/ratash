@@ -21,8 +21,8 @@ use hopash::application::{
 };
 use hopash::constants::IPC_FRAME_MAX_BYTES;
 use hopash::domain::{
-    LocalRuleSetRevision, NodeRecordId, ProbeGeneration, ProfileId, RuntimeGeneration,
-    SubscriptionUrl,
+    LocalRuleSetRevision, NodeRecordId, ProbeGeneration, ProfileId, ProxyGroupId,
+    RuntimeGeneration, SubscriptionUrl,
 };
 use hopash::error::ErrorCode;
 use hopash::ipc::{
@@ -379,6 +379,7 @@ fn application_output_cases() -> Vec<(ApplicationOperation, ApplicationOutput)> 
         last_error: None,
     };
     let node_id = NodeRecordId::for_provider("provider", "Node A");
+    let group_id = ProxyGroupId::for_name("Main");
     let latency = LatencySummary {
         node_id: node_id.clone(),
         node_name: "Node A".to_owned(),
@@ -431,16 +432,18 @@ fn application_output_cases() -> Vec<(ApplicationOperation, ApplicationOutput)> 
         ),
         (
             ApplicationOperation::ProxyList {
-                group: "Main".to_owned(),
+                group: group_id.as_str().to_owned(),
             },
             ApplicationOutput::Proxies(ProxyListOutcome {
                 group: ProxyGroupSummary {
+                    id: group_id.clone(),
                     name: "Main".to_owned(),
                     proxy_type: "Selector".to_owned(),
                     selectable: true,
                     selected_node: Some(identity.clone()),
                 },
                 groups: vec![ProxyGroupSummary {
+                    id: group_id.clone(),
                     name: "Main".to_owned(),
                     proxy_type: "Selector".to_owned(),
                     selectable: true,
@@ -466,10 +469,11 @@ fn application_output_cases() -> Vec<(ApplicationOperation, ApplicationOutput)> 
         ),
         (
             ApplicationOperation::ProxySelect {
-                group: "Main".to_owned(),
+                group: group_id.as_str().to_owned(),
                 node: identity.id.clone(),
             },
             ApplicationOutput::ProxySelection(ProxySelectionOutcome {
+                group_id,
                 group: "Main".to_owned(),
                 previous_node: None,
                 selected_node: identity,

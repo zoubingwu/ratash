@@ -13,8 +13,8 @@ use hopash::application::{
 use hopash::constants::LOG_CAPACITY;
 use hopash::domain::{
     ActiveProfileSummary, ApplyState, CoreLifecycle, CoreStatus, NodeRecordId, ProbeQueueStatus,
-    ProfileId, SampleState, StatusSnapshot, StreamHealthSet, StreamState, SupervisorLifecycle,
-    SupervisorStatus, TrafficSample, TunStatus,
+    ProfileId, ProxyGroupId, SampleState, StatusSnapshot, StreamHealthSet, StreamState,
+    SupervisorLifecycle, SupervisorStatus, TrafficSample, TunStatus,
 };
 use hopash::ipc::RequestId;
 use hopash::tui::{
@@ -426,6 +426,7 @@ fn background_snapshot_refresh_replaces_profiles_and_proxies() {
     let mut refreshed = snapshot(90);
     refreshed.profiles.push(profile_row(40_000));
     refreshed.proxies.push(ProxyRow {
+        group_id: ProxyGroupId::for_name("Automatic"),
         group: "Automatic".to_owned(),
         node_id: Some(NodeRecordId::for_core("Berlin")),
         name: "Berlin".to_owned(),
@@ -698,7 +699,7 @@ fn successful_mutation_dispatches_a_refreshed_full_snapshot() {
         .submit(Command::SelectNode {
             request_id: RequestId(92),
             connection_generation: 6,
-            group: "Automatic".to_owned(),
+            group_id: ProxyGroupId::for_name("Automatic"),
             node_id: NodeRecordId::for_core("Berlin"),
         })
         .expect("fixture command should enter the bounded queue");
@@ -748,7 +749,7 @@ fn idle_background_command_workers_block_until_work_or_shutdown() {
         .submit(Command::FetchProxyGroup {
             request_id: RequestId(94),
             connection_generation: 6,
-            group: "Automatic".to_owned(),
+            group_id: ProxyGroupId::for_name("Automatic"),
         })
         .expect("fixture work should enter the bounded queue");
     waker.wait(checkpoint, Some(Duration::from_secs(1)));
@@ -770,6 +771,7 @@ fn background_dispatcher_loads_one_proxy_group_without_a_full_snapshot() {
     let order = Arc::new(Mutex::new(Vec::new()));
     let mut view = snapshot(0);
     view.proxy_groups = vec![ProxyGroupRow {
+        id: ProxyGroupId::for_name("Manual"),
         name: "Manual".to_owned(),
         proxy_type: "Selector".to_owned(),
         selected_node: Some("Paris".to_owned()),
@@ -793,7 +795,7 @@ fn background_dispatcher_loads_one_proxy_group_without_a_full_snapshot() {
         .submit(Command::FetchProxyGroup {
             request_id: RequestId(93),
             connection_generation: 6,
-            group: "Manual".to_owned(),
+            group_id: ProxyGroupId::for_name("Manual"),
         })
         .expect("Proxy Group request should enter the bounded queue");
     waker.wait(checkpoint, Some(Duration::from_secs(1)));
@@ -1010,9 +1012,10 @@ impl FullSnapshotSource for FakeSnapshots {
             .snapshot
             .proxy_groups
             .iter()
-            .find(|candidate| candidate.name == group)
+            .find(|candidate| candidate.name == group || candidate.id.as_str() == group)
             .cloned()
             .unwrap_or_else(|| ProxyGroupRow {
+                id: ProxyGroupId::parse(group).unwrap_or_else(|_| ProxyGroupId::for_name(group)),
                 name: group.to_owned(),
                 proxy_type: "Selector".to_owned(),
                 selected_node: None,
@@ -1198,7 +1201,12 @@ impl ApplicationClient for ProxySnapshotClient {
                 }))
             }
             ApplicationOperation::ProxyList { group } => {
-                let node_name = if group == "Manual" { "Paris" } else { "Tokyo" };
+                let node_name =
+                    if group == "Manual" || group == ProxyGroupId::for_name("Manual").as_str() {
+                        "Paris"
+                    } else {
+                        "Tokyo"
+                    };
                 Ok(ApplicationOutput::Proxies(ProxyListOutcome {
                     group: proxy_group_summary(&group, node_name),
                     groups: vec![
@@ -1228,6 +1236,7 @@ impl ApplicationClient for ProxySnapshotClient {
 
 fn proxy_group_summary(name: &str, selected_node: &str) -> ProxyGroupSummary {
     ProxyGroupSummary {
+        id: ProxyGroupId::for_name(name),
         name: name.to_owned(),
         proxy_type: "Selector".to_owned(),
         selectable: true,

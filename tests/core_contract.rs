@@ -13,8 +13,8 @@ use hopash::core::{
     project_proxy_view,
 };
 use hopash::domain::{
-    CoreInstanceGeneration, LatencySample, NodeRecordId, ProbeGeneration, RuntimeGeneration,
-    SampleState,
+    CoreInstanceGeneration, LatencySample, NodeRecordId, ProbeGeneration, ProxyGroupId,
+    RuntimeGeneration, SampleState,
 };
 
 const PROXIES: &[u8] = include_bytes!("../fixtures/mihomo/v1.19.28/proxies.json");
@@ -56,6 +56,7 @@ fn v1_19_28_projection_preserves_groups_and_source_aware_nodes() {
         view.primary_group().map(|group| group.name.as_str()),
         Some("Manual")
     );
+    assert_eq!(view.groups[1].id, ProxyGroupId::for_name("Manual"));
     assert!(view.groups[0].core_internal);
     assert!(view.groups[0].selectable);
     assert!(!view.groups[2].selectable);

@@ -258,6 +258,50 @@ fn source_aware_node_id(source: &str, components: &[&str]) -> String {
     format!("node_v1_{}", crate::digest::sha256_hex(&canonical))
 }
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProxyGroupId(String);
+
+impl ProxyGroupId {
+    pub fn parse(value: &str) -> Result<Self, InvalidProxyGroupId> {
+        let digest = value.strip_prefix("group_v1_").ok_or(InvalidProxyGroupId)?;
+        if digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(InvalidProxyGroupId)
+        }
+    }
+
+    #[must_use]
+    pub fn for_name(name: &str) -> Self {
+        let mut canonical = b"hopash-proxy-group-v1\0".to_vec();
+        canonical.extend_from_slice(name.as_bytes());
+        Self(format!(
+            "group_v1_{}",
+            crate::digest::sha256_hex(&canonical)
+        ))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidProxyGroupId;
+
+impl fmt::Display for InvalidProxyGroupId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Proxy Group ID is invalid")
+    }
+}
+
+impl std::error::Error for InvalidProxyGroupId {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SupervisorStatus {
     pub lifecycle: SupervisorLifecycle,

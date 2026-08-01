@@ -375,6 +375,7 @@ impl From<application::ProxyListOutcome> for ProxyListViewV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ProxyGroupViewV1 {
+    pub id: String,
     pub name: String,
     pub proxy_type: String,
     pub selectable: bool,
@@ -385,6 +386,7 @@ pub struct ProxyGroupViewV1 {
 impl From<application::ProxyGroupSummary> for ProxyGroupViewV1 {
     fn from(group: application::ProxyGroupSummary) -> Self {
         Self {
+            id: group.id.as_str().to_owned(),
             name: group.name,
             proxy_type: group.proxy_type,
             selectable: group.selectable,
@@ -510,6 +512,7 @@ impl From<application::SelectorIdentity> for SelectorIdentityViewV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ProxySelectionViewV1 {
+    pub group_id: String,
     pub group: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_node: Option<SelectorIdentityViewV1>,
@@ -521,6 +524,7 @@ pub struct ProxySelectionViewV1 {
 impl From<application::ProxySelectionOutcome> for ProxySelectionViewV1 {
     fn from(outcome: application::ProxySelectionOutcome) -> Self {
         Self {
+            group_id: outcome.group_id.as_str().to_owned(),
             group: outcome.group,
             previous_node: outcome.previous_node.map(Into::into),
             selected_node: outcome.selected_node.into(),

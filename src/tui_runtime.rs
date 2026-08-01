@@ -20,7 +20,7 @@ use crate::application::{
 use crate::constants::{
     LOG_CAPACITY, MAX_ACTIVE_NODES, RECONNECT_INITIAL_BACKOFF, RECONNECT_MAX_BACKOFF,
 };
-use crate::domain::StatusSnapshot;
+use crate::domain::{ProxyGroupId, StatusSnapshot};
 use crate::ipc::RequestId;
 use crate::tui::{
     AppState, Command, ConnectionStatus, CrosstermControl, EventSource, FairEventInbox,
@@ -483,6 +483,7 @@ fn proxy_group_snapshot(outcome: ProxyListOutcome) -> ProxyGroupSnapshot {
         groups,
         nodes,
     } = outcome;
+    let group_id = group.id.clone();
     let group_name = group.name.clone();
     let current_group = proxy_group_row(group);
     let mut group_rows = groups
@@ -498,6 +499,7 @@ fn proxy_group_snapshot(outcome: ProxyListOutcome) -> ProxyGroupSnapshot {
         .into_iter()
         .take(MAX_ACTIVE_NODES)
         .map(|node| ProxyRow {
+            group_id: group_id.clone(),
             group: group_name.clone(),
             node_id: node.id,
             name: node.name,
@@ -521,6 +523,7 @@ fn proxy_group_snapshot(outcome: ProxyListOutcome) -> ProxyGroupSnapshot {
 
 fn proxy_group_row(group: ProxyGroupSummary) -> ProxyGroupRow {
     ProxyGroupRow {
+        id: group.id,
         name: group.name,
         proxy_type: group.proxy_type,
         selected_node: group.selected_node.map(|node| node.name),
@@ -937,12 +940,12 @@ fn execute_work(
         Command::SelectNode {
             request_id,
             connection_generation,
-            group,
+            group_id,
             node_id,
         } => proxy_selection_result(
             *request_id,
             *connection_generation,
-            group,
+            group_id,
             node_id,
             &work.cancellation,
             snapshots,
@@ -951,10 +954,14 @@ fn execute_work(
         Command::FetchProxyGroup {
             request_id,
             connection_generation,
-            group,
+            group_id,
         } => {
             let result = snapshots
-                .fetch_proxy_group(group, *connection_generation, &work.cancellation)
+                .fetch_proxy_group(
+                    group_id.as_str(),
+                    *connection_generation,
+                    &work.cancellation,
+                )
                 .map_err(|error| short_terminal_text(&error.to_string()));
             DispatchedEvent {
                 source: EventSource::CommandResult,
@@ -1063,7 +1070,7 @@ fn mutation_result(
 fn proxy_selection_result(
     request_id: RequestId,
     connection_generation: u64,
-    group: &str,
+    group_id: &ProxyGroupId,
     node_id: &crate::domain::NodeRecordId,
     cancellation: &CancellationToken,
     snapshots: &Arc<dyn FullSnapshotSource>,
@@ -1072,7 +1079,7 @@ fn proxy_selection_result(
     let result = commands
         .execute(
             ApplicationOperation::ProxySelect {
-                group: group.to_owned(),
+                group: group_id.as_str().to_owned(),
                 node: node_id.as_str().to_owned(),
             },
             cancellation,
@@ -1080,8 +1087,11 @@ fn proxy_selection_result(
         .and_then(|message| {
             let mut snapshot =
                 snapshots.fetch_full_snapshot(connection_generation, cancellation)?;
-            let selected_group =
-                snapshots.fetch_proxy_group(group, connection_generation, cancellation)?;
+            let selected_group = snapshots.fetch_proxy_group(
+                group_id.as_str(),
+                connection_generation,
+                cancellation,
+            )?;
             snapshot.proxy_groups = selected_group.groups;
             snapshot.proxies = selected_group.proxies;
             Ok(MutationSuccess {
