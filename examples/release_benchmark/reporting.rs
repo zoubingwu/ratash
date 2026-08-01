@@ -1,4 +1,4 @@
-//! Captures environment provenance, aggregates samples, and validates reports.
+//! Captures environment provenance and validates benchmark artifacts.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -8,21 +8,19 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use hopash::tui_runtime::ShutdownSignal;
 
-use super::collection::collect_sample;
-use super::metadata::{validate_metadata, validate_metadata_file};
-use super::process_metrics::ProcessChildGuard;
-use super::workload::generate_workload;
+use super::process_support::ProcessChildGuard;
+use super::support::invalid;
 use super::{
     CAPTURE_TOOL_VERSION, COLLECTOR_SOURCE_FILES, CURVE_KEYS, MEASUREMENT_KEYS,
-    ObservationDurations, PROBE_COMPLETION_TIMEOUT, RELEASE_SCALE, SMOKE_OBSERVATIONS, SMOKE_SCALE,
-    WORKLOAD_GENERATOR_VERSION, WORKLOAD_SEED, WorkloadScale,
+    ObservationDurations, PROBE_COMPLETION_TIMEOUT, RELEASE_SCALE, WORKLOAD_GENERATOR_VERSION,
+    WORKLOAD_SEED, WorkloadScale,
 };
 
 pub(super) fn current_rss(resource_probe: &Path) -> Result<f64, Box<dyn Error>> {
@@ -76,190 +74,6 @@ pub(super) fn child_metric(
 
 pub(super) fn insert_measurement(measurements: &mut Map<String, Value>, key: &str, value: f64) {
     measurements.insert(key.to_owned(), Value::from(value));
-}
-
-pub(super) fn elapsed_ms(start: Instant) -> f64 {
-    start.elapsed().as_secs_f64() * 1_000.0
-}
-
-pub(super) fn capture_results(
-    metadata_path: &Path,
-    manifest_path: &Path,
-    samples_directory: &Path,
-    output: &Path,
-) -> Result<(), Box<dyn Error>> {
-    let metadata = read_json(metadata_path)?;
-    let environment = capture_environment(&metadata)?;
-    capture_results_with_environment(
-        metadata_path,
-        manifest_path,
-        samples_directory,
-        output,
-        environment,
-    )
-}
-
-pub(super) fn capture_results_with_environment(
-    metadata_path: &Path,
-    manifest_path: &Path,
-    samples_directory: &Path,
-    output: &Path,
-    environment: Value,
-) -> Result<(), Box<dyn Error>> {
-    let metadata = read_json(metadata_path)?;
-    validate_metadata(&metadata, false)?;
-    if metadata["status"] != "capture_required" {
-        return Err(invalid("capture requires capture_required metadata"));
-    }
-    let manifest = read_json(manifest_path)?;
-    validate_release_manifest(&manifest, &metadata)?;
-    validate_manifest_artifacts(manifest_path, &manifest)?;
-    let workload_manifest_sha256 = sha256_file(manifest_path)?;
-    let expected_samples = metadata["measurement_environment"]["samples"]
-        .as_u64()
-        .ok_or_else(|| invalid("measurement_environment.samples must be an integer"))?;
-    let sample_capacity = usize::try_from(expected_samples)?;
-    let expected_observations = ObservationDurations {
-        background_seconds: metadata["measurement_environment"]["idle_observation_seconds"]
-            .as_u64()
-            .ok_or_else(|| invalid("idle observation must be an integer"))?,
-        telemetry_seconds: metadata["measurement_environment"]["telemetry_observation_seconds"]
-            .as_u64()
-            .ok_or_else(|| invalid("telemetry observation must be an integer"))?,
-        tui_seconds: metadata["measurement_environment"]["tui_observation_seconds"]
-            .as_u64()
-            .ok_or_else(|| invalid("TUI observation must be an integer"))?,
-    };
-    let mut values = MEASUREMENT_KEYS
-        .iter()
-        .map(|key| ((*key).to_owned(), Vec::with_capacity(sample_capacity)))
-        .collect::<BTreeMap<_, _>>();
-    let mut raw_samples = Vec::with_capacity(sample_capacity);
-    let mut report_environment = None;
-    let mut report_inputs = None;
-    for sample in 1..=expected_samples {
-        let path = samples_directory.join(format!("sample-{sample:02}.json"));
-        let sample = read_json(&path)?;
-        require_u64(&sample, "schema_version", 1)?;
-        validate_sample_collector(&sample, false)?;
-        validate_observation_durations(&sample, expected_observations)?;
-        let sample_environment = sample
-            .get("environment")
-            .ok_or_else(|| invalid(format!("{} environment is missing", path.display())))?;
-        validate_sample_environment(sample_environment, &environment)?;
-        if let Some(first) = &report_environment {
-            validate_sample_environment(sample_environment, first)?;
-        } else {
-            report_environment = Some(sample_environment.clone());
-        }
-        let sample_inputs = sample
-            .get("inputs")
-            .ok_or_else(|| invalid(format!("{} inputs are missing", path.display())))?;
-        validate_sample_inputs(sample_inputs)?;
-        if let Some(first) = &report_inputs {
-            if sample_inputs != first {
-                return Err(invalid("release samples use different executable inputs"));
-            }
-        } else {
-            report_inputs = Some(sample_inputs.clone());
-        }
-        if sample["workload_manifest_sha256"] != workload_manifest_sha256 {
-            return Err(invalid(format!(
-                "{} is bound to a different workload manifest",
-                path.display()
-            )));
-        }
-        let measurements = sample["measurements"]
-            .as_object()
-            .ok_or_else(|| invalid(format!("{} measurements must be an object", path.display())))?;
-        exact_numeric_measurements(measurements)?;
-        validate_curves(
-            sample["curves"]
-                .as_object()
-                .ok_or_else(|| invalid(format!("{} curves must be an object", path.display())))?,
-            expected_observations,
-        )?;
-        raw_samples.push(json!({
-            "path": format!("samples/sample-{sample:02}.json"),
-            "sha256": sha256_file(&path)?,
-            "measurements": measurements
-        }));
-        for key in MEASUREMENT_KEYS {
-            values
-                .get_mut(key)
-                .ok_or_else(|| invalid("report measurement key is missing"))?
-                .push(non_negative_number(&measurements[key], key)?);
-        }
-    }
-    let measurements = median_measurements(values)?;
-    let report = json!({
-        "schema_version": 1,
-        "status": "review_required",
-        "capture_tool": {
-            "name": "hopash-release-benchmark",
-            "version": CAPTURE_TOOL_VERSION
-        },
-        "environment": report_environment
-            .ok_or_else(|| invalid("release report has no sample environment"))?,
-        "inputs": report_inputs
-            .ok_or_else(|| invalid("release report has no sample inputs"))?,
-        "workload": {
-            "manifest_sha256": workload_manifest_sha256,
-            "generator": manifest["generator"].clone(),
-            "scale": manifest["scale"].clone()
-        },
-        "samples": expected_samples,
-        "summary_statistic": "median",
-        "measurements": measurements,
-        "raw_samples": raw_samples
-    });
-    write_json_new(output, &report)?;
-    Ok(())
-}
-
-pub(super) fn run_smoke(
-    metadata_path: &Path,
-    release_binary: &Path,
-    fixture_binary: &Path,
-) -> Result<(), Box<dyn Error>> {
-    validate_metadata_file(metadata_path, false)?;
-    let root = TemporaryDirectory::new()?;
-    let manifest = generate_workload(&root.path.join("workload"), SMOKE_SCALE)?;
-    let generated = read_json(&manifest)?;
-    validate_manifest_scale(&generated, SMOKE_SCALE)?;
-    let resource_probe = root.path.join("resource-probe");
-    fs::write(
-        &resource_probe,
-        b"#!/bin/sh\ncase \"$1\" in rss) echo 1048576 ;; cpu) echo 0.5 ;; wakeups) echo 0.25 ;; *) exit 1 ;; esac\n",
-    )?;
-    fs::set_permissions(&resource_probe, fs::Permissions::from_mode(0o700))?;
-    let sample = root.path.join("sample.json");
-    collect_sample(
-        metadata_path,
-        &manifest,
-        release_binary,
-        fixture_binary,
-        &resource_probe,
-        &sample,
-        true,
-    )?;
-    let sample = read_json(&sample)?;
-    if sample["workload_manifest_sha256"] != sha256_file(&manifest)? {
-        return Err(invalid("smoke sample workload binding changed"));
-    }
-    exact_numeric_measurements(
-        sample["measurements"]
-            .as_object()
-            .ok_or_else(|| invalid("smoke sample measurements must be an object"))?,
-    )?;
-    validate_curves(
-        sample["curves"]
-            .as_object()
-            .ok_or_else(|| invalid("smoke sample curves must be an object"))?,
-        SMOKE_OBSERVATIONS,
-    )?;
-    println!("release benchmark smoke passed");
-    Ok(())
 }
 
 pub(super) fn validate_release_manifest(
@@ -841,10 +655,6 @@ pub(super) fn require_bool_object(
 
 fn unix_seconds() -> Result<u64, Box<dyn Error>> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
-}
-
-pub(super) fn invalid(message: impl Into<String>) -> Box<dyn Error> {
-    Box::new(io::Error::new(io::ErrorKind::InvalidData, message.into()))
 }
 
 pub(super) struct TemporaryDirectory {

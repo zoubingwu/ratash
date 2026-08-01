@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::WorkloadScale;
-use super::reporting::invalid;
+use super::support::invalid;
 
 pub(super) struct ProfileServer {
     base_url: String,

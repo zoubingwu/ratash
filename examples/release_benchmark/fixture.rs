@@ -30,7 +30,8 @@ use hopash::service::{
 use hopash::tui_runtime::{ProcessSignalSource, ShutdownSignal};
 
 use super::CORE_FIXTURE_WORKER_COUNT;
-use super::reporting::{invalid, sha256_file};
+use super::reporting::sha256_file;
+use super::support::invalid;
 
 #[derive(Default)]
 struct FixtureOwnerIdentity {

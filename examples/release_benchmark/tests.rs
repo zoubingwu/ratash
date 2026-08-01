@@ -15,14 +15,14 @@ use hopash::domain::{NodeRecordId, ProfileId};
 use hopash::lifecycle::{ProcessIdentity, ProcessInspector, PsProcessInspector};
 use hopash::tui_runtime::ShutdownSignal;
 
+use super::collection::capture_results_with_environment;
 use super::metadata::validate_metadata;
-use super::process_metrics::{ProcessChildGuard, PtyChildGuard};
+use super::process_support::{ProcessChildGuard, PtyChildGuard};
 use super::profile_server::read_ndjson;
 use super::reporting::{
-    TemporaryDirectory, capture_results_with_environment, collector_source_sha256, command_output,
-    exact_numeric_measurements, project_root, read_json, sha256_file, sha256_pretty_json,
-    source_tree_sha256, validate_curves, validate_manifest_scale, validate_sample_collector,
-    write_json_new,
+    TemporaryDirectory, collector_source_sha256, command_output, exact_numeric_measurements,
+    project_root, read_json, sha256_file, sha256_pretty_json, source_tree_sha256, validate_curves,
+    validate_manifest_scale, validate_sample_collector, write_json_new,
 };
 use super::runtime_support::{LifecycleGuard, curve_point, is_retryable_error};
 use super::workload::generate_workload;

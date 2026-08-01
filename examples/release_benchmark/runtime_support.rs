@@ -19,9 +19,9 @@ use hopash::telemetry::LogLevel;
 use hopash::tui::Page;
 use hopash::tui_runtime::ShutdownSignal;
 
-use super::process_metrics::ProcessChildGuard;
+use super::process_support::ProcessChildGuard;
 use super::profile_server::wait_for_socket;
-use super::reporting::{elapsed_ms, invalid};
+use super::support::{elapsed_ms, ensure_collection_running, invalid};
 use super::{CHILD_CLEANUP_TIMEOUT, SERVICE_CLEANUP_TIMEOUT, WorkloadScale};
 
 pub(super) fn curve_point(elapsed_ms: u64, value: f64) -> Value {
@@ -29,14 +29,6 @@ pub(super) fn curve_point(elapsed_ms: u64, value: f64) -> Value {
         "elapsed_ms": elapsed_ms,
         "value": value
     })
-}
-
-pub(super) fn ensure_collection_running(signal: &dyn ShutdownSignal) -> Result<(), Box<dyn Error>> {
-    if signal.shutdown_requested() {
-        Err(invalid("release benchmark collection was interrupted"))
-    } else {
-        Ok(())
-    }
 }
 
 pub(super) fn parse_log_level(value: &str) -> Result<LogLevel, Box<dyn Error>> {

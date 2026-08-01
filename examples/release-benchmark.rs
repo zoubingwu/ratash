@@ -14,22 +14,25 @@ mod fixture;
 mod metadata;
 #[path = "release_benchmark/process_metrics.rs"]
 mod process_metrics;
+#[path = "release_benchmark/process_support.rs"]
+mod process_support;
 #[path = "release_benchmark/profile_server.rs"]
 mod profile_server;
 #[path = "release_benchmark/reporting.rs"]
 mod reporting;
 #[path = "release_benchmark/runtime_support.rs"]
 mod runtime_support;
+#[path = "release_benchmark/support.rs"]
+mod support;
 #[cfg(test)]
 #[path = "release_benchmark/tests.rs"]
 mod tests;
 #[path = "release_benchmark/workload.rs"]
 mod workload;
 
-use collection::collect_sample;
+use collection::{capture_results, collect_sample, run_smoke};
 use fixture::{argument_value, run_fixture_core, run_fixture_core_service};
 use metadata::validate_metadata_file;
-use reporting::{capture_results, run_smoke};
 use workload::generate_workload;
 
 const CAPTURE_TOOL_VERSION: u64 = 1;
@@ -69,15 +72,17 @@ const CURVE_KEYS: [&str; 5] = [
     "telemetry_rss_bytes",
     "tui_rss_bytes",
 ];
-const COLLECTOR_SOURCE_FILES: [&str; 10] = [
+const COLLECTOR_SOURCE_FILES: [&str; 12] = [
     "examples/release-benchmark.rs",
     "examples/release_benchmark/collection.rs",
     "examples/release_benchmark/fixture.rs",
     "examples/release_benchmark/metadata.rs",
     "examples/release_benchmark/process_metrics.rs",
+    "examples/release_benchmark/process_support.rs",
     "examples/release_benchmark/profile_server.rs",
     "examples/release_benchmark/reporting.rs",
     "examples/release_benchmark/runtime_support.rs",
+    "examples/release_benchmark/support.rs",
     "examples/release_benchmark/tests.rs",
     "examples/release_benchmark/workload.rs",
 ];
