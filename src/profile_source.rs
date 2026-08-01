@@ -12,6 +12,8 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::timeout;
 
+const PROFILE_USER_AGENT: &str = concat!("clash-verge/v", env!("CARGO_PKG_VERSION"));
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProfileSourcePolicy {
     pub connect_timeout: Duration,
@@ -228,6 +230,7 @@ impl ReqwestProfileSource {
         let client = reqwest::Client::builder()
             .connect_timeout(policy.connect_timeout)
             .redirect(redirect_policy)
+            .user_agent(PROFILE_USER_AGENT)
             .no_proxy()
             .build()
             .map_err(|_| ProfileSourceError::new(DownloadErrorKind::ClientInitialization))?;

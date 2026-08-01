@@ -1,5 +1,5 @@
 use hopash::domain::SubscriptionUrl;
-use hopash::profile::RefreshStage;
+use hopash::profile::{ProfileSnapshot, RefreshStage, SnapshotLimits};
 use hopash::profile_source::{
     DownloadErrorKind, ProfileSource, ProfileSourcePolicy, ReqwestProfileSource,
 };
@@ -34,7 +34,7 @@ impl TestServer {
                     .accept()
                     .await
                     .expect("the fixture should accept a request");
-                read_request_headers(&mut socket).await;
+                let _ = read_request_headers(&mut socket).await;
                 for step in response {
                     match step {
                         ServerStep::Write(bytes) => {
@@ -74,7 +74,7 @@ impl Drop for TestServer {
     }
 }
 
-async fn read_request_headers(socket: &mut tokio::net::TcpStream) {
+async fn read_request_headers(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
     let mut request = Vec::new();
     let mut buffer = [0_u8; 1_024];
     while !request.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -91,6 +91,7 @@ async fn read_request_headers(socket: &mut tokio::net::TcpStream) {
             "fixture request headers grew too large"
         );
     }
+    request
 }
 
 fn write(bytes: impl Into<Vec<u8>>) -> ServerStep {
@@ -188,6 +189,58 @@ async fn downloads_profile_with_bounded_metadata_and_a_sanitized_final_url() {
     for secret in ["alice", "password", "private-value", "query-secret"] {
         assert!(!debug.contains(secret), "{secret} leaked in {debug}");
     }
+}
+
+#[tokio::test]
+async fn downloads_yaml_from_a_user_agent_negotiated_subscription() {
+    const YAML_PROFILE: &[u8] = b"proxies: []\nrules: []\n";
+    const GENERIC_SUBSCRIPTION: &[u8] = b"c3M6Ly9maXh0dXJlCg==";
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("the content negotiation fixture should bind");
+    let address = listener
+        .local_addr()
+        .expect("the content negotiation fixture should have an address");
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener
+            .accept()
+            .await
+            .expect("the fixture should accept a request");
+        let request = read_request_headers(&mut socket).await;
+        let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+        let expected_user_agent = format!(
+            "\r\nuser-agent: clash-verge/v{}\r\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        let body = if request.contains(&expected_user_agent) {
+            YAML_PROFILE
+        } else {
+            GENERIC_SUBSCRIPTION
+        };
+        let response = fixed_response("200 OK", "", body);
+        for step in response {
+            if let ServerStep::Write(bytes) = step {
+                socket
+                    .write_all(&bytes)
+                    .await
+                    .expect("the fixture response should write");
+            }
+        }
+    });
+    let source = ReqwestProfileSource::new(policy(1_024)).expect("the source should initialize");
+    let url = SubscriptionUrl::parse(&format!("http://{address}/subscription"))
+        .expect("the loopback subscription URL should be valid");
+
+    let download = source
+        .download(&url)
+        .await
+        .expect("the negotiated Profile should download");
+    let snapshot = ProfileSnapshot::parse(download.body(), SnapshotLimits::new(1_024, 16))
+        .expect("the negotiated response should be a YAML Profile");
+
+    assert_eq!(snapshot.raw(), YAML_PROFILE);
+    server.await.expect("the fixture should stop cleanly");
 }
 
 #[tokio::test]

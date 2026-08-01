@@ -15,9 +15,9 @@
   },
   "intervals_ms": {
     "profile_refresh": 21600000,
-    "profile_connect_timeout": 5000,
-    "profile_request_timeout": 10000,
-    "profile_total_timeout": 30000,
+    "profile_connect_timeout": 15000,
+    "profile_request_timeout": 30000,
+    "profile_total_timeout": 120000,
     "core_readiness_timeout": 10000,
     "core_health_timeout": 5000,
     "core_process_stop_timeout": 5000,
@@ -37,7 +37,7 @@
     "ipc_deadline_layer_margin": 5000,
     "ipc_request_timeout": 15000,
     "ipc_runtime_mutation_timeout": 55000,
-    "ipc_profile_add_timeout": 95000,
+    "ipc_profile_add_timeout": 180000,
     "daemon_startup_timeout": 90000,
     "daemon_shutdown_timeout": 10000,
     "daemon_poll_interval": 25

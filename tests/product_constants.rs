@@ -7,9 +7,9 @@ use std::path::PathBuf;
 fn observable_product_limits_are_frozen_for_the_release_contract() {
     assert_eq!(PROFILE_REFRESH_INTERVAL.as_secs(), 21_600);
     assert_eq!(PROFILE_REFRESH_CONCURRENCY, 2);
-    assert_eq!(PROFILE_CONNECT_TIMEOUT.as_secs(), 5);
-    assert_eq!(PROFILE_REQUEST_TIMEOUT.as_secs(), 10);
-    assert_eq!(PROFILE_TOTAL_TIMEOUT.as_secs(), 30);
+    assert_eq!(PROFILE_CONNECT_TIMEOUT.as_secs(), 15);
+    assert_eq!(PROFILE_REQUEST_TIMEOUT.as_secs(), 30);
+    assert_eq!(PROFILE_TOTAL_TIMEOUT.as_secs(), 120);
     assert_eq!(PROFILE_REDIRECT_LIMIT, 5);
     assert_eq!(PROFILE_METADATA_NAME_MAX_BYTES, 80);
     assert_eq!(PROFILE_COUNT_MAX, 1_000);
@@ -49,7 +49,7 @@ fn observable_product_limits_are_frozen_for_the_release_contract() {
     assert_eq!(CORE_SERVICE_MUTATION_TIMEOUT.as_secs(), 40);
     assert_eq!(IPC_REQUEST_TIMEOUT.as_secs(), 15);
     assert_eq!(IPC_RUNTIME_MUTATION_TIMEOUT.as_secs(), 55);
-    assert_eq!(IPC_PROFILE_ADD_TIMEOUT.as_secs(), 95);
+    assert_eq!(IPC_PROFILE_ADD_TIMEOUT.as_secs(), 180);
     assert_eq!(DAEMON_STARTUP_TIMEOUT.as_secs(), 90);
     assert_eq!(DAEMON_SHUTDOWN_TIMEOUT.as_secs(), 10);
 }
