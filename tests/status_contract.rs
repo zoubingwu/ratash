@@ -1,5 +1,6 @@
 use hopash::application::{ApplicationService, Clock};
 use hopash::contract::{JsonEnvelope, StatusViewV1};
+use hopash::domain::{CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,7 +48,11 @@ fn zero_profile_status_serializes_the_complete_v1_contract() {
                     "uptime_seconds": 42
                 },
                 "core": {
-                    "lifecycle": "unconfigured"
+                    "lifecycle": "unconfigured",
+                    "restart": {
+                        "pending": false,
+                        "attempts": 0
+                    }
                 },
                 "tun": {
                     "requested": true,
@@ -76,6 +81,34 @@ fn zero_profile_status_serializes_the_complete_v1_contract() {
                     "connections": "disconnected",
                     "logs": "disconnected"
                 }
+            }
+        })
+    );
+}
+
+#[test]
+fn core_restart_status_serializes_stable_public_diagnostics() {
+    let mut status = ApplicationService::new().status();
+    status.core.lifecycle = CoreLifecycle::Starting;
+    status.core.restart = CoreRestartStatus {
+        pending: true,
+        attempts: 2,
+        backoff_ms: Some(4_000),
+        diagnostic: Some(CoreDiagnosticCategory::RestartLimitReached),
+    };
+
+    let value = serde_json::to_value(StatusViewV1::from(status))
+        .expect("status should serialize through the public contract");
+
+    assert_eq!(
+        value["core"],
+        json!({
+            "lifecycle": "starting",
+            "restart": {
+                "pending": true,
+                "attempts": 2,
+                "backoff_ms": 4000,
+                "diagnostic": "core_restart_limit_reached"
             }
         })
     );

@@ -77,6 +77,7 @@ impl ApplicationService {
                 lifecycle: CoreLifecycle::Unconfigured,
                 pid: None,
                 instance_generation: None,
+                restart: crate::domain::CoreRestartStatus::default(),
             },
             tun: TunStatus {
                 requested: true,

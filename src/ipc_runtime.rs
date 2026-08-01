@@ -36,11 +36,11 @@ use crate::constants::{
     STATUS_SUBSCRIBER_CAPACITY,
 };
 use crate::domain::{
-    ActiveProfileSummary, ApplyState, CoreInstanceGeneration, CoreLifecycle, CoreStatus,
-    LatencySample, LocalRuleSetRevision, NodeRecordId, ProbeGeneration, ProbeQueueStatus,
-    ProfileId, ProxyGroupId, RuntimeGeneration, SampleState, SelectedNodeSummary, StatusSnapshot,
-    StreamHealthSet, StreamState, SubscriptionUrl, SupervisorLifecycle, SupervisorStatus,
-    TrafficSample, TunReason, TunStatus,
+    ActiveProfileSummary, ApplyState, CoreDiagnosticCategory, CoreInstanceGeneration,
+    CoreLifecycle, CoreRestartStatus, CoreStatus, LatencySample, LocalRuleSetRevision,
+    NodeRecordId, ProbeGeneration, ProbeQueueStatus, ProfileId, ProxyGroupId, RuntimeGeneration,
+    SampleState, SelectedNodeSummary, StatusSnapshot, StreamHealthSet, StreamState,
+    SubscriptionUrl, SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason, TunStatus,
 };
 use crate::error::ErrorCode;
 use crate::ipc::{
@@ -3197,6 +3197,8 @@ struct WireCoreStatus {
     lifecycle: WireCoreLifecycle,
     pid: Option<u32>,
     instance_generation: Option<u64>,
+    #[serde(default)]
+    restart: WireCoreRestartStatus,
 }
 
 impl From<CoreStatus> for WireCoreStatus {
@@ -3205,6 +3207,7 @@ impl From<CoreStatus> for WireCoreStatus {
             lifecycle: status.lifecycle.into(),
             pid: status.pid,
             instance_generation: status.instance_generation.map(|generation| generation.0),
+            restart: status.restart.into(),
         }
     }
 }
@@ -3215,6 +3218,59 @@ impl From<WireCoreStatus> for CoreStatus {
             lifecycle: status.lifecycle.into(),
             pid: status.pid,
             instance_generation: status.instance_generation.map(CoreInstanceGeneration),
+            restart: status.restart.into(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct WireCoreRestartStatus {
+    pending: bool,
+    attempts: u64,
+    backoff_ms: Option<u64>,
+    diagnostic: Option<WireCoreDiagnosticCategory>,
+}
+
+impl From<CoreRestartStatus> for WireCoreRestartStatus {
+    fn from(status: CoreRestartStatus) -> Self {
+        Self {
+            pending: status.pending,
+            attempts: status.attempts,
+            backoff_ms: status.backoff_ms,
+            diagnostic: status.diagnostic.map(Into::into),
+        }
+    }
+}
+
+impl From<WireCoreRestartStatus> for CoreRestartStatus {
+    fn from(status: WireCoreRestartStatus) -> Self {
+        Self {
+            pending: status.pending,
+            attempts: status.attempts,
+            backoff_ms: status.backoff_ms,
+            diagnostic: status.diagnostic.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireCoreDiagnosticCategory {
+    RestartLimitReached,
+}
+
+impl From<CoreDiagnosticCategory> for WireCoreDiagnosticCategory {
+    fn from(category: CoreDiagnosticCategory) -> Self {
+        match category {
+            CoreDiagnosticCategory::RestartLimitReached => Self::RestartLimitReached,
+        }
+    }
+}
+
+impl From<WireCoreDiagnosticCategory> for CoreDiagnosticCategory {
+    fn from(category: WireCoreDiagnosticCategory) -> Self {
+        match category {
+            WireCoreDiagnosticCategory::RestartLimitReached => Self::RestartLimitReached,
         }
     }
 }

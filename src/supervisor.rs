@@ -27,16 +27,18 @@ use crate::constants::{
     TRAFFIC_SERIES_CAPACITY, YAML_MAX_DEPTH,
 };
 use crate::core::{
-    Availability, CoreRuntime, CoreRuntimeStatus, DelayProbeRequest, DelayTarget,
+    Availability, CoreRuntime, CoreRuntimeDiagnosticCategory as RuntimeDiagnosticCategory,
+    CoreRuntimeLifecycle, CoreRuntimeStatus, CoreRuntimeTunReason, DelayProbeRequest, DelayTarget,
     ManagedCoreHandle, MihomoAdapter, MihomoError, MihomoErrorKind, NodeRowMemberV1, NodeSelection,
     NodeSource, ProbeObservation, ProbeStatus as CoreProbeStatus, ProxyView, RuntimeBundle,
     SelectionError,
 };
 use crate::domain::{
-    ActiveProfileSummary, ApplyState, CoreInstanceGeneration, CoreLifecycle, CoreStatus,
-    NodeRecordId, ProbeGeneration, ProbeQueueStatus, ProfileId, ProxyGroupId, RuntimeGeneration,
-    SampleState, SelectedNodeSummary, StatusSnapshot, StreamHealthSet, StreamState,
-    SubscriptionUrl, SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason, TunStatus,
+    ActiveProfileSummary, ApplyState, CoreDiagnosticCategory, CoreInstanceGeneration,
+    CoreLifecycle, CoreRestartStatus, CoreStatus, NodeRecordId, ProbeGeneration, ProbeQueueStatus,
+    ProfileId, ProxyGroupId, RuntimeGeneration, SampleState, SelectedNodeSummary, StatusSnapshot,
+    StreamHealthSet, StreamState, SubscriptionUrl, SupervisorLifecycle, SupervisorStatus,
+    TrafficSample, TunReason, TunStatus,
 };
 use crate::error::ErrorCode;
 use crate::profile::{
@@ -1091,14 +1093,16 @@ impl Supervisor {
             }
             Err(TryLockError::Poisoned(_)) => return Err(internal_error()),
         };
-        let managed_core = if state.profiles.active_profile_id().is_none() {
-            None
+        let active_profile_id = state.profiles.active_profile_id();
+        let core_health = if active_profile_id.is_none() {
+            CoreHealthProjection::unconfigured()
         } else {
-            self.core
-                .runtime_status()
-                .ok()
-                .and_then(|status| status.managed_core)
+            match self.core.runtime_status() {
+                Ok(status) => CoreHealthProjection::from_runtime(status),
+                Err(_) => CoreHealthProjection::unavailable(),
+            }
         };
+        let managed_core = core_health.managed_core.clone();
         if let Some(core) = &managed_core {
             ensure_telemetry(&mut state, core.instance_generation)?;
         }
@@ -1107,7 +1111,6 @@ impl Supervisor {
             .now_unix_ms()
             .saturating_sub(self.started_at_unix_ms)
             / 1_000;
-        let active_profile_id = state.profiles.active_profile_id();
         if let Some(core) = &managed_core {
             let order = effective_group_order(&state.profiles)?;
             if let Ok(view) = self.core.proxy_view(core, &order) {
@@ -1135,11 +1138,9 @@ impl Supervisor {
             .and_then(TelemetryStore::connection_count)
             .unwrap_or_default();
         let probe_queue = probe_queue_status(state.probes.metrics(self.clock.now_unix_ms()));
-        let zero_profile = active_profile_id.is_none();
-        let core_ready = managed_core.is_some();
         let status = StatusSnapshot {
             supervisor: SupervisorStatus {
-                lifecycle: if state.degraded {
+                lifecycle: if state.degraded || core_health.degraded {
                     SupervisorLifecycle::Degraded
                 } else {
                     SupervisorLifecycle::Ready
@@ -1147,31 +1148,8 @@ impl Supervisor {
                 started_at_unix_ms: self.started_at_unix_ms,
                 uptime_seconds,
             },
-            core: CoreStatus {
-                lifecycle: if zero_profile {
-                    CoreLifecycle::Unconfigured
-                } else if state.degraded {
-                    CoreLifecycle::Degraded
-                } else if core_ready {
-                    CoreLifecycle::Ready
-                } else {
-                    CoreLifecycle::Stopped
-                },
-                pid: managed_core.as_ref().map(|core| core.pid),
-                instance_generation: managed_core.as_ref().map(|core| core.instance_generation),
-            },
-            tun: TunStatus {
-                requested: true,
-                capable: core_ready,
-                effective: core_ready,
-                reason: if zero_profile {
-                    Some(TunReason::NoActiveProfile)
-                } else if core_ready {
-                    None
-                } else {
-                    Some(TunReason::CoreUnavailable)
-                },
-            },
+            core: core_health.core,
+            tun: core_health.tun,
             active_profile,
             primary_proxy_group,
             selected_node,
@@ -2358,6 +2336,107 @@ fn resolve_latency_node<'a>(
     }
 }
 
+struct CoreHealthProjection {
+    managed_core: Option<ManagedCoreHandle>,
+    core: CoreStatus,
+    tun: TunStatus,
+    degraded: bool,
+}
+
+impl CoreHealthProjection {
+    fn unconfigured() -> Self {
+        Self {
+            managed_core: None,
+            core: CoreStatus {
+                lifecycle: CoreLifecycle::Unconfigured,
+                pid: None,
+                instance_generation: None,
+                restart: CoreRestartStatus::default(),
+            },
+            tun: TunStatus {
+                requested: true,
+                capable: false,
+                effective: false,
+                reason: Some(TunReason::NoActiveProfile),
+            },
+            degraded: false,
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            managed_core: None,
+            core: CoreStatus {
+                lifecycle: CoreLifecycle::Degraded,
+                pid: None,
+                instance_generation: None,
+                restart: CoreRestartStatus::default(),
+            },
+            tun: TunStatus {
+                requested: true,
+                capable: false,
+                effective: false,
+                reason: Some(TunReason::CoreUnavailable),
+            },
+            degraded: true,
+        }
+    }
+
+    fn from_runtime(status: CoreRuntimeStatus) -> Self {
+        let (lifecycle, managed_core, degraded) = match (status.lifecycle, status.managed_core) {
+            (CoreRuntimeLifecycle::Owned, None) => (CoreLifecycle::Stopped, None, false),
+            (CoreRuntimeLifecycle::Running, Some(core)) => {
+                (CoreLifecycle::Ready, Some(core), false)
+            }
+            (CoreRuntimeLifecycle::RestartPending, _) => (CoreLifecycle::Starting, None, false),
+            (CoreRuntimeLifecycle::Degraded, _) => (CoreLifecycle::Degraded, None, true),
+            (CoreRuntimeLifecycle::Owned | CoreRuntimeLifecycle::Running, _) => {
+                (CoreLifecycle::Degraded, None, true)
+            }
+        };
+        let capable = status.tun.capable;
+        let effective = lifecycle == CoreLifecycle::Ready && capable;
+        let runtime_tun_reason = status.tun.reason.map(|reason| match reason {
+            CoreRuntimeTunReason::PermissionDenied => TunReason::PermissionDenied,
+            CoreRuntimeTunReason::Unsupported => TunReason::Unsupported,
+        });
+        let reason = if effective {
+            None
+        } else {
+            runtime_tun_reason.or(Some(TunReason::CoreUnavailable))
+        };
+        let restart = CoreRestartStatus {
+            pending: status.restart.pending,
+            attempts: u64::try_from(status.restart.attempts).unwrap_or(u64::MAX),
+            backoff_ms: status
+                .restart
+                .backoff
+                .map(|backoff| u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX)),
+            diagnostic: status.restart.diagnostic.map(|category| match category {
+                RuntimeDiagnosticCategory::CoreRestartLimitReached => {
+                    CoreDiagnosticCategory::RestartLimitReached
+                }
+            }),
+        };
+        Self {
+            core: CoreStatus {
+                lifecycle,
+                pid: managed_core.as_ref().map(|core| core.pid),
+                instance_generation: managed_core.as_ref().map(|core| core.instance_generation),
+                restart,
+            },
+            managed_core,
+            tun: TunStatus {
+                requested: true,
+                capable,
+                effective,
+                reason,
+            },
+            degraded,
+        }
+    }
+}
+
 fn status_proxy_fields(
     state: &SupervisorState,
     now_unix_ms: u64,
@@ -2778,6 +2857,7 @@ fn initial_status_snapshot(
             },
             pid: None,
             instance_generation: None,
+            restart: CoreRestartStatus::default(),
         },
         tun: TunStatus {
             requested: true,

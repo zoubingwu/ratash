@@ -343,6 +343,7 @@ fn stopped_status(
                 lifecycle: CoreLifecycle::Stopped,
                 pid: None,
                 instance_generation: None,
+                restart: crate::domain::CoreRestartStatus::default(),
             },
             tun: crate::domain::TunStatus {
                 requested: true,

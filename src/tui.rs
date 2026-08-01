@@ -25,7 +25,10 @@ use crate::constants::{
     LOG_CAPACITY, MAX_ACTIVE_NODES, MINIMUM_TERMINAL_HEIGHT, MINIMUM_TERMINAL_WIDTH,
     TRAFFIC_SERIES_CAPACITY,
 };
-use crate::domain::{NodeRecordId, ProfileId, ProxyGroupId, SampleState, StatusSnapshot};
+use crate::domain::{
+    CoreDiagnosticCategory, NodeRecordId, ProfileId, ProxyGroupId, SampleState, StatusSnapshot,
+    TunReason,
+};
 use crate::ipc::RequestId;
 use crate::telemetry::{CoreLogRecord, LogLevel, LogSource};
 
@@ -2016,15 +2019,37 @@ fn render_overview(state: &AppState, area: Rect, buffer: &mut Buffer) {
         } else {
             "settled"
         };
+        let restart_backoff = status
+            .core
+            .restart
+            .backoff_ms
+            .map_or_else(|| "-".to_owned(), |backoff| format!("{backoff} ms"));
+        let restart_diagnostic =
+            status
+                .core
+                .restart
+                .diagnostic
+                .map_or("-", |diagnostic| match diagnostic {
+                    CoreDiagnosticCategory::RestartLimitReached => "core_restart_limit_reached",
+                });
+        let restart_pending = if status.core.restart.pending {
+            "on"
+        } else {
+            "off"
+        };
+        let tun_reason = status.tun.reason.map_or("-", |reason| match reason {
+            TunReason::NoActiveProfile => "no_active_profile",
+            TunReason::PermissionDenied => "permission_denied",
+            TunReason::Unsupported => "unsupported",
+            TunReason::CoreUnavailable => "core_unavailable",
+        });
+        let tun_effective = if status.tun.effective { "on" } else { "off" };
+        let tun_capable = if status.tun.capable { "yes" } else { "no" };
         format!(
-            "Connection: {connection}\nSupervisor: {:?}\nCore: {:?}\nTUN: {}\nActive Profile: {}\nPrimary Group: {}\nCurrent Node: {}\nSelection Restore: {selection_restore}\nLatency: {delay}\nSampled At: {sampled_at}\nFreshness: {freshness}\nProbe: {probe_status} (generation {probe_generation})\nProbe Queue: {probe_queue_state}, queued {}, in-flight {}, stale {:.1}%\nProbe Window: oldest {oldest_due}, full pass {} ms\nConnections: {}\nUptime: {}s",
+            "Connection: {connection}\nSupervisor: {:?}\nCore: {:?}\nRestart: {restart_pending}, tries={}, wait={restart_backoff}\nDiagnostic: {restart_diagnostic}\nTUN: {tun_effective}, cap={tun_capable}, {tun_reason}\nActive Profile: {}\nPrimary Group: {}\nCurrent Node: {}\nSelection Restore: {selection_restore}\nLatency: {delay}\nSampled At: {sampled_at}\nFreshness: {freshness}\nProbe: {probe_status} (generation {probe_generation})\nProbe Queue: {probe_queue_state}, queued {}, in-flight {}, stale {:.1}%\nProbe Window: oldest {oldest_due}, full pass {} ms\nConnections: {} | Uptime: {}s",
             status.supervisor.lifecycle,
             status.core.lifecycle,
-            if status.tun.effective {
-                "effective"
-            } else {
-                "inactive"
-            },
+            status.core.restart.attempts,
             active_profile,
             primary_group,
             current_node,

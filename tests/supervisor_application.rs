@@ -4,9 +4,10 @@ use hopash::config::{
 };
 use hopash::constants::LATENCY_FRESHNESS;
 use hopash::core::{
-    Availability, CoreControlEndpoint, CoreRuntimeStatus, ManagedCoreHandle, MihomoError,
-    NodeSelection, NodeSource, ProviderState, ProxyGroup, ProxyMember, ProxyNode, ProxyView,
-    ProxyViewOrderSource,
+    Availability, CoreControlEndpoint, CoreRuntimeDiagnosticCategory, CoreRuntimeLifecycle,
+    CoreRuntimeRestartStatus, CoreRuntimeStatus, CoreRuntimeTunReason, CoreRuntimeTunStatus,
+    ManagedCoreHandle, MihomoError, NodeSelection, NodeSource, ProviderState, ProxyGroup,
+    ProxyMember, ProxyNode, ProxyView, ProxyViewOrderSource,
 };
 use hopash::domain::{
     CoreInstanceGeneration, NodeRecordId, ProxyGroupId, RuntimeGeneration, StreamState,
@@ -262,6 +263,8 @@ impl SupervisorCorePort for UnusedCore {
 
 struct FakeCoreState {
     managed_core: Option<ManagedCoreHandle>,
+    status_override: Option<CoreRuntimeStatus>,
+    fail_status: bool,
     view: ProxyView,
     selections: Vec<NodeSelection>,
     fail_next_selection: bool,
@@ -290,17 +293,38 @@ impl FakeCore {
             runtime_generation: generation,
         });
     }
+
+    fn set_runtime_status(&self, status: CoreRuntimeStatus) {
+        self.state
+            .lock()
+            .expect("the Core lock should be available")
+            .status_override = Some(status);
+    }
+
+    fn fail_runtime_status(&self) {
+        self.state
+            .lock()
+            .expect("the Core lock should be available")
+            .fail_status = true;
+    }
 }
 
 impl SupervisorCorePort for FakeCore {
     fn runtime_status(&self) -> Result<CoreRuntimeStatus, MihomoError> {
-        Ok(CoreRuntimeStatus::from_managed_core(
-            self.state
-                .lock()
-                .expect("the Core lock should be available")
-                .managed_core
-                .clone(),
-        ))
+        let state = self
+            .state
+            .lock()
+            .expect("the Core lock should be available");
+        if state.fail_status {
+            return Err(MihomoError::new(
+                hopash::core::MihomoErrorKind::Unavailable,
+                "injected runtime status failure",
+            ));
+        }
+        Ok(state
+            .status_override
+            .clone()
+            .unwrap_or_else(|| CoreRuntimeStatus::from_managed_core(state.managed_core.clone())))
     }
 
     fn proxy_view(
@@ -519,6 +543,8 @@ impl Harness {
         let core = Arc::new(FakeCore {
             state: Mutex::new(FakeCoreState {
                 managed_core: None,
+                status_override: None,
+                fail_status: false,
                 view: fixture_proxy_view(),
                 selections: Vec::new(),
                 fail_next_selection: false,
@@ -870,6 +896,139 @@ fn zero_profile_supervisor_is_ready_without_contacting_the_core() {
     );
     assert!(status.active_profile.is_none());
     assert!(status.runtime_generation.is_none());
+}
+
+#[test]
+fn status_projects_core_restart_degradation_and_tun_capability() {
+    let harness = Harness::new("core-health-status");
+    harness.queue_profile("Primary", "node-a");
+    let supervisor = harness.open();
+    add_profile(&supervisor, "https://example.test/primary.yaml");
+
+    harness.core.set_runtime_status(CoreRuntimeStatus {
+        managed_core: None,
+        lifecycle: CoreRuntimeLifecycle::RestartPending,
+        restart: CoreRuntimeRestartStatus {
+            pending: true,
+            attempts: 1,
+            backoff: Some(Duration::from_secs(2)),
+            diagnostic: None,
+        },
+        tun: CoreRuntimeTunStatus::available(),
+    });
+    let pending = get_status(&supervisor);
+    assert_eq!(
+        pending.supervisor.lifecycle,
+        hopash::domain::SupervisorLifecycle::Ready
+    );
+    assert_eq!(
+        pending.core.lifecycle,
+        hopash::domain::CoreLifecycle::Starting
+    );
+    assert_eq!(
+        pending.core.restart,
+        hopash::domain::CoreRestartStatus {
+            pending: true,
+            attempts: 1,
+            backoff_ms: Some(2_000),
+            diagnostic: None,
+        }
+    );
+    assert!(pending.tun.capable);
+    assert!(!pending.tun.effective);
+    assert_eq!(
+        pending.tun.reason,
+        Some(hopash::domain::TunReason::CoreUnavailable)
+    );
+
+    harness.core.set_runtime_status(CoreRuntimeStatus {
+        managed_core: None,
+        lifecycle: CoreRuntimeLifecycle::Degraded,
+        restart: CoreRuntimeRestartStatus {
+            pending: false,
+            attempts: 3,
+            backoff: None,
+            diagnostic: Some(CoreRuntimeDiagnosticCategory::CoreRestartLimitReached),
+        },
+        tun: CoreRuntimeTunStatus::available(),
+    });
+    let degraded = get_status(&supervisor);
+    assert_eq!(
+        degraded.supervisor.lifecycle,
+        hopash::domain::SupervisorLifecycle::Degraded
+    );
+    assert_eq!(
+        degraded.core.lifecycle,
+        hopash::domain::CoreLifecycle::Degraded
+    );
+    assert_eq!(
+        degraded.core.restart.diagnostic,
+        Some(hopash::domain::CoreDiagnosticCategory::RestartLimitReached)
+    );
+
+    let managed_core = harness
+        .core
+        .state
+        .lock()
+        .expect("the Core lock should be available")
+        .managed_core
+        .clone()
+        .expect("the applied Core should be available");
+    for (reason, expected) in [
+        (
+            CoreRuntimeTunReason::PermissionDenied,
+            hopash::domain::TunReason::PermissionDenied,
+        ),
+        (
+            CoreRuntimeTunReason::Unsupported,
+            hopash::domain::TunReason::Unsupported,
+        ),
+    ] {
+        harness.core.set_runtime_status(CoreRuntimeStatus {
+            managed_core: Some(managed_core.clone()),
+            lifecycle: CoreRuntimeLifecycle::Running,
+            restart: CoreRuntimeRestartStatus::inactive(),
+            tun: CoreRuntimeTunStatus {
+                capable: false,
+                reason: Some(reason),
+            },
+        });
+        let status = get_status(&supervisor);
+        assert_eq!(status.core.lifecycle, hopash::domain::CoreLifecycle::Ready);
+        assert!(!status.tun.capable);
+        assert!(!status.tun.effective);
+        assert_eq!(status.tun.reason, Some(expected));
+    }
+}
+
+#[test]
+fn runtime_status_failure_is_publicly_degraded() {
+    let harness = Harness::new("core-status-failure");
+    harness.queue_profile("Primary", "node-a");
+    let supervisor = harness.open();
+    add_profile(&supervisor, "https://example.test/primary.yaml");
+    harness.core.fail_runtime_status();
+
+    let status = get_status(&supervisor);
+
+    assert_eq!(
+        status.supervisor.lifecycle,
+        hopash::domain::SupervisorLifecycle::Degraded
+    );
+    assert_eq!(
+        status.core.lifecycle,
+        hopash::domain::CoreLifecycle::Degraded
+    );
+    assert_eq!(
+        status.core.restart,
+        hopash::domain::CoreRestartStatus::default()
+    );
+    assert!(!status.tun.capable);
+    assert!(!status.tun.effective);
+    assert_eq!(
+        status.tun.reason,
+        Some(hopash::domain::TunReason::CoreUnavailable)
+    );
 }
 
 #[test]
@@ -1234,10 +1393,8 @@ fn failed_runtime_recovery_marks_the_supervisor_degraded_and_retains_rules() {
         status.supervisor.lifecycle,
         hopash::domain::SupervisorLifecycle::Degraded
     );
-    assert_eq!(
-        status.core.lifecycle,
-        hopash::domain::CoreLifecycle::Degraded
-    );
+    assert_eq!(status.core.lifecycle, hopash::domain::CoreLifecycle::Ready);
+    assert!(status.tun.effective);
     assert_eq!(status.runtime_generation, Some(RuntimeGeneration(1)));
 }
 
@@ -2417,6 +2574,16 @@ fn rule_strings_from_application(supervisor: &Supervisor) -> Vec<String> {
         .into_iter()
         .map(|rule| rule.rule_string)
         .collect()
+}
+
+fn get_status(supervisor: &Supervisor) -> hopash::domain::StatusSnapshot {
+    let ApplicationOutput::Status(status) = supervisor
+        .execute(ApplicationOperation::GetStatus)
+        .expect("status should succeed")
+    else {
+        panic!("status should return Status")
+    };
+    status
 }
 
 fn add_profile(supervisor: &Supervisor, url: &str) -> hopash::application::ProfileSummary {

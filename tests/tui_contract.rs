@@ -16,9 +16,10 @@ use hopash::constants::{
     TRAFFIC_SERIES_CAPACITY,
 };
 use hopash::domain::{
-    ActiveProfileSummary, ApplyState, CoreLifecycle, CoreStatus, NodeRecordId, ProbeQueueStatus,
-    ProfileId, ProxyGroupId, RuntimeGeneration, SampleState, SelectedNodeSummary, StatusSnapshot,
-    StreamHealthSet, StreamState, SupervisorLifecycle, SupervisorStatus, TrafficSample, TunStatus,
+    ActiveProfileSummary, ApplyState, CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus,
+    CoreStatus, NodeRecordId, ProbeQueueStatus, ProfileId, ProxyGroupId, RuntimeGeneration,
+    SampleState, SelectedNodeSummary, StatusSnapshot, StreamHealthSet, StreamState,
+    SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason, TunStatus,
 };
 use hopash::ipc::RequestId;
 use hopash::telemetry::{LogLevel, LogSource};
@@ -72,6 +73,32 @@ fn overview_renders_probe_queue_overload_metrics() {
     assert!(text.contains("Selection Restore: pending"));
     assert!(text.contains("queued 7, in-flight 2, stale 40.0%"));
     assert!(text.contains("oldest 12345 ms, full pass 30000 ms"));
+}
+
+#[test]
+fn overview_renders_core_restart_and_tun_diagnostics() {
+    let mut state = connected_state();
+    let status = state
+        .status
+        .as_mut()
+        .expect("the connected fixture should have status");
+    status.core.lifecycle = CoreLifecycle::Starting;
+    status.core.restart = CoreRestartStatus {
+        pending: true,
+        attempts: 2,
+        backoff_ms: Some(4_000),
+        diagnostic: Some(CoreDiagnosticCategory::RestartLimitReached),
+    };
+    status.tun.capable = false;
+    status.tun.effective = false;
+    status.tun.reason = Some(TunReason::PermissionDenied);
+
+    let (text, _) = render_with_backend(&state, 80, 24);
+
+    assert!(text.contains("Restart: on, tries=2, wait=4000 ms"));
+    assert!(text.contains("Diagnostic: core_restart_limit_reached"));
+    assert!(text.contains("TUN: off, cap=no, permission_denied"));
+    assert!(text.contains("Connections: 3 | Uptime: 60s"));
 }
 
 #[test]
@@ -1229,6 +1256,7 @@ fn status_snapshot() -> StatusSnapshot {
             lifecycle: CoreLifecycle::Ready,
             pid: Some(42),
             instance_generation: Some(hopash::domain::CoreInstanceGeneration(1)),
+            restart: hopash::domain::CoreRestartStatus::default(),
         },
         tun: TunStatus {
             requested: true,

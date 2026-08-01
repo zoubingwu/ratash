@@ -45,7 +45,7 @@
 
 - `src/application.rs` defines transport-independent operations, outputs, errors, and the application service seam.
 - `src/background.rs` owns bounded Profile refresh, delay-probe, and generation-scoped Mihomo telemetry workers with wakeable shutdown and reconnect backoff.
-- `src/supervisor.rs` coordinates copy-on-write Profile, proxy, latency, rule, refresh, probe, and telemetry use cases through injected persistence, Runtime Apply, Profile source, and Core ports.
+- `src/supervisor.rs` coordinates copy-on-write Profile, proxy, latency, rule, refresh, probe, telemetry, and public Core health projection through injected persistence, Runtime Apply, Profile source, and Core ports.
 - `src/domain.rs` defines shared lifecycle, identity, status, and validated value types.
 - `src/contract.rs` owns the versioned JSON V1 envelope and explicit status DTO projection.
 - `src/ipc.rs` owns the versioned local wire protocol, bounded JSON framing, private Unix socket boundary, and per-subscriber status and log backpressure state.

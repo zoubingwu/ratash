@@ -26,6 +26,11 @@ pub enum TunReason {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoreDiagnosticCategory {
+    RestartLimitReached,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApplyState {
     Idle,
     Applying,
@@ -314,6 +319,15 @@ pub struct CoreStatus {
     pub lifecycle: CoreLifecycle,
     pub pid: Option<u32>,
     pub instance_generation: Option<CoreInstanceGeneration>,
+    pub restart: CoreRestartStatus,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CoreRestartStatus {
+    pub pending: bool,
+    pub attempts: u64,
+    pub backoff_ms: Option<u64>,
+    pub diagnostic: Option<CoreDiagnosticCategory>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -21,8 +21,8 @@ use hopash::application::{
 };
 use hopash::constants::IPC_FRAME_MAX_BYTES;
 use hopash::domain::{
-    LocalRuleSetRevision, NodeRecordId, ProbeGeneration, ProfileId, ProxyGroupId,
-    RuntimeGeneration, SubscriptionUrl,
+    CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus, LocalRuleSetRevision, NodeRecordId,
+    ProbeGeneration, ProfileId, ProxyGroupId, RuntimeGeneration, SubscriptionUrl,
 };
 use hopash::error::ErrorCode;
 use hopash::ipc::{
@@ -214,6 +214,84 @@ fn one_shot_client_executes_through_the_authenticated_server() {
     );
 
     server.shutdown().expect("server should stop cleanly");
+}
+
+#[test]
+fn core_restart_health_round_trips_through_typed_ipc() {
+    let socket = TempSocket::new("core-restart-round-trip");
+    let mut expected = ApplicationService::new().status();
+    expected.core.lifecycle = CoreLifecycle::Starting;
+    expected.core.restart = CoreRestartStatus {
+        pending: true,
+        attempts: 2,
+        backoff_ms: Some(4_000),
+        diagnostic: Some(CoreDiagnosticCategory::RestartLimitReached),
+    };
+    let mut server = IpcServer::start(
+        socket.path(),
+        Arc::new(QueuedClient::new(vec![Ok(ApplicationOutput::Status(
+            expected.clone(),
+        ))])),
+        Arc::new(AllowPeer),
+        IpcServerConfig::default(),
+    )
+    .expect("server should start");
+
+    let output = IpcClient::new(socket.path())
+        .execute(ApplicationOperation::GetStatus)
+        .expect("rich status should round trip");
+
+    assert_eq!(output, ApplicationOutput::Status(expected));
+    server.shutdown().expect("server should stop cleanly");
+}
+
+#[test]
+fn legacy_status_without_core_restart_decodes_with_inactive_defaults() {
+    let capture_socket = TempSocket::new("legacy-status-capture");
+    let mut capture_server = IpcServer::start(
+        capture_socket.path(),
+        Arc::new(ApplicationService::new()),
+        Arc::new(AllowPeer),
+        IpcServerConfig::default(),
+    )
+    .expect("capture server should start");
+    let mut capture_stream =
+        UnixStream::connect(capture_socket.path()).expect("the capture client should connect");
+    write_frame(
+        &mut capture_stream,
+        &IpcRequest::new(RequestId(1), RequestOperation::GetStatus(EmptyPayload {})),
+    )
+    .expect("the capture request should write");
+    let mut legacy_response: serde_json::Value =
+        read_frame(&mut capture_stream).expect("the current status response should decode");
+    capture_server
+        .shutdown()
+        .expect("capture server should stop cleanly");
+    let core = legacy_response
+        .pointer_mut("/data/data/core")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("the captured response should contain Core status");
+    assert!(core.remove("restart").is_some());
+
+    let legacy_socket = TempSocket::new("legacy-status-response");
+    let listener = bind_private_listener(legacy_socket.path())
+        .expect("the legacy fixture listener should bind");
+    let fixture = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("legacy fixture should accept");
+        let request: IpcRequest =
+            read_frame(&mut stream).expect("legacy fixture should read the request");
+        legacy_response["request_id"] = serde_json::json!(request.request_id.0);
+        write_frame(&mut stream, &legacy_response).expect("legacy response should write");
+    });
+
+    let output = IpcClient::new(legacy_socket.path())
+        .execute(ApplicationOperation::GetStatus)
+        .expect("legacy status should decode");
+    let ApplicationOutput::Status(status) = output else {
+        panic!("legacy response should return status")
+    };
+    assert_eq!(status.core.restart, CoreRestartStatus::default());
+    fixture.join().expect("legacy fixture should stop");
 }
 
 #[test]

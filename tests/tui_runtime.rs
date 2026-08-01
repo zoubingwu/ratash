@@ -929,6 +929,7 @@ fn status(upload: u64) -> StatusSnapshot {
             lifecycle: CoreLifecycle::Ready,
             pid: Some(42),
             instance_generation: None,
+            restart: hopash::domain::CoreRestartStatus::default(),
         },
         tun: TunStatus {
             requested: true,

@@ -4,9 +4,10 @@ pub use crate::error::{ErrorCode, ProcessExitCode};
 
 use crate::application::{self, ApplicationError, ApplicationErrorDetails, ApplicationOutput};
 use crate::domain::{
-    ActiveProfileSummary, ApplyState, CoreLifecycle, CoreStatus, LatencySample, ProbeQueueStatus,
-    SampleState, SelectedNodeSummary, StatusSnapshot, StreamHealthSet, StreamState,
-    SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason, TunStatus,
+    ActiveProfileSummary, ApplyState, CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus,
+    CoreStatus, LatencySample, ProbeQueueStatus, SampleState, SelectedNodeSummary, StatusSnapshot,
+    StreamHealthSet, StreamState, SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason,
+    TunStatus,
 };
 
 pub const SCHEMA_VERSION: u16 = 1;
@@ -997,6 +998,7 @@ pub struct CoreViewV1 {
     pub pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instance_generation: Option<String>,
+    pub restart: CoreRestartViewV1,
 }
 
 impl From<CoreStatus> for CoreViewV1 {
@@ -1007,6 +1009,42 @@ impl From<CoreStatus> for CoreViewV1 {
             instance_generation: status
                 .instance_generation
                 .map(|generation| generation.0.to_string()),
+            restart: status.restart.into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct CoreRestartViewV1 {
+    pub pending: bool,
+    pub attempts: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backoff_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<CoreDiagnosticCategoryViewV1>,
+}
+
+impl From<CoreRestartStatus> for CoreRestartViewV1 {
+    fn from(status: CoreRestartStatus) -> Self {
+        Self {
+            pending: status.pending,
+            attempts: status.attempts,
+            backoff_ms: status.backoff_ms,
+            diagnostic: status.diagnostic.map(Into::into),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoreDiagnosticCategoryViewV1 {
+    CoreRestartLimitReached,
+}
+
+impl From<CoreDiagnosticCategory> for CoreDiagnosticCategoryViewV1 {
+    fn from(category: CoreDiagnosticCategory) -> Self {
+        match category {
+            CoreDiagnosticCategory::RestartLimitReached => Self::CoreRestartLimitReached,
         }
     }
 }
