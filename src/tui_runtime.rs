@@ -387,12 +387,7 @@ where
         let (proxy_groups, proxies) = if let Some(group) = status.primary_proxy_group.clone() {
             match self
                 .client
-                .execute_cancellable(
-                    ApplicationOperation::ProxyList {
-                        group,
-                    },
-                    cancellation,
-                )
+                .execute_cancellable(ApplicationOperation::ProxyList { group }, cancellation)
                 .map_err(snapshot_application_error)?
             {
                 ApplicationOutput::Proxies(outcome) => {

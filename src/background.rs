@@ -675,7 +675,10 @@ fn spawn_log_thread(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the stream worker keeps lifecycle dependencies and behavior callbacks explicit"
+)]
 fn run_stream<T: Send + 'static>(
     application: Arc<dyn BackgroundApplication>,
     core: Arc<dyn BackgroundCorePort>,
@@ -871,7 +874,10 @@ fn generation_is_current(
         .is_some_and(|core| core.instance_generation == generation)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "failure publication keeps the stream transition inputs explicit"
+)]
 fn publish_failure_state(
     application: &dyn BackgroundApplication,
     kind: TelemetryStream,

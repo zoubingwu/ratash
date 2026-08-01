@@ -41,6 +41,11 @@ security-framework = "3.7"
 [lints.rust]
 unsafe_code = "forbid"
 
+[lints.clippy]
+large_enum_variant = "warn"
+needless_collect = "warn"
+redundant_clone = "warn"
+
 [dev-dependencies]
 clap_complete = "4"
 clap_mangen = "0.2"

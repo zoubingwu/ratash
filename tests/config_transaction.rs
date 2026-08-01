@@ -841,7 +841,7 @@ fn revision_change_during_validation_discards_the_stale_candidate() {
     let (point, entered) = BlockPoint::new();
     harness.validator.block_next(point.clone());
     let coordinator = harness.coordinator.clone();
-    let transaction = candidate.clone();
+    let transaction = candidate;
     let worker = std::thread::spawn(move || coordinator.execute(&transaction));
     entered
         .recv_timeout(Duration::from_secs(1))
@@ -878,8 +878,8 @@ fn blocking_producers_serialize_and_rule_acquire_reports_busy() {
         .expect_err("the rule producer should report busy");
     assert_eq!(rule_error.kind, ConfigTransactionErrorKind::Busy);
 
-    let second_coordinator = harness.coordinator.clone();
-    let second_candidate = candidate.clone();
+    let second_coordinator = harness.coordinator;
+    let second_candidate = candidate;
     let (finished_sender, finished_receiver) = mpsc::channel();
     let second = std::thread::spawn(move || {
         finished_sender

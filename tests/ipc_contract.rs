@@ -322,7 +322,7 @@ fn peer_authorization_is_an_object_safe_accept_boundary() {
     let fixture = TempFixture::new("peer-auth");
     let socket_path = fixture.path().join("ipc/hopash.sock");
     let listener = bind_private_listener(&socket_path).expect("private listener should bind");
-    let client_path = socket_path.clone();
+    let client_path = socket_path;
     let client = thread::spawn(move || {
         UnixStream::connect(client_path).expect("fixture client should connect")
     });

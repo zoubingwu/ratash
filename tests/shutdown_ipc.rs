@@ -368,7 +368,7 @@ fn control_ipc_shutdown_deadline_does_not_join_a_blocked_handler() {
     )
     .expect("the control IPC server should start");
     let client_socket = socket.clone();
-    let client_intent = intent.clone();
+    let client_intent = intent;
     let blocked = thread::spawn(move || {
         request_shutdown(&client_socket, &client_intent, Duration::from_secs(30))
     });

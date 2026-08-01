@@ -173,13 +173,9 @@ impl DaemonProcessControl for FakeProcessControl {
         match behavior {
             SpawnBehavior::Ready | SpawnBehavior::WrongProcess => {
                 let paths = StatePaths::for_root(launch.state_root());
-                let ownership = SupervisorOwnership::acquire(
-                    paths.clone(),
-                    process.clone(),
-                    u64::from(pid),
-                    self,
-                )
-                .map_err(|error| io::Error::other(error.to_string()))?;
+                let ownership =
+                    SupervisorOwnership::acquire(paths.clone(), process, u64::from(pid), self)
+                        .map_err(|error| io::Error::other(error.to_string()))?;
                 let listener = UnixListener::bind(&paths.ipc_socket)?;
                 if matches!(behavior, SpawnBehavior::WrongProcess) {
                     launch

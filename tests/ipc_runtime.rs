@@ -33,9 +33,9 @@ use hopash::domain::{
 };
 use hopash::error::ErrorCode;
 use hopash::ipc::{
-    EmptyPayload, IPC_PROTOCOL_VERSION, IpcRequest, IpcResponse, LogSubscriptionPayload,
-    PeerAuthorizationError, PeerAuthorizer, RequestId, RequestOperation, bind_private_listener,
-    read_frame, write_frame,
+    EmptyPayload, FrameError, IPC_PROTOCOL_VERSION, IpcRequest, IpcResponse,
+    LogSubscriptionPayload, PeerAuthorizationError, PeerAuthorizer, RequestId, RequestOperation,
+    bind_private_listener, read_frame, write_frame,
 };
 use hopash::ipc_runtime::{IpcClient, IpcServer, IpcServerConfig, SameUserPeerAuthorizer};
 
@@ -286,6 +286,14 @@ impl ApplicationClient for CountingClient {
 struct BlockingClient {
     entered: AtomicUsize,
     gate: (Mutex<bool>, Condvar),
+}
+
+struct BlockingClientRelease<'a>(&'a BlockingClient);
+
+impl Drop for BlockingClientRelease<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
 }
 
 impl BlockingClient {
@@ -1631,6 +1639,7 @@ fn pending_connection_queue_rejects_excess_work_without_growing() {
         },
     )
     .expect("server should start");
+    let _release = BlockingClientRelease(application.as_ref());
 
     let client_path = socket.path().to_path_buf();
     let first =
@@ -1639,17 +1648,17 @@ fn pending_connection_queue_rejects_excess_work_without_growing() {
 
     let second_request =
         IpcRequest::new(RequestId(2), RequestOperation::GetStatus(EmptyPayload {}));
-    let mut second = raw_request(socket.path(), &second_request);
-    second
-        .set_read_timeout(Some(Duration::from_millis(300)))
-        .expect("fixture timeout should configure");
+    let mut second = overload_request(socket.path(), &second_request)
+        .expect("second overload request should be observable");
     let third_request = IpcRequest::new(RequestId(3), RequestOperation::GetStatus(EmptyPayload {}));
-    let mut third = raw_request(socket.path(), &third_request);
-    third
-        .set_read_timeout(Some(Duration::from_millis(300)))
-        .expect("fixture timeout should configure");
-    let second_closed = connection_closed_or_pending(&mut second);
-    let third_closed = connection_closed_or_pending(&mut third);
+    let mut third = overload_request(socket.path(), &third_request)
+        .expect("third overload request should be observable");
+    let second_closed = second
+        .as_mut()
+        .map_or(Ok(true), connection_closed_or_pending);
+    let third_closed = third
+        .as_mut()
+        .map_or(Ok(true), connection_closed_or_pending);
 
     application.release();
     let second_closed = second_closed.expect("second admission state should be observable");
@@ -1663,9 +1672,17 @@ fn pending_connection_queue_rejects_excess_work_without_growing() {
         Ok(ApplicationOutput::Status(_))
     ));
     let (queued, expected_request_id) = if second_closed {
-        (&mut third, RequestId(3))
+        (
+            third.as_mut().expect("third request should remain queued"),
+            RequestId(3),
+        )
     } else {
-        (&mut second, RequestId(2))
+        (
+            second
+                .as_mut()
+                .expect("second request should remain queued"),
+            RequestId(2),
+        )
     };
     let response: IpcResponse = read_frame(queued).expect("queued connection should complete");
     assert_eq!(response.request_id, expected_request_id);
@@ -1673,6 +1690,25 @@ fn pending_connection_queue_rejects_excess_work_without_growing() {
     assert_eq!(application.entered.load(Ordering::Acquire), 2);
 
     server.shutdown().expect("server should stop cleanly");
+}
+
+fn overload_request(path: &Path, request: &IpcRequest) -> io::Result<Option<UnixStream>> {
+    let mut stream = UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(Duration::from_millis(300)))?;
+    match write_frame(&mut stream, request) {
+        Ok(()) => Ok(Some(stream)),
+        Err(FrameError::Io(error))
+            if matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(io::Error::other(error)),
+    }
 }
 
 fn connection_closed_or_pending(stream: &mut UnixStream) -> io::Result<bool> {

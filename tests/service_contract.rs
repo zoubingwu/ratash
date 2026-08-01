@@ -2459,11 +2459,9 @@ fn bounded_log_forwarding_evicts_by_aggregate_message_bytes() {
         .apply_candidate(&session.proof, &harness.bundle(1))
         .expect("the Core should spawn");
     let message = "x".repeat(CORE_LOG_LINE_MAX_BYTES);
-    harness.processes.push_logs(
-        (0..=retained_records)
-            .map(|index| process_log(index as u64, &message))
-            .collect::<Vec<_>>(),
-    );
+    harness
+        .processes
+        .push_logs((0..=retained_records).map(|index| process_log(index as u64, &message)));
 
     let mut after_sequence = None;
     let mut records = Vec::new();

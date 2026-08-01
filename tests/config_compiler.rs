@@ -907,7 +907,7 @@ fn privileged_validation_rejects_forged_runtime_authority_and_provider_manifest(
         .insert("listen".into(), "0.0.0.0:53".into());
     forgeries.push(forged_dns_listener);
 
-    let mut forged_listener = original.clone();
+    let mut forged_listener = original;
     forged_listener
         .as_mapping_mut()
         .expect("the candidate should be a mapping")

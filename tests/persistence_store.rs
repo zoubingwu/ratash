@@ -237,7 +237,7 @@ fn committed_manifest_retains_current_and_previous_generations() {
         .committed
         .expect("manifest should exist");
     assert_eq!(committed.current, second.candidate);
-    assert_eq!(committed.previous, Some(first.candidate.clone()));
+    assert_eq!(committed.previous, Some(first.candidate));
     assert_eq!(
         store
             .load_transaction(&committed.current)

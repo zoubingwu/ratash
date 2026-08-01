@@ -281,7 +281,7 @@ fn keyboard_and_mouse_profile_activation_produce_the_same_intent_and_command() {
     let profile_hit = hit_for(&map, |intent| {
         matches!(intent, UiIntent::ActivateProfile(_))
     });
-    keyboard_state.publish_interaction_map(map.clone());
+    keyboard_state.publish_interaction_map(map);
     let mut mouse_state = keyboard_state.clone();
 
     let keyboard = input_to_intent(&keyboard_state, TerminalInput::Key(KeyInput::Enter))

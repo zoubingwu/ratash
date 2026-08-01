@@ -160,11 +160,7 @@ fn probe_generation_deduplicates_nodes_and_enqueues_the_first_pass_immediately()
     let mut scheduler = ProbeScheduler::new();
 
     scheduler
-        .reset(
-            ProbeGeneration(1),
-            [first.clone(), second.clone(), first.clone()],
-            100,
-        )
+        .reset(ProbeGeneration(1), [first.clone(), second, first], 100)
         .expect("generation should be accepted");
 
     let metrics = scheduler.metrics(100);
