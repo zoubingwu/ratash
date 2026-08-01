@@ -52,7 +52,8 @@
 - `src/diagnostics.rs` owns safe typed Wrapper diagnostic categories, structured transition records, and bounded tail and gap semantics.
 - `src/contract.rs` owns the versioned JSON V1 envelope and explicit status DTO projection.
 - `src/ipc.rs` owns the versioned local wire protocol, bounded JSON framing, private Unix socket boundary, and per-subscriber status and log backpressure state.
-- `src/ipc_runtime.rs` implements the cancellable, deadline-bounded one-shot IPC client, strict aggregation of bounded Profile, Proxy, and Rule pages, same-user peer authorization, request-frame allocation limits, count-and-byte-bounded Core Log recovery tails, and the stoppable bounded Unix socket server.
+- `src/ipc_runtime.rs` is the public facade for the live user-local IPC runtime.
+- `src/ipc_runtime/client.rs` owns cancellable deadline-bounded request and streaming clients; `client_error.rs` owns safe client error translation; `server.rs` owns same-user authorization and the stoppable bounded Unix socket server; `stream.rs` owns bounded status and Core Log fan-out; `wire.rs` and `wire/status.rs` own private application DTO projections.
 - `src/frontend_ipc.rs` adapts status and Core Log streams for foreground clients with a count-and-byte-bounded delivery queue that preserves dropped and gap signals.
 - `src/cancellation.rs` owns the shared operation cancellation token and interrupt-registration boundary used to wake blocking foreground work.
 - `src/lifecycle.rs` owns state-root discovery, process identities, recoverable directory leases, instance records, and verified stale-socket cleanup.
