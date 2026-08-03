@@ -175,11 +175,10 @@ pub fn input_to_intent(state: &AppState, input: TerminalInput) -> Option<UiInten
     }
 
     match key {
-        KeyInput::Character('1') => Some(UiIntent::SwitchPage(Page::Overview)),
-        KeyInput::Character('2') => Some(UiIntent::SwitchPage(Page::Proxies)),
-        KeyInput::Character('3') => Some(UiIntent::SwitchPage(Page::Connections)),
-        KeyInput::Character('4') => Some(UiIntent::SwitchPage(Page::Rules)),
-        KeyInput::Character('5') => Some(UiIntent::SwitchPage(Page::Logs)),
+        KeyInput::Character('1') => Some(UiIntent::SwitchPage(Page::Proxies)),
+        KeyInput::Character('2') => Some(UiIntent::SwitchPage(Page::Connections)),
+        KeyInput::Character('3') => Some(UiIntent::SwitchPage(Page::Rules)),
+        KeyInput::Character('4') => Some(UiIntent::SwitchPage(Page::Logs)),
         KeyInput::Character('j') | KeyInput::Down if state.focus == Focus::ProxyGroups => {
             Some(UiIntent::NextProxyGroup)
         }
@@ -215,15 +214,12 @@ pub fn input_to_intent(state: &AppState, input: TerminalInput) -> Option<UiInten
         KeyInput::BackTab => Some(UiIntent::FocusPrevious),
         KeyInput::Character('/') => Some(UiIntent::FocusSearch),
         KeyInput::Character(':') => Some(UiIntent::OpenCommandPalette),
-        KeyInput::Character('p') if state.page == Page::Overview => Some(UiIntent::OpenProfiles),
+        KeyInput::Character('p') if state.page != Page::Logs => Some(UiIntent::OpenProfiles),
         KeyInput::Character('?') => Some(UiIntent::ToggleHelp),
         KeyInput::Character('q') => Some(UiIntent::Quit),
         KeyInput::Escape => Some(UiIntent::Escape),
         KeyInput::Character('s') if state.page == Page::Proxies => {
             Some(UiIntent::SetProxySort(state.proxies.sort.next()))
-        }
-        KeyInput::Character('d') if state.page == Page::Proxies => {
-            Some(UiIntent::ToggleProxyDetail)
         }
         KeyInput::Character('z') if state.page == Page::Proxies => Some(UiIntent::ToggleZoom),
         KeyInput::Character('r') if state.page == Page::Rules => Some(UiIntent::LoadRules),
@@ -299,6 +295,14 @@ fn selected_intent(state: &AppState) -> Option<UiIntent> {
         Page::Proxies if state.proxies.group_load_pending.is_some() => None,
         Page::Proxies => filtered_proxies(&state.proxies)
             .get(state.proxies.selected)
+            .filter(|row| {
+                state
+                    .proxies
+                    .groups
+                    .iter()
+                    .find(|group| group.id == row.group_id)
+                    .is_some_and(|group| group.selectable)
+            })
             .and_then(|row| {
                 row.node_id.clone().map(|node_id| UiIntent::SelectNode {
                     group_id: row.group_id.clone(),
@@ -311,7 +315,6 @@ fn selected_intent(state: &AppState) -> Option<UiIntent> {
         Page::Rules => None,
         Page::Connections => None,
         Page::Logs => Some(UiIntent::ToggleLogPause),
-        Page::Overview => None,
     }
 }
 

@@ -6,14 +6,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
-use crate::application::LatencyProbeStatus;
-
 use super::super::{AppState, Focus, ProxyRow};
 use super::layout::{LayoutRegions, proxy_group_offset, proxy_sort_areas};
 use super::{
-    ACCENT, MUTED, WARN, fit_column, latency_freshness_title, latency_probe_status_title,
-    render_vertical_separator, selected_style, terminal_safe, title_line,
+    ACCENT, MUTED, WARN, fit_column, fit_node_name, render_vertical_separator, selected_style,
+    terminal_safe, title_line,
 };
+use crate::tui::visible_window_start;
 
 pub(super) fn render(state: &AppState, regions: &LayoutRegions, buffer: &mut Buffer) {
     let row_indices = regions.proxy_row_indices();
@@ -29,15 +28,6 @@ pub(super) fn render(state: &AppState, regions: &LayoutRegions, buffer: &mut Buf
         }
     } else if let Some(list) = regions.list {
         render_nodes(state, row_indices, list, buffer);
-    }
-    if let Some(detail) = regions.detail {
-        if detail.x > regions.content.x {
-            render_vertical_separator(
-                Rect::new(detail.x.saturating_sub(1), detail.y, 1, detail.height),
-                buffer,
-            );
-        }
-        render_detail(state, row_indices, detail, buffer);
     }
 }
 
@@ -114,16 +104,17 @@ fn render_groups(state: &AppState, area: Rect, buffer: &mut Buffer) {
             .as_ref()
             .is_some_and(|load| load.group_id == group.id);
         let marker = match (current, pending) {
-            (true, true) => "[current][pending] ",
-            (true, false) => "[current] ",
-            (false, true) => "[pending] ",
+            (true, true) => "◉ ",
+            (true, false) => "● ",
+            (false, true) => "◌ ",
             (false, false) => "",
         };
         let line = format!(
-            "{}{}{}",
+            "{}{}{} · {}",
             if focused { "▌" } else { " " },
             marker,
-            terminal_safe(&group.name)
+            terminal_safe(&group.name),
+            terminal_safe(&group.proxy_type),
         );
         Paragraph::new(line)
             .style(if focused {
@@ -151,7 +142,13 @@ fn render_nodes(state: &AppState, row_indices: &[usize], area: Rect, buffer: &mu
     Paragraph::new(header)
         .style(Style::default().fg(MUTED))
         .render(Rect::new(area.x, area.y, area.width, 1), buffer);
-    let offset = state.proxies.scroll.min(state.proxies.selected);
+    let visible = area.height.saturating_sub(1) as usize;
+    let offset = visible_window_start(
+        state.proxies.scroll,
+        state.proxies.selected,
+        visible,
+        row_indices.len(),
+    );
     for (visible_index, row_index_in_state) in row_indices
         .iter()
         .copied()
@@ -170,10 +167,10 @@ fn render_nodes(state: &AppState, row_indices: &[usize], area: Rect, buffer: &mu
                     group_id == &row.group_id && row.node_id.as_ref() == Some(node_id)
                 });
         let marker = match (row.selected, pending) {
-            (true, true) => "[current][pending]",
-            (true, false) => "[current]         ",
-            (false, true) => "[pending]         ",
-            (false, false) => "                  ",
+            (true, true) => "◉",
+            (true, false) => "●",
+            (false, true) => "◌",
+            (false, false) => " ",
         };
         let availability = if row.available {
             "ready"
@@ -188,33 +185,17 @@ fn render_nodes(state: &AppState, row_indices: &[usize], area: Rect, buffer: &mu
         };
         let line = match density {
             NodeRowDensity::Compact => format!(
-                "{cursor} {} {} {}",
-                fit_column(&row.name, 34),
-                fit_column(&delay, 11),
+                "{cursor}{marker} {} {} {}",
+                fit_node_name(&row.name, 28),
                 fit_column(availability, 11),
+                fit_column(&delay, 10),
             ),
             NodeRowDensity::Standard => format!(
-                "{cursor} {} {} {} {} {}",
-                fit_column(marker, 18),
-                fit_column(&row.name, 20),
+                "{cursor}{marker} {} {} {} {}",
+                fit_node_name(&row.name, 28),
                 fit_column(&row.node_type, 12),
                 fit_column(availability, 11),
-                fit_column(&delay, 8),
-            ),
-            NodeRowDensity::Extended => format!(
-                "{cursor} {} {} {} {} {} {} {} {}",
-                fit_column(marker, 18),
-                fit_column(&row.name, 20),
-                fit_column(&row.node_type, 12),
-                fit_column(availability, 11),
-                fit_column(&delay, 8),
-                fit_column(
-                    &row.sampled_at_unix_ms
-                        .map_or_else(|| "-".to_owned(), |sampled| sampled.to_string()),
-                    13,
-                ),
-                fit_column(latency_freshness_title(row.freshness), 11),
-                fit_column(latency_probe_status_title(row.probe_status), 11),
+                fit_column(&delay, 10),
             ),
         };
         Paragraph::new(line)
@@ -247,14 +228,11 @@ fn render_nodes(state: &AppState, row_indices: &[usize], area: Rect, buffer: &mu
 enum NodeRowDensity {
     Compact,
     Standard,
-    Extended,
 }
 
 impl NodeRowDensity {
     fn for_width(width: u16) -> Self {
-        if width >= 113 {
-            Self::Extended
-        } else if width >= 75 {
+        if width >= 65 {
             Self::Standard
         } else {
             Self::Compact
@@ -264,12 +242,9 @@ impl NodeRowDensity {
 
 fn node_header(density: NodeRowDensity) -> &'static str {
     match density {
-        NodeRowDensity::Compact => "  NODE                               DELAY       STATE      ",
+        NodeRowDensity::Compact => "  NODE                         STATUS      LATENCY   ",
         NodeRowDensity::Standard => {
-            "  STATE              NODE                 TYPE         STATUS      DELAY   "
-        }
-        NodeRowDensity::Extended => {
-            "  STATE              NODE                 TYPE         STATUS      DELAY    SAMPLED       FRESHNESS   PROBE      "
+            "  NODE                         TYPE         STATUS      LATENCY   "
         }
     }
 }
@@ -280,65 +255,13 @@ fn proxy_row_style(row: &ProxyRow, selected: bool, focused: bool) -> Style {
     } else if !row.available {
         Style::default().fg(Color::Red)
     } else if row.selected {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     }
 }
 
-fn render_detail(state: &AppState, row_indices: &[usize], area: Rect, buffer: &mut Buffer) {
-    let Some(row_index) = row_indices.get(state.proxies.selected) else {
-        Paragraph::new(vec![title_line("NODE DETAIL"), Line::from("Select a Node")])
-            .render(area, buffer);
-        return;
-    };
-    let row = &state.proxies.rows[*row_index];
-    let delay = delay_label(row);
-    let sampled = row
-        .sampled_at_unix_ms
-        .map_or_else(|| "-".to_owned(), |sampled| sampled.to_string());
-    Paragraph::new(vec![
-        title_line("NODE DETAIL"),
-        Line::from(""),
-        Line::from(Span::styled(
-            terminal_safe(&row.name),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(format!("Type       {}", terminal_safe(&row.node_type))),
-        Line::from(format!("Group      {}", terminal_safe(&row.group))),
-        Line::from(format!(
-            "Status     {}",
-            if row.available {
-                "ready"
-            } else {
-                "unavailable"
-            }
-        )),
-        Line::from(format!("Latency    {delay}")),
-        Line::from(format!(
-            "Freshness  {}",
-            latency_freshness_title(row.freshness)
-        )),
-        Line::from(format!(
-            "Probe      {}",
-            latency_probe_status_title(row.probe_status)
-        )),
-        Line::from(format!("Sampled    {sampled}")),
-    ])
-    .render(area, buffer);
-}
-
 fn delay_label(row: &ProxyRow) -> String {
-    row.delay_ms.map_or_else(
-        || {
-            match row.probe_status {
-                LatencyProbeStatus::NotSampled | LatencyProbeStatus::Succeeded => "-",
-                LatencyProbeStatus::Queued => "queued",
-                LatencyProbeStatus::InFlight => "probing",
-                LatencyProbeStatus::Failed => "failed",
-            }
-            .to_owned()
-        },
-        |delay| format!("{delay} ms"),
-    )
+    row.delay_ms
+        .map_or_else(|| "-".to_owned(), |delay| format!("{delay} ms"))
 }

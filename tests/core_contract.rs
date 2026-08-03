@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 
+use ratash::constants::{
+    CONNECTION_CHAIN_CAPACITY, CONNECTION_FIELD_MAX_BYTES, CONNECTION_RECORD_CAPACITY,
+};
 use ratash::core::{
     ApplyCandidateResult, ApplyDisposition, ConnectionSummary, CoreControlEndpoint, CoreEvent,
     CoreEventStream, CoreRuntime, CoreRuntimeError, CoreRuntimeErrorKind, CoreRuntimeStatus,
@@ -13,8 +16,8 @@ use ratash::core::{
     project_proxy_view,
 };
 use ratash::domain::{
-    CoreInstanceGeneration, LatencySample, NodeRecordId, ProbeGeneration, ProxyGroupId,
-    RuntimeGeneration, SampleState,
+    ConnectionRecord, CoreInstanceGeneration, LatencySample, NodeRecordId, ProbeGeneration,
+    ProxyGroupId, RuntimeGeneration, SampleState,
 };
 
 const PROXIES: &[u8] = include_bytes!("../fixtures/mihomo/v1.19.28/proxies.json");
@@ -255,6 +258,32 @@ fn codecs_match_v1_19_28_snapshot_and_stream_shapes() {
             upload_total_bytes: 4096,
             download_total_bytes: 8192,
             memory_bytes: Some(1_048_576),
+            connections: vec![
+                ConnectionRecord {
+                    id: "fixture-connection".to_owned(),
+                    network: "tcp".to_owned(),
+                    host: Some("example.com".to_owned()),
+                    destination_ip: Some("93.184.216.34".to_owned()),
+                    destination_port: Some("443".to_owned()),
+                    chains: vec!["provider-only".to_owned(), "Manual".to_owned()],
+                    rule: "DOMAIN-SUFFIX".to_owned(),
+                    rule_payload: Some("example.com".to_owned()),
+                    upload_bytes: 1024,
+                    download_bytes: 2048,
+                },
+                ConnectionRecord {
+                    id: "fixture-direct".to_owned(),
+                    network: "udp".to_owned(),
+                    host: Some("dns.google".to_owned()),
+                    destination_ip: Some("1.1.1.1".to_owned()),
+                    destination_port: Some("53".to_owned()),
+                    chains: vec!["DIRECT".to_owned()],
+                    rule: "MATCH".to_owned(),
+                    rule_payload: None,
+                    upload_bytes: 64,
+                    download_bytes: 128,
+                },
+            ],
         }
     );
     assert_eq!(
@@ -267,6 +296,51 @@ fn codecs_match_v1_19_28_snapshot_and_stream_shapes() {
     let error = project_proxy_view(PROXIES, Some(b"{}"), &group_order())
         .expect_err("providers map is required");
     assert_eq!(error.kind, ProjectionErrorKind::Providers);
+}
+
+#[test]
+fn connection_projection_bounds_rows_chains_and_text_fields() {
+    let long = "x".repeat(CONNECTION_FIELD_MAX_BYTES + 20);
+    let chains = (0..CONNECTION_CHAIN_CAPACITY + 3)
+        .map(|index| format!("chain-{index}"))
+        .collect::<Vec<_>>();
+    let connections = (0..CONNECTION_RECORD_CAPACITY + 5)
+        .map(|index| {
+            serde_json::json!({
+                "id": if index == 0 { long.clone() } else { format!("connection-{index}") },
+                "metadata": {
+                    "network": "tcp",
+                    "host": "example.com",
+                    "destinationIP": "93.184.216.34",
+                    "destinationPort": "443"
+                },
+                "chains": chains.clone(),
+                "rule": "MATCH",
+                "rulePayload": "",
+                "upload": 1,
+                "download": 2
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "uploadTotal": 1,
+        "downloadTotal": 2,
+        "connections": connections
+    }))
+    .expect("fixture connection payload should encode");
+
+    let summary = MihomoJsonCodec::connections(&payload).expect("connections should project");
+
+    assert_eq!(
+        summary.active_connections,
+        (CONNECTION_RECORD_CAPACITY + 5) as u64
+    );
+    assert_eq!(summary.connections.len(), CONNECTION_RECORD_CAPACITY);
+    assert_eq!(summary.connections[0].id.len(), CONNECTION_FIELD_MAX_BYTES);
+    assert_eq!(
+        summary.connections[0].chains.len(),
+        CONNECTION_CHAIN_CAPACITY
+    );
 }
 
 #[test]

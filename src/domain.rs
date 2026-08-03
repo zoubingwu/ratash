@@ -417,6 +417,20 @@ pub struct TrafficSample {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectionRecord {
+    pub id: String,
+    pub network: String,
+    pub host: Option<String>,
+    pub destination_ip: Option<String>,
+    pub destination_port: Option<String>,
+    pub chains: Vec<String>,
+    pub rule: String,
+    pub rule_payload: Option<String>,
+    pub upload_bytes: u64,
+    pub download_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamHealthSet {
     pub traffic: StreamState,
     pub connections: StreamState,
@@ -456,6 +470,10 @@ pub struct StatusSnapshot {
     pub latency: Option<LatencySample>,
     pub traffic: TrafficSample,
     pub connection_count: u64,
+    pub upload_total_bytes: u64,
+    pub download_total_bytes: u64,
+    pub memory_bytes: Option<u64>,
+    pub connections: Vec<ConnectionRecord>,
     pub runtime_generation: Option<RuntimeGeneration>,
     pub apply_state: ApplyState,
     pub runtime_apply: RuntimeApplySnapshot,

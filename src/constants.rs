@@ -59,6 +59,9 @@ pub const WRAPPER_DIAGNOSTIC_CAPACITY: usize = 256;
 pub const STATUS_SUBSCRIBER_CAPACITY: usize = 64;
 pub const IPC_STREAM_CAPACITY: usize = 3;
 pub const TRAFFIC_SERIES_CAPACITY: usize = 300;
+pub const CONNECTION_RECORD_CAPACITY: usize = 256;
+pub const CONNECTION_CHAIN_CAPACITY: usize = 16;
+pub const CONNECTION_FIELD_MAX_BYTES: usize = 512;
 
 pub const PROFILE_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const YAML_MAX_DEPTH: usize = 64;

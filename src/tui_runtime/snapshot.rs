@@ -242,11 +242,11 @@ fn proxy_group_snapshot(outcome: ProxyListOutcome) -> ProxyGroupSnapshot {
     let current_group = proxy_group_row(group);
     let mut group_rows = groups
         .into_iter()
-        .filter(|group| group.selectable)
+        .filter(|group| group.name != "GLOBAL")
         .take(MAX_ACTIVE_NODES)
         .map(proxy_group_row)
         .collect::<Vec<_>>();
-    if group_rows.is_empty() {
+    if group_rows.is_empty() && current_group.name != "GLOBAL" {
         group_rows.push(current_group.clone());
     }
     let proxies = nodes
@@ -263,9 +263,6 @@ fn proxy_group_snapshot(outcome: ProxyListOutcome) -> ProxyGroupSnapshot {
             available: node.availability == ProxyAvailability::Available,
             selected: node.selected,
             delay_ms: node.delay_ms,
-            sampled_at_unix_ms: node.sampled_at_unix_ms,
-            freshness: node.freshness,
-            probe_status: node.probe_status,
         })
         .collect();
     ProxyGroupSnapshot {
@@ -280,6 +277,7 @@ fn proxy_group_row(group: ProxyGroupSummary) -> ProxyGroupRow {
         id: group.id,
         name: group.name,
         proxy_type: group.proxy_type,
+        selectable: group.selectable,
         selected_node: group.selected_node.map(|node| node.name),
     }
 }

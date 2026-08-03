@@ -6,7 +6,7 @@ use ratatui::widgets::{Paragraph, Widget};
 
 use crate::application::PolicyTargetValidation;
 
-use super::super::{AppState, Focus};
+use super::super::{AppState, Focus, visible_window_start};
 use super::{
     ACCENT, MUTED, WARN, fit_column, policy_validation_title, selected_style, terminal_safe,
     title_line,
@@ -87,7 +87,13 @@ pub(super) fn render(
         return;
     }
 
-    let offset = state.rules.scroll.min(state.rules.selected);
+    let visible = table.height.saturating_sub(1) as usize;
+    let offset = visible_window_start(
+        state.rules.scroll,
+        state.rules.selected,
+        visible,
+        row_indices.len(),
+    );
     for (visible_index, row_index_in_state) in row_indices
         .iter()
         .copied()

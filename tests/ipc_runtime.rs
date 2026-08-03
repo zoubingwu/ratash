@@ -26,10 +26,10 @@ use ratash::constants::{
     PROFILE_COUNT_MAX,
 };
 use ratash::domain::{
-    CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus, LocalRuleSetRevision, NodeRecordId,
-    ProbeGeneration, ProfileId, ProxyGroupId, RuntimeApplyPhase, RuntimeApplySnapshot,
-    RuntimeGeneration, RuntimeRecoverySnapshot, RuntimeRecoveryStatus, SubscriptionUrl,
-    SupervisorHealthReason, SupervisorLifecycle,
+    ConnectionRecord, CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus,
+    LocalRuleSetRevision, NodeRecordId, ProbeGeneration, ProfileId, ProxyGroupId,
+    RuntimeApplyPhase, RuntimeApplySnapshot, RuntimeGeneration, RuntimeRecoverySnapshot,
+    RuntimeRecoveryStatus, SubscriptionUrl, SupervisorHealthReason, SupervisorLifecycle,
 };
 use ratash::error::ErrorCode;
 use ratash::ipc::{
@@ -407,6 +407,22 @@ fn runtime_apply_and_core_health_round_trip_through_typed_ipc() {
             message: Some("Committed Runtime Generation cleanup is pending".to_owned()),
         },
     };
+    expected.connection_count = 1;
+    expected.upload_total_bytes = 1_024;
+    expected.download_total_bytes = 2_048;
+    expected.memory_bytes = Some(4_096);
+    expected.connections = vec![ConnectionRecord {
+        id: "fixture-connection".to_owned(),
+        network: "tcp".to_owned(),
+        host: Some("example.com".to_owned()),
+        destination_ip: Some("93.184.216.34".to_owned()),
+        destination_port: Some("443".to_owned()),
+        chains: vec!["Automatic".to_owned()],
+        rule: "DOMAIN-SUFFIX".to_owned(),
+        rule_payload: Some("example.com".to_owned()),
+        upload_bytes: 1024,
+        download_bytes: 2048,
+    }];
     let mut server = IpcServer::start(
         socket.path(),
         Arc::new(QueuedClient::new(vec![Ok(ApplicationOutput::Status(
@@ -450,7 +466,7 @@ fn stopped_supervisor_round_trips_through_typed_ipc() {
 }
 
 #[test]
-fn legacy_status_without_core_restart_decodes_with_inactive_defaults() {
+fn legacy_status_without_recent_fields_decodes_with_inactive_defaults() {
     let capture_socket = TempSocket::new("legacy-status-capture");
     let mut capture_server = IpcServer::start(
         capture_socket.path(),
@@ -486,6 +502,10 @@ fn legacy_status_without_core_restart_decodes_with_inactive_defaults() {
         .and_then(serde_json::Value::as_object_mut)
         .expect("the captured response should contain status");
     assert!(status.remove("runtime_apply").is_some());
+    assert!(status.remove("upload_total_bytes").is_some());
+    assert!(status.remove("download_total_bytes").is_some());
+    assert!(status.remove("memory_bytes").is_some());
+    assert!(status.remove("connections").is_some());
 
     let legacy_socket = TempSocket::new("legacy-status-response");
     let listener = bind_private_listener(legacy_socket.path())
@@ -507,6 +527,10 @@ fn legacy_status_without_core_restart_decodes_with_inactive_defaults() {
     assert_eq!(status.core.restart, CoreRestartStatus::default());
     assert!(status.supervisor.health_reasons.is_empty());
     assert_eq!(status.runtime_apply, RuntimeApplySnapshot::default());
+    assert_eq!(status.upload_total_bytes, 0);
+    assert_eq!(status.download_total_bytes, 0);
+    assert_eq!(status.memory_bytes, None);
+    assert!(status.connections.is_empty());
     fixture.join().expect("legacy fixture should stop");
 }
 

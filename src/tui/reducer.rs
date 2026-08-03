@@ -87,6 +87,7 @@ pub enum UiIntent {
     SubmitRuleEditor,
     ConfirmRuleRemoval,
     SelectRule(usize),
+    SelectConnection(usize),
     SelectLog {
         tail_offset: usize,
     },
@@ -110,7 +111,6 @@ pub enum UiIntent {
     SetLogLevel(LogLevelFilter),
     ToggleLogPause,
     FollowLogs,
-    ToggleProxyDetail,
     ToggleZoom,
     ToggleHelp,
     CloseModal,
@@ -244,12 +244,12 @@ pub fn update(state: &mut AppState, event: UiEvent) -> Vec<Command> {
                 if runtime_changed {
                     commands.extend(invalidate_rule_cache(state));
                 }
-                state.status = Some(status);
+                state.set_status_preserving_connection_selection(status);
+                state.clamp_selections();
                 state.status_revision = state.status_revision.wrapping_add(1).max(1);
                 if collection_changed {
                     state.bump_view_revision();
                 }
-                state.push_traffic_sample();
                 state.render_dirty = true;
                 if runtime_changed && state.page == Page::Rules {
                     commands.extend(ensure_rules_loaded(state));
@@ -607,14 +607,22 @@ fn apply_intent(state: &mut AppState, intent: UiIntent) -> Vec<Command> {
         UiIntent::SelectRule(index) => {
             if state.rules_projection_ready() {
                 state.rules.selected = clamp_index(index, state.filtered_rule_count());
-                state.rules.scroll = state.rules.selected;
+                keep_selection_visible(state, ListSelection::Rules);
                 state.focus = Focus::Content;
             }
+            Vec::new()
+        }
+        UiIntent::SelectConnection(index) => {
+            state.connections.selected = clamp_index(index, state.connection_record_count());
+            keep_selection_visible(state, ListSelection::Connections);
+            state.focus = Focus::Content;
             Vec::new()
         }
         UiIntent::SelectLog { tail_offset } => {
             let filtered_count = state.filtered_log_count();
             if state.page == Page::Logs && state.modal.is_none() && tail_offset < filtered_count {
+                let visible = visible_row_count(state);
+                state.logs.viewport_start = visible_log_start(&state.logs, filtered_count, visible);
                 state.logs.follow = false;
                 state.logs.scroll = tail_offset;
                 state.focus = Focus::Content;
@@ -655,6 +663,7 @@ fn apply_intent(state: &mut AppState, intent: UiIntent) -> Vec<Command> {
         UiIntent::SetLogLevel(level) => {
             state.logs.level_filter = level;
             state.logs.scroll = 0;
+            state.logs.viewport_start = 0;
             Vec::new()
         }
         UiIntent::ToggleLogPause => {
@@ -662,6 +671,7 @@ fn apply_intent(state: &mut AppState, intent: UiIntent) -> Vec<Command> {
                 state.logs.paused = false;
                 state.logs.follow = true;
                 state.logs.scroll = 0;
+                state.logs.viewport_start = 0;
                 vec![Command::FetchLogTail {
                     connection_generation: state.connection.generation,
                     after_sequence: state.logs.paused_anchor.take(),
@@ -676,13 +686,7 @@ fn apply_intent(state: &mut AppState, intent: UiIntent) -> Vec<Command> {
         UiIntent::FollowLogs => {
             state.logs.follow = true;
             state.logs.scroll = 0;
-            Vec::new()
-        }
-        UiIntent::ToggleProxyDetail => {
-            if state.page == Page::Proxies && state.focus == Focus::Content {
-                state.proxy_detail_open = !state.proxy_detail_open;
-                state.zoomed_focus = false;
-            }
+            state.logs.viewport_start = 0;
             Vec::new()
         }
         UiIntent::ToggleZoom => {
@@ -783,7 +787,7 @@ fn switch_page(state: &mut AppState, page: Page) -> Vec<Command> {
 }
 
 fn available_focuses(state: &AppState) -> &'static [Focus] {
-    const OVERVIEW: &[Focus] = &[
+    const SIMPLE: &[Focus] = &[
         Focus::Tabs,
         Focus::Content,
         Focus::FooterHelp,
@@ -797,7 +801,7 @@ fn available_focuses(state: &AppState) -> &'static [Focus] {
         Focus::FooterHelp,
         Focus::FooterQuit,
     ];
-    const CONNECTIONS: &[Focus] = OVERVIEW;
+    const CONNECTIONS: &[Focus] = SIMPLE;
     const SEARCHABLE: &[Focus] = &[
         Focus::Tabs,
         Focus::Content,
@@ -819,7 +823,6 @@ fn available_focuses(state: &AppState) -> &'static [Focus] {
             | Modal::Message { .. },
         ) => MODAL,
         None => match state.page {
-            Page::Overview => OVERVIEW,
             Page::Proxies => PROXIES,
             Page::Connections => CONNECTIONS,
             Page::Rules | Page::Logs => SEARCHABLE,
@@ -875,13 +878,12 @@ fn escape(state: &mut AppState) -> Vec<Command> {
         state.focus = Focus::Content;
     } else if state.focus == Focus::Search {
         state.focus = Focus::Content;
-    } else if state.page == Page::Proxies && state.proxy_detail_open {
-        state.proxy_detail_open = false;
     } else if state.zoomed_focus {
         state.zoomed_focus = false;
     } else if state.page == Page::Logs && !state.logs.follow {
         state.logs.follow = true;
         state.logs.scroll = 0;
+        state.logs.viewport_start = 0;
     } else if state.page == Page::Proxies
         && state.focus == Focus::Content
         && state.terminal_width < 90
@@ -1162,7 +1164,6 @@ fn current_search_mut(state: &mut AppState) -> Option<&mut String> {
         return Some(&mut state.profiles.filter);
     }
     match state.page {
-        Page::Overview => None,
         Page::Proxies => Some(&mut state.proxies.filter),
         Page::Connections => None,
         Page::Rules => Some(&mut state.rules.filter),
@@ -1185,32 +1186,49 @@ fn move_selection(state: &mut AppState, delta: isize) {
             state.filtered_profile_count(),
             delta,
         );
-        state.profiles.scroll = state.profiles.selected;
+        keep_selection_visible(state, ListSelection::Profiles);
         return;
     }
     match state.page {
-        Page::Overview => {}
         Page::Proxies => {
             state.proxies.selected =
                 moved_index(state.proxies.selected, state.filtered_proxy_count(), delta);
-            state.proxies.scroll = state.proxies.selected;
+            keep_selection_visible(state, ListSelection::Proxies);
         }
-        Page::Connections => {}
+        Page::Connections => {
+            state.connections.selected = moved_index(
+                state.connections.selected,
+                state.connection_record_count(),
+                delta,
+            );
+            keep_selection_visible(state, ListSelection::Connections);
+        }
         Page::Rules if state.rules_projection_ready() => {
             state.rules.selected =
                 moved_index(state.rules.selected, state.filtered_rule_count(), delta);
-            state.rules.scroll = state.rules.selected;
+            keep_selection_visible(state, ListSelection::Rules);
         }
         Page::Rules => {}
         Page::Logs => {
             let filtered_count = state.filtered_log_count();
             if filtered_count > 0 {
+                let visible = visible_row_count(state);
+                let was_following = state.logs.follow;
                 state.logs.follow = false;
                 state.logs.scroll = if delta < 0 {
                     state.logs.scroll.saturating_add(1).min(filtered_count - 1)
                 } else {
                     state.logs.scroll.saturating_sub(1)
                 };
+                let selected = selected_log_position(&state.logs, filtered_count)
+                    .unwrap_or(filtered_count.saturating_sub(1));
+                let start = if was_following {
+                    filtered_count.saturating_sub(visible)
+                } else {
+                    state.logs.viewport_start
+                };
+                state.logs.viewport_start =
+                    visible_window_start(start, selected, visible, filtered_count);
             }
         }
     }
@@ -1273,8 +1291,63 @@ fn activate_selected(state: &mut AppState) -> Vec<Command> {
         Page::Rules => Vec::new(),
         Page::Connections => Vec::new(),
         Page::Logs => apply_intent(state, UiIntent::ToggleLogPause),
-        Page::Overview => Vec::new(),
     }
+}
+
+#[derive(Clone, Copy)]
+enum ListSelection {
+    Profiles,
+    Proxies,
+    Connections,
+    Rules,
+}
+
+fn keep_selection_visible(state: &mut AppState, selection: ListSelection) {
+    let visible = visible_row_count(state);
+    match selection {
+        ListSelection::Profiles => {
+            let total = state.filtered_profile_count();
+            state.profiles.scroll = visible_window_start(
+                state.profiles.scroll,
+                state.profiles.selected,
+                visible,
+                total,
+            );
+        }
+        ListSelection::Proxies => {
+            let total = state.filtered_proxy_count();
+            state.proxies.scroll =
+                visible_window_start(state.proxies.scroll, state.proxies.selected, visible, total);
+        }
+        ListSelection::Connections => {
+            let total = state.connection_record_count();
+            state.connections.scroll = visible_window_start(
+                state.connections.scroll,
+                state.connections.selected,
+                visible,
+                total,
+            );
+        }
+        ListSelection::Rules => {
+            let total = state.filtered_rule_count();
+            state.rules.scroll =
+                visible_window_start(state.rules.scroll, state.rules.selected, visible, total);
+        }
+    }
+}
+
+fn visible_row_count(state: &AppState) -> usize {
+    state
+        .interaction_map()
+        .and_then(|map| map.scroll_regions.last())
+        .map_or(usize::MAX, |region| {
+            let height = region.area.height as usize;
+            if state.modal == Some(Modal::Profiles) || state.page == Page::Logs {
+                height
+            } else {
+                height.saturating_sub(1)
+            }
+        })
 }
 
 fn issue_profile_activation(state: &mut AppState, profile_id: ProfileId) -> Vec<Command> {
@@ -1300,6 +1373,15 @@ fn issue_node_selection(
     group_id: ProxyGroupId,
     node_id: NodeRecordId,
 ) -> Vec<Command> {
+    if !state
+        .proxies
+        .groups
+        .iter()
+        .find(|group| group.id == group_id)
+        .is_some_and(|group| group.selectable)
+    {
+        return Vec::new();
+    }
     let request_id = state.take_request_id();
     let mut commands = cancel_pending(state);
     state.pending = Some(PendingOperation {

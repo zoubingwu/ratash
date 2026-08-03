@@ -129,7 +129,11 @@ fn telemetry_accepts_only_the_current_core_generation() {
         TelemetryStore::new(first, 4, 8, 3).expect("fixture limits should be valid");
 
     assert!(telemetry.publish_traffic(first, traffic(10, 20, 1)));
-    assert!(telemetry.publish_connections(first, 7));
+    assert!(telemetry.publish_connections(first, 7, 70, 140, Some(280), Vec::new()));
+    assert_eq!(telemetry.connection_count(), Some(7));
+    assert_eq!(telemetry.upload_total_bytes(), Some(70));
+    assert_eq!(telemetry.download_total_bytes(), Some(140));
+    assert_eq!(telemetry.memory_bytes(), Some(280));
     assert!(
         telemetry
             .publish_log(first, 1, LogLevel::Info, LogSource::CoreApi, "ready")
@@ -139,13 +143,16 @@ fn telemetry_accepts_only_the_current_core_generation() {
     telemetry.replace_core(second);
 
     assert!(!telemetry.publish_traffic(first, traffic(30, 40, 2)));
-    assert!(!telemetry.publish_connections(first, 99));
+    assert!(!telemetry.publish_connections(first, 99, 990, 1_980, Some(3_960), Vec::new()));
     assert!(
         !telemetry
             .publish_log(first, 2, LogLevel::Warn, LogSource::Stderr, "stale")
             .expect("stale generation is a normal discard")
     );
     assert_eq!(telemetry.connection_count(), None);
+    assert_eq!(telemetry.upload_total_bytes(), None);
+    assert_eq!(telemetry.download_total_bytes(), None);
+    assert_eq!(telemetry.memory_bytes(), None);
     assert_eq!(telemetry.latest_traffic(), None);
     assert_eq!(messages(&telemetry.logs().records()), ["ready"]);
 }

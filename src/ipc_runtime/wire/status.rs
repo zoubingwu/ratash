@@ -3,13 +3,17 @@
 use serde::{Deserialize, Serialize};
 
 use crate::application::{LogGap, LogMetadata};
+use crate::constants::{
+    CONNECTION_CHAIN_CAPACITY, CONNECTION_FIELD_MAX_BYTES, CONNECTION_RECORD_CAPACITY,
+};
 use crate::domain::{
-    ActiveProfileSummary, ApplyState, CoreDiagnosticCategory, CoreInstanceGeneration,
-    CoreLifecycle, CoreRestartStatus, CoreStatus, LatencySample, NodeRecordId, ProbeGeneration,
-    ProbeQueueStatus, ProfileId, RuntimeApplyPhase, RuntimeApplySnapshot, RuntimeGeneration,
-    RuntimeRecoverySnapshot, RuntimeRecoveryStatus, SampleState, SelectedNodeSummary,
-    StatusSnapshot, StreamHealthSet, StreamState, SupervisorHealthReason, SupervisorLifecycle,
-    SupervisorStatus, TrafficSample, TunReason, TunStatus,
+    ActiveProfileSummary, ApplyState, ConnectionRecord, CoreDiagnosticCategory,
+    CoreInstanceGeneration, CoreLifecycle, CoreRestartStatus, CoreStatus, LatencySample,
+    NodeRecordId, ProbeGeneration, ProbeQueueStatus, ProfileId, RuntimeApplyPhase,
+    RuntimeApplySnapshot, RuntimeGeneration, RuntimeRecoverySnapshot, RuntimeRecoveryStatus,
+    SampleState, SelectedNodeSummary, StatusSnapshot, StreamHealthSet, StreamState,
+    SupervisorHealthReason, SupervisorLifecycle, SupervisorStatus, TrafficSample, TunReason,
+    TunStatus,
 };
 
 use super::WireConversionError;
@@ -85,6 +89,14 @@ pub(super) struct WireStatusSnapshot {
     latency: Option<WireLatencySample>,
     traffic: WireTrafficSample,
     connection_count: u64,
+    #[serde(default)]
+    upload_total_bytes: u64,
+    #[serde(default)]
+    download_total_bytes: u64,
+    #[serde(default)]
+    memory_bytes: Option<u64>,
+    #[serde(default)]
+    connections: Vec<WireConnectionRecord>,
     runtime_generation: Option<u64>,
     apply_state: WireApplyState,
     #[serde(default)]
@@ -108,6 +120,10 @@ impl From<StatusSnapshot> for WireStatusSnapshot {
             latency: status.latency.map(Into::into),
             traffic: status.traffic.into(),
             connection_count: status.connection_count,
+            upload_total_bytes: status.upload_total_bytes,
+            download_total_bytes: status.download_total_bytes,
+            memory_bytes: status.memory_bytes,
+            connections: status.connections.into_iter().map(Into::into).collect(),
             runtime_generation: status.runtime_generation.map(|generation| generation.0),
             apply_state: status.apply_state.into(),
             runtime_apply: Some(status.runtime_apply.into()),
@@ -122,6 +138,14 @@ impl TryFrom<WireStatusSnapshot> for StatusSnapshot {
     type Error = WireConversionError;
 
     fn try_from(status: WireStatusSnapshot) -> Result<Self, Self::Error> {
+        if status.connections.len() > CONNECTION_RECORD_CAPACITY {
+            return Err(WireConversionError);
+        }
+        let connections = status
+            .connections
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, _>>()?;
         let runtime_generation = status.runtime_generation.map(RuntimeGeneration);
         let apply_state: ApplyState = status.apply_state.into();
         let runtime_apply = status.runtime_apply.map_or_else(
@@ -148,12 +172,83 @@ impl TryFrom<WireStatusSnapshot> for StatusSnapshot {
             latency: status.latency.map(TryInto::try_into).transpose()?,
             traffic: status.traffic.into(),
             connection_count: status.connection_count,
+            upload_total_bytes: status.upload_total_bytes,
+            download_total_bytes: status.download_total_bytes,
+            memory_bytes: status.memory_bytes,
+            connections,
             runtime_generation,
             apply_state,
             runtime_apply,
             selection_restore_pending: status.selection_restore_pending,
             probe_queue: status.probe_queue.try_into()?,
             stream_health: status.stream_health.into(),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct WireConnectionRecord {
+    id: String,
+    network: String,
+    host: Option<String>,
+    destination_ip: Option<String>,
+    destination_port: Option<String>,
+    chains: Vec<String>,
+    rule: String,
+    rule_payload: Option<String>,
+    upload_bytes: u64,
+    download_bytes: u64,
+}
+
+impl From<ConnectionRecord> for WireConnectionRecord {
+    fn from(connection: ConnectionRecord) -> Self {
+        Self {
+            id: connection.id,
+            network: connection.network,
+            host: connection.host,
+            destination_ip: connection.destination_ip,
+            destination_port: connection.destination_port,
+            chains: connection.chains,
+            rule: connection.rule,
+            rule_payload: connection.rule_payload,
+            upload_bytes: connection.upload_bytes,
+            download_bytes: connection.download_bytes,
+        }
+    }
+}
+
+impl TryFrom<WireConnectionRecord> for ConnectionRecord {
+    type Error = WireConversionError;
+
+    fn try_from(connection: WireConnectionRecord) -> Result<Self, Self::Error> {
+        let fields = [
+            connection.id.as_str(),
+            connection.network.as_str(),
+            connection.host.as_deref().unwrap_or_default(),
+            connection.destination_ip.as_deref().unwrap_or_default(),
+            connection.destination_port.as_deref().unwrap_or_default(),
+            connection.rule.as_str(),
+            connection.rule_payload.as_deref().unwrap_or_default(),
+        ];
+        if connection.chains.len() > CONNECTION_CHAIN_CAPACITY
+            || fields
+                .into_iter()
+                .chain(connection.chains.iter().map(String::as_str))
+                .any(|field| field.len() > CONNECTION_FIELD_MAX_BYTES)
+        {
+            return Err(WireConversionError);
+        }
+        Ok(Self {
+            id: connection.id,
+            network: connection.network,
+            host: connection.host,
+            destination_ip: connection.destination_ip,
+            destination_port: connection.destination_port,
+            chains: connection.chains,
+            rule: connection.rule,
+            rule_payload: connection.rule_payload,
+            upload_bytes: connection.upload_bytes,
+            download_bytes: connection.download_bytes,
         })
     }
 }

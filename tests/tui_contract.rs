@@ -11,19 +11,18 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 
-use ratash::application::{LatencyFreshness, LatencyProbeStatus, PolicyTargetValidation};
+use ratash::application::PolicyTargetValidation;
 use ratash::constants::{
     CORE_LOG_LINE_MAX_BYTES, LOCAL_RULE_COUNT_MAX, LOG_CAPACITY, LOG_RETENTION_MAX_BYTES,
-    MAX_ACTIVE_NODES, MINIMUM_TERMINAL_HEIGHT, MINIMUM_TERMINAL_WIDTH, TRAFFIC_SERIES_CAPACITY,
-    TUI_SEARCH_MAX_BYTES, TUI_SEARCH_MAX_CHARACTERS,
+    MAX_ACTIVE_NODES, MINIMUM_TERMINAL_HEIGHT, MINIMUM_TERMINAL_WIDTH, TUI_SEARCH_MAX_BYTES,
+    TUI_SEARCH_MAX_CHARACTERS,
 };
 use ratash::domain::{
-    ActiveProfileSummary, ApplyState, CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus,
-    CoreStatus, LocalRuleSetRevision, NodeRecordId, ProbeQueueStatus, ProfileId, ProxyGroupId,
-    RuntimeApplyPhase, RuntimeApplySnapshot, RuntimeGeneration, RuntimeRecoverySnapshot,
-    RuntimeRecoveryStatus, SampleState, SelectedNodeSummary, StatusSnapshot, StreamHealthSet,
-    StreamState, SupervisorHealthReason, SupervisorLifecycle, SupervisorStatus, TrafficSample,
-    TunReason, TunStatus,
+    ActiveProfileSummary, ApplyState, ConnectionRecord, CoreLifecycle, CoreStatus,
+    LocalRuleSetRevision, NodeRecordId, ProbeQueueStatus, ProfileId, ProxyGroupId,
+    RuntimeApplyPhase, RuntimeApplySnapshot, RuntimeGeneration, SampleState, SelectedNodeSummary,
+    StatusSnapshot, StreamHealthSet, StreamState, SupervisorHealthReason, SupervisorLifecycle,
+    SupervisorStatus, TrafficSample, TunStatus,
 };
 use ratash::ipc::RequestId;
 use ratash::telemetry::{LogLevel, LogSource};
@@ -37,22 +36,248 @@ use ratash::tui::{
 };
 
 #[test]
-fn all_five_pages_render_their_primary_content() {
+fn all_four_pages_render_their_primary_content() {
     let mut state = connected_state();
     for (page, expected) in [
-        (Page::Overview, "Work"),
         (Page::Proxies, "Tokyo"),
-        (Page::Connections, "3"),
+        (Page::Connections, "example.com:443"),
         (Page::Rules, "DOMAIN-SUFFIX"),
         (Page::Logs, "connected to Core"),
     ] {
         state.page = page;
         let (text, _) = render_with_backend(&state, 100, 30);
         assert!(text.contains(expected), "{page:?} should render {expected}");
-        for title in ["Overview", "Proxies", "Connections", "Rules", "Logs"] {
+        for title in ["Proxies", "Connections", "Rules", "Logs"] {
             assert!(text.contains(title));
         }
     }
+}
+
+#[test]
+fn global_header_uses_two_status_rows_above_navigation() {
+    let state = connected_state();
+    let area = Rect::new(0, 0, 160, 30);
+    let (regions, _) = ratash::tui::compute_layout(&state, area, 1);
+    let (text, _) = render_with_backend(&state, 160, 30);
+    let lines = text.lines().collect::<Vec<_>>();
+
+    assert_eq!(regions.status.height, 2);
+    assert_eq!(regions.navigation.y, area.y + 2);
+    assert!(lines[0].contains("Profile:"));
+    assert!(lines[0].contains("Work"));
+    assert!(lines[0].contains("Node:"));
+    assert!(lines[0].contains("Tokyo"));
+    assert!(lines[0].contains("Traffic:"));
+    assert!(lines[0].find("Traffic:").is_some_and(|column| column > 100));
+    assert!(lines[1].contains("Connections: 3"));
+    assert!(lines[1].contains("Total:"));
+    assert!(lines[1].contains("Memory:"));
+    assert!(lines[1].contains("Mihomo: v1.19.28"));
+    assert!(lines[1].contains("Mode: RULE"));
+    assert!(lines[1].contains("Mixed: OFF"));
+    assert!(lines[2].contains("Proxies"));
+    assert!(lines[2].contains("Connections"));
+}
+
+#[test]
+fn logs_default_to_info_from_the_mihomo_api() {
+    let mut state = connected_state();
+    state.page = Page::Logs;
+    let mut process_log = log(2, LogLevel::Info, "Managed Core startup output");
+    process_log.source = LogSource::Stdout;
+    state.logs.records = VecDeque::from([
+        log(
+            1,
+            LogLevel::Info,
+            "[TCP] api.github.com:443 match DomainKeyword(github) using Manual",
+        ),
+        process_log,
+    ]);
+
+    let (text, _) = render_with_backend(&state, 160, 30);
+
+    assert_eq!(state.logs.level_filter, LogLevelFilter::Info);
+    assert!(text.contains("api.github.com:443"));
+    assert!(!text.contains("Managed Core startup output"));
+}
+
+#[test]
+fn connections_page_renders_target_rule_chain_and_traffic() {
+    let mut state = connected_state();
+    state.page = Page::Connections;
+
+    let (text, _) = render_with_backend(&state, 140, 30);
+
+    for expected in [
+        "example.com:443",
+        "DOMAIN-SUFFIX · example.com",
+        "provider-only",
+        "Manual",
+        "2.0 KiB",
+        "1.0 KiB",
+    ] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+    assert!(!text.contains("bounded Core projection"));
+    assert!(!text.contains("Traffic sample"));
+}
+
+#[test]
+fn automatic_proxy_groups_are_browsable_and_read_only() {
+    let mut state = connected_state();
+    state.page = Page::Proxies;
+    state.proxies.groups[0].proxy_type = "URLTest".to_owned();
+    state.proxies.groups[0].selectable = false;
+
+    let (text, map) = render_with_backend(&state, 140, 30);
+    let commands = update(&mut state, UiEvent::Intent(UiIntent::ActivateSelected));
+
+    assert!(text.contains("Automatic · URLTest"));
+    assert!(
+        map.interactions
+            .iter()
+            .all(|interaction| !matches!(interaction.intent, UiIntent::SelectNode { .. }))
+    );
+    assert!(commands.is_empty());
+    assert!(state.proxies.selection_pending.is_none());
+}
+
+#[test]
+fn keyboard_and_mouse_connection_selection_target_the_same_row() {
+    let mut base = connected_state();
+    base.page = Page::Connections;
+    let mut second = base
+        .status
+        .as_ref()
+        .expect("fixture status should exist")
+        .connections[0]
+        .clone();
+    second.id = "second-connection".to_owned();
+    second.host = Some("second.example.com".to_owned());
+    base.status
+        .as_mut()
+        .expect("fixture status should exist")
+        .connections
+        .push(second);
+
+    let mut keyboard = base.clone();
+    let (_, keyboard_map) = render_with_backend(&keyboard, 100, 30);
+    keyboard.publish_interaction_map(keyboard_map);
+    update(
+        &mut keyboard,
+        UiEvent::Terminal(TerminalInput::Key(KeyInput::Down)),
+    );
+
+    let mut mouse = base;
+    let (_, mouse_map) = render_with_backend(&mouse, 100, 30);
+    let hit = hit_for(&mouse_map, |intent| {
+        *intent == UiIntent::SelectConnection(1)
+    });
+    mouse.publish_interaction_map(mouse_map);
+    update(
+        &mut mouse,
+        UiEvent::Terminal(TerminalInput::Mouse(MouseInput {
+            kind: MouseInputKind::LeftClick,
+            column: hit.0,
+            row: hit.1,
+        })),
+    );
+
+    assert_eq!(keyboard.connections.selected, 1);
+    assert_eq!(mouse.connections.selected, keyboard.connections.selected);
+}
+
+#[test]
+fn proxy_selection_moves_inside_the_viewport_before_the_list_scrolls() {
+    let mut state = connected_state();
+    state.page = Page::Proxies;
+    state.proxies.rows = (0..40)
+        .map(|index| proxy(&format!("Node {index:02}"), index == 0))
+        .collect();
+    let (_, map) = render_with_backend(&state, 100, 24);
+    let visible = map
+        .scroll_regions
+        .first()
+        .expect("Proxy list should be scrollable")
+        .area
+        .height
+        .saturating_sub(1) as usize;
+    state.publish_interaction_map(map);
+
+    for _ in 1..visible {
+        update(&mut state, UiEvent::Intent(UiIntent::MoveDown));
+    }
+    assert_eq!(state.proxies.selected, visible.saturating_sub(1));
+    assert_eq!(state.proxies.scroll, 0);
+
+    update(&mut state, UiEvent::Intent(UiIntent::MoveDown));
+    assert_eq!(state.proxies.selected, visible);
+    assert_eq!(state.proxies.scroll, 1);
+
+    update(&mut state, UiEvent::Intent(UiIntent::MoveUp));
+    assert_eq!(state.proxies.scroll, 1);
+}
+
+#[test]
+fn rule_selection_moves_inside_the_viewport_before_the_list_scrolls() {
+    let mut state = connected_state();
+    state.page = Page::Rules;
+    let template = state.rules.rows[0].clone();
+    state.rules.rows = (0..40)
+        .map(|index| RuleRow {
+            index,
+            rule_string: format!("DOMAIN,example-{index}.com,Automatic"),
+            payload: Some(format!("example-{index}.com")),
+            ..template.clone()
+        })
+        .collect();
+    let (_, map) = render_with_backend(&state, 100, 24);
+    let visible = map
+        .scroll_regions
+        .first()
+        .expect("Rule list should be scrollable")
+        .area
+        .height
+        .saturating_sub(1) as usize;
+    state.publish_interaction_map(map);
+
+    for _ in 1..visible {
+        update(&mut state, UiEvent::Intent(UiIntent::MoveDown));
+    }
+    assert_eq!(state.rules.scroll, 0);
+    update(&mut state, UiEvent::Intent(UiIntent::MoveDown));
+    assert_eq!(state.rules.scroll, 1);
+    update(&mut state, UiEvent::Intent(UiIntent::MoveUp));
+    assert_eq!(state.rules.scroll, 1);
+}
+
+#[test]
+fn log_selection_moves_inside_the_viewport_before_the_list_scrolls() {
+    let mut state = connected_state();
+    state.page = Page::Logs;
+    state.logs.records = (0..40)
+        .map(|index| log(index, LogLevel::Info, &format!("message {index}")))
+        .collect();
+    state.logs.follow = false;
+    state.logs.scroll = state.logs.records.len().saturating_sub(1);
+    state.logs.viewport_start = 0;
+    let (_, map) = render_with_backend(&state, 100, 24);
+    let visible = map
+        .scroll_regions
+        .first()
+        .expect("Log list should be scrollable")
+        .area
+        .height as usize;
+    state.publish_interaction_map(map);
+
+    for _ in 1..visible {
+        update(&mut state, UiEvent::Intent(UiIntent::MoveDown));
+    }
+    assert_eq!(state.logs.viewport_start, 0);
+    update(&mut state, UiEvent::Intent(UiIntent::MoveDown));
+    assert_eq!(state.logs.viewport_start, 1);
+    update(&mut state, UiEvent::Intent(UiIntent::MoveUp));
+    assert_eq!(state.logs.viewport_start, 1);
 }
 
 #[test]
@@ -163,7 +388,7 @@ fn failed_rule_load_is_distinct_from_uninitialized_or_prior_rule_state() {
             result: Err("Rule projection unavailable".to_owned()),
         },
     );
-    let (text, _) = render_with_backend(&state, 100, 30);
+    let (text, _) = render_with_backend(&state, 160, 30);
 
     assert!(text.contains("Rule load failed: Rule projection unavailable"));
     assert!(!text.contains("DOMAIN-SUFFIX"));
@@ -627,58 +852,6 @@ fn profile_activation_requeues_a_cancelled_rule_load() {
 }
 
 #[test]
-fn overview_renders_probe_queue_overload_metrics() {
-    let mut state = connected_state();
-    let status = state
-        .status
-        .as_mut()
-        .expect("the connected fixture should have status");
-    status.probe_queue = ProbeQueueStatus {
-        active_node_count: 10,
-        queue_depth: 7,
-        in_flight_count: 2,
-        overloaded: true,
-        oldest_due_age_ms: Some(12_345),
-        estimated_full_pass_duration_ms: 30_000,
-        stale_node_count: 4,
-    };
-    status.selection_restore_pending = true;
-
-    let (text, _) = render_with_backend(&state, 120, 32);
-
-    assert!(text.contains("Probe Queue: overloaded"));
-    assert!(text.contains("Selection Restore: pending"));
-    assert!(text.contains("queued 7, in-flight 2, stale 40.0%"));
-    assert!(text.contains("oldest 12345 ms, full pass 30000 ms"));
-}
-
-#[test]
-fn overview_renders_core_restart_and_tun_diagnostics() {
-    let mut state = connected_state();
-    let status = state
-        .status
-        .as_mut()
-        .expect("the connected fixture should have status");
-    status.core.lifecycle = CoreLifecycle::Starting;
-    status.core.restart = CoreRestartStatus {
-        pending: true,
-        attempts: 2,
-        backoff_ms: Some(4_000),
-        diagnostic: Some(CoreDiagnosticCategory::RestartLimitReached),
-    };
-    status.tun.capable = false;
-    status.tun.effective = false;
-    status.tun.reason = Some(TunReason::PermissionDenied);
-
-    let (text, _) = render_with_backend(&state, 80, 24);
-
-    assert!(text.contains("Restart: on, tries=2, wait=4000 ms"));
-    assert!(text.contains("Diagnostic: core_restart_limit_reached"));
-    assert!(text.contains("TUN: off, cap=no, permission_denied"));
-    assert!(text.contains("Connections: 3 | Uptime: 60s"));
-}
-
-#[test]
 fn header_health_reflects_a_stopped_managed_core() {
     let mut state = connected_state();
     state
@@ -688,7 +861,7 @@ fn header_health_reflects_a_stopped_managed_core() {
         .core
         .lifecycle = CoreLifecycle::Stopped;
 
-    let (text, _) = render_with_backend(&state, 100, 30);
+    let (text, _) = render_with_backend(&state, 160, 30);
     let header = text.lines().next().expect("header row should exist");
 
     assert!(header.contains("STOPPED"));
@@ -707,7 +880,7 @@ fn shared_header_uses_one_healthy_dot_and_an_active_navigation_segment() {
         .count();
     assert_eq!(healthy_header_cells, 1);
     let separator = (area.x..area.right())
-        .map(|column| buffer[(column, area.y + 2)].symbol())
+        .map(|column| buffer[(column, area.y + 3)].symbol())
         .collect::<String>();
     assert!(separator.contains('━'));
 }
@@ -726,9 +899,17 @@ fn minimum_width_header_keeps_status_profile_mode_tun_and_live_metrics() {
     status.connection_count = 428;
 
     let (text, _) = render_with_backend(&state, 80, 24);
-    let header = text.lines().next().expect("header row should exist");
+    let header = text.lines().take(3).collect::<Vec<_>>().join("\n");
 
-    for expected in ["● UP", "[RULE]", "[TUN]", "↓18.0M", "↑2.0M", "428"] {
+    for expected in [
+        "● UP",
+        "Profile:",
+        "Node:",
+        "Traffic:",
+        "↓18.0M",
+        "↑2.0M",
+        "Connections: 428",
+    ] {
         assert!(
             header.contains(expected),
             "compact header should retain {expected}: {header}"
@@ -749,8 +930,8 @@ fn standard_header_truncates_long_profile_before_live_metrics() {
     status.traffic.upload_bytes_per_second = 2 * 1024 * 1024;
     status.connection_count = 428;
 
-    let (text, _) = render_with_backend(&state, 100, 30);
-    let header = text.lines().next().expect("header row should exist");
+    let (text, _) = render_with_backend(&state, 160, 30);
+    let header = text.lines().take(3).collect::<Vec<_>>().join("\n");
 
     for expected in [
         "CONNECTED",
@@ -758,7 +939,7 @@ fn standard_header_truncates_long_profile_before_live_metrics() {
         "TUN: ON",
         "↓ 18.0 MiB/s",
         "↑ 2.0 MiB/s",
-        "428 conn",
+        "Connections: 428",
     ] {
         assert!(
             header.contains(expected),
@@ -786,7 +967,7 @@ fn footer_hints_follow_the_active_focus_and_hide_inactive_globals() {
     state.focus = Focus::Content;
     let (nodes, _) = render_with_backend(&state, 80, 24);
     let nodes_footer = nodes.lines().last().expect("footer row should exist");
-    for expected in ["Enter Select", "d Details", "[?] Help", "[q] Quit"] {
+    for expected in ["Enter Select", "p Profiles", "[?] Help", "[q] Quit"] {
         assert!(
             nodes_footer.contains(expected),
             "missing {expected}: {nodes_footer}"
@@ -839,7 +1020,7 @@ fn healthy_header_dot_is_the_only_green_cell_on_standard_pages() {
     let area = Rect::new(0, 0, 180, 30);
     let mut state = connected_state();
 
-    for page in [Page::Overview, Page::Connections, Page::Rules, Page::Logs] {
+    for page in [Page::Proxies, Page::Connections, Page::Rules, Page::Logs] {
         state.page = page;
         let mut buffer = Buffer::empty(area);
         render_buffer(&state, area, &mut buffer);
@@ -891,7 +1072,7 @@ fn proxy_search_and_current_node_use_the_cyan_gray_selection_palette() {
     }));
     assert!((list.x..list.right()).any(|column| {
         node_buffer[(column, current_row)].symbol() == "T"
-            && node_buffer[(column, current_row)].fg == Color::Gray
+            && node_buffer[(column, current_row)].fg == Color::Cyan
     }));
 }
 
@@ -900,6 +1081,7 @@ fn selected_log_renders_a_sanitized_detail_and_full_row_muted_cyan_highlight() {
     let area = Rect::new(0, 0, 100, 30);
     let mut state = connected_state();
     state.page = Page::Logs;
+    state.logs.level_filter = LogLevelFilter::All;
     state.logs.records = VecDeque::from([
         log(1, LogLevel::Info, "first"),
         log(2, LogLevel::Warn, "selected\u{1b}message"),
@@ -938,27 +1120,27 @@ fn selected_log_renders_a_sanitized_detail_and_full_row_muted_cyan_highlight() {
 }
 
 #[test]
-fn degraded_header_replaces_live_metrics_with_the_recovery_reason() {
+fn degraded_header_keeps_primary_metrics_and_shows_the_recovery_reason() {
     let mut state = connected_state();
     let status = state.status.as_mut().expect("fixture status should exist");
     status.supervisor.lifecycle = SupervisorLifecycle::Degraded;
     status.supervisor.health_reasons = vec![SupervisorHealthReason::RuntimeRecovery];
 
     let (text, _) = render_with_backend(&state, 120, 30);
-    let header = text.lines().next().expect("header row should exist");
+    let header = text.lines().take(3).collect::<Vec<_>>().join("\n");
 
     assert!(header.contains("Recovery: runtime_recovery"));
-    assert!(!header.contains('↓'));
-    assert!(!header.contains(" conn"));
+    assert!(header.contains('↓'));
+    assert!(header.contains("Connections: 3"));
 }
 
 #[test]
 fn compact_pages_keep_controls_and_visualizations_within_their_contract() {
     let mut state = connected_state();
-    let (overview, _) = render_with_backend(&state, 100, 30);
-    assert!(!overview.contains("Apply:"));
-    assert!(!overview.contains("Recovery:"));
-    assert!(!overview.contains("Diagnostic:"));
+    let (page, _) = render_with_backend(&state, 100, 30);
+    assert!(!page.contains("Apply:"));
+    assert!(!page.contains("Recovery:"));
+    assert!(!page.contains("Diagnostic:"));
 
     state.page = Page::Logs;
     state.logs.search = "openai".to_owned();
@@ -976,66 +1158,6 @@ fn compact_pages_keep_controls_and_visualizations_within_their_contract() {
 }
 
 #[test]
-fn overview_renders_the_final_stopped_supervisor_lifecycle() {
-    let mut state = connected_state();
-    let status = state
-        .status
-        .as_mut()
-        .expect("the connected fixture should have status");
-    status.supervisor.lifecycle = SupervisorLifecycle::Stopped;
-    status.core.lifecycle = CoreLifecycle::Stopped;
-
-    let (text, _) = render_with_backend(&state, 80, 24);
-
-    assert!(text.contains("Supervisor: Stopped | Core: Stopped"));
-}
-
-#[test]
-fn overview_renders_supervisor_health_reasons() {
-    let mut state = connected_state();
-    let status = state
-        .status
-        .as_mut()
-        .expect("the connected fixture should have status");
-    status.supervisor.lifecycle = SupervisorLifecycle::Degraded;
-    status.supervisor.health_reasons = vec![
-        SupervisorHealthReason::RuntimeRecovery,
-        SupervisorHealthReason::SelectionRestoration,
-    ];
-
-    let (text, _) = render_with_backend(&state, 100, 28);
-
-    assert!(text.contains("Health: runtime_recovery, selection_restoration"));
-}
-
-#[test]
-fn compact_overview_renders_runtime_apply_recovery() {
-    let mut state = connected_state();
-    let status = state
-        .status
-        .as_mut()
-        .expect("the connected fixture should have status");
-    status.apply_state = ApplyState::Recovering;
-    status.runtime_apply = RuntimeApplySnapshot {
-        candidate_generation: Some(RuntimeGeneration(2)),
-        committed_generation: Some(RuntimeGeneration(1)),
-        phase: RuntimeApplyPhase::Recovering,
-        recovery: RuntimeRecoverySnapshot {
-            status: RuntimeRecoveryStatus::Pending,
-            restored_generation: Some(RuntimeGeneration(1)),
-            message: Some("Committed Runtime Generation cleanup is pending".to_owned()),
-        },
-    };
-
-    let (text, _) = render_with_backend(&state, 80, 24);
-
-    assert!(text.contains("Apply: recovering, candidate=2, committed=1"));
-    assert!(text.contains("Recovery: pending, restored=1"));
-    assert!(text.contains("Why: Committed Runtime Generation cleanup is pending"));
-    assert!(text.contains("Connections: 3 | Uptime: 60s"));
-}
-
-#[test]
 fn proxy_rows_without_stable_node_ids_are_visible_and_read_only() {
     let mut state = connected_state();
     state.page = Page::Proxies;
@@ -1048,9 +1170,6 @@ fn proxy_rows_without_stable_node_ids_are_visible_and_read_only() {
         available: false,
         selected: false,
         delay_ms: None,
-        sampled_at_unix_ms: None,
-        freshness: LatencyFreshness::NotSampled,
-        probe_status: LatencyProbeStatus::NotSampled,
     }];
     state.proxies.selected = 0;
 
@@ -1074,37 +1193,53 @@ fn proxy_rows_without_stable_node_ids_are_visible_and_read_only() {
 }
 
 #[test]
-fn proxy_delay_labels_distinguish_pending_and_failed_probe_states() {
+fn proxy_latency_omits_probe_state_when_no_sample_exists() {
     let mut state = connected_state();
     state.page = Page::Proxies;
-    state.proxies.rows = [
-        ("Never sampled", LatencyProbeStatus::NotSampled),
-        ("Queued node", LatencyProbeStatus::Queued),
-        ("Probing node", LatencyProbeStatus::InFlight),
-        ("Failed node", LatencyProbeStatus::Failed),
-    ]
-    .into_iter()
-    .map(|(name, probe_status)| ProxyRow {
-        group_id: ProxyGroupId::for_name("Automatic"),
-        group: "Automatic".to_owned(),
-        node_id: Some(NodeRecordId::for_core(name)),
-        name: name.to_owned(),
-        node_type: "Shadowsocks".to_owned(),
-        available: probe_status != LatencyProbeStatus::Failed,
-        selected: false,
-        delay_ms: None,
-        sampled_at_unix_ms: None,
-        freshness: LatencyFreshness::NotSampled,
-        probe_status,
-    })
-    .collect();
+    state.proxies.rows = ["Node A", "Node B", "Node C", "Node D"]
+        .into_iter()
+        .map(|name| ProxyRow {
+            group_id: ProxyGroupId::for_name("Automatic"),
+            group: "Automatic".to_owned(),
+            node_id: Some(NodeRecordId::for_core(name)),
+            name: name.to_owned(),
+            node_type: "Shadowsocks".to_owned(),
+            available: name != "Node D",
+            selected: false,
+            delay_ms: None,
+        })
+        .collect();
 
     let (text, _) = render_with_backend(&state, 100, 30);
 
-    assert!(text.contains("queued"));
-    assert!(text.contains("probing"));
-    assert!(text.contains("failed"));
+    assert!(
+        ["Node A", "Node B", "Node C", "Node D"]
+            .iter()
+            .all(|name| text.contains(name))
+    );
+    assert!(!text.contains("queued"));
+    assert!(!text.contains("probing"));
+    assert!(!text.contains("failed"));
     assert!(!text.contains("timeout"));
+}
+
+#[test]
+fn profiles_sheet_omits_refresh_timestamps_and_freshness() {
+    let mut state = connected_state();
+    state.profiles.rows[0].fresh = false;
+    state.profiles.rows[0].next_refresh_at_unix_ms = 9_876_543_210;
+    state.profiles.rows[0].error = Some("refresh unavailable".to_owned());
+    update(&mut state, UiEvent::Intent(UiIntent::OpenProfiles));
+
+    let (text, _) = render_with_backend(&state, 100, 30);
+
+    assert!(text.contains("STATE"));
+    assert!(text.contains("PROFILE"));
+    assert!(text.contains("ERROR"));
+    assert!(text.contains("refresh unavailable"));
+    assert!(!text.contains("FRESH"));
+    assert!(!text.contains("NEXT REFRESH"));
+    assert!(!text.contains("9876543210"));
 }
 
 #[test]
@@ -1126,8 +1261,8 @@ fn rendering_replaces_terminal_control_characters_in_external_text() {
     state.toast = Some("Toast\u{1b}X".to_owned());
 
     for (page, expected) in [
-        (Page::Overview, "Profile?X"),
         (Page::Proxies, "Node?X"),
+        (Page::Connections, "Profile?X"),
         (Page::Rules, "Rule?X"),
         (Page::Logs, "Log?X"),
     ] {
@@ -1302,19 +1437,20 @@ fn proxy_group_last_page_mouse_hits_match_the_rendered_rows() {
             id: ProxyGroupId::for_name(&format!("Group {index:02}")),
             name: format!("Group {index:02}"),
             proxy_type: "Selector".to_owned(),
+            selectable: true,
             selected_node: None,
         })
         .collect();
     state.proxies.group_cursor = 19;
 
     let (text, map) = render_with_backend(&state, 140, 24);
-    let first_visible = ProxyGroupId::for_name("Group 03");
+    let first_visible = ProxyGroupId::for_name("Group 05");
     let hit = hit_for(&map, |intent| {
         *intent == UiIntent::ShowProxyGroup(first_visible.clone())
     });
     state.publish_interaction_map(map);
 
-    assert!(text.contains("Group 03"));
+    assert!(text.contains("Group 05"));
     assert_eq!(
         input_to_intent(
             &state,
@@ -1387,7 +1523,6 @@ fn interaction_map_covers_tabs_search_footer_log_controls_and_scroll() {
     state.page = Page::Logs;
     let (_, map) = render_with_backend(&state, 100, 30);
     for expected in [
-        UiIntent::SwitchPage(Page::Overview),
         UiIntent::SwitchPage(Page::Proxies),
         UiIntent::SwitchPage(Page::Connections),
         UiIntent::SwitchPage(Page::Rules),
@@ -1529,7 +1664,7 @@ fn tab_shift_tab_and_page_shortcuts_update_navigation_state() {
         &mut state,
         UiEvent::Terminal(TerminalInput::Key(KeyInput::Tab)),
     );
-    assert_eq!(state.focus, Focus::Content);
+    assert_eq!(state.focus, Focus::ProxyGroups);
     update(
         &mut state,
         UiEvent::Terminal(TerminalInput::Key(KeyInput::BackTab)),
@@ -1537,7 +1672,7 @@ fn tab_shift_tab_and_page_shortcuts_update_navigation_state() {
     assert_eq!(state.focus, Focus::Tabs);
     update(
         &mut state,
-        UiEvent::Terminal(TerminalInput::Key(KeyInput::Character('5'))),
+        UiEvent::Terminal(TerminalInput::Key(KeyInput::Character('4'))),
     );
     assert_eq!(state.page, Page::Logs);
 }
@@ -1545,7 +1680,6 @@ fn tab_shift_tab_and_page_shortcuts_update_navigation_state() {
 #[test]
 fn tab_and_shift_tab_visit_only_controls_present_on_each_page() {
     for (page, first_focus) in [
-        (Page::Overview, Focus::Content),
         (Page::Proxies, Focus::ProxyGroups),
         (Page::Connections, Focus::Content),
         (Page::Rules, Focus::Content),
@@ -1660,8 +1794,8 @@ fn proxy_group_load_and_mutation_states_are_visually_distinct() {
     state.proxies.selected = 1;
     update(&mut state, UiEvent::Intent(UiIntent::ActivateSelected));
     let (pending_text, _) = render_with_backend(&state, 180, 30);
-    assert!(pending_text.contains("[current]"));
-    assert!(pending_text.contains("[pending]"));
+    assert!(pending_text.contains("● Automatic"));
+    assert!(pending_text.contains('◌'));
 
     let group_commands = update(
         &mut state,
@@ -1677,7 +1811,7 @@ fn proxy_group_load_and_mutation_states_are_visually_distinct() {
         },
     );
     let (success_text, _) = render_with_backend(&state, 180, 30);
-    assert!(success_text.contains("[current] Manual"));
+    assert!(success_text.contains("● Manual"));
     assert!(success_text.contains("Success: Loaded Proxy Group Manual"));
 
     let failed_commands = update(
@@ -2138,31 +2272,6 @@ fn log_drop_counter_remains_monotonic_across_recovery_batches() {
 }
 
 #[test]
-fn traffic_series_use_latest_samples_with_fixed_capacity() {
-    let mut state = connected_state();
-
-    for index in 0..TRAFFIC_SERIES_CAPACITY + 10 {
-        let mut status = status_snapshot();
-        status.traffic.upload_bytes_per_second = index as u64;
-        status.traffic.download_bytes_per_second = index as u64 * 2;
-        update(
-            &mut state,
-            UiEvent::StatusSnapshot {
-                connection_generation: 1,
-                status,
-            },
-        );
-    }
-
-    assert_eq!(state.upload_series.len(), TRAFFIC_SERIES_CAPACITY);
-    assert_eq!(state.download_series.len(), TRAFFIC_SERIES_CAPACITY);
-    assert_eq!(
-        state.upload_series.back(),
-        Some(&((TRAFFIC_SERIES_CAPACITY + 9) as u64))
-    );
-}
-
-#[test]
 fn keyboard_log_selection_pins_a_record_until_escape_resumes_follow() {
     let mut state = connected_state();
     state.page = Page::Logs;
@@ -2338,24 +2447,57 @@ fn user_log_query_filters_time_level_and_content_and_shows_stream_state() {
 }
 
 #[test]
-fn overview_and_proxy_rows_show_latency_time_freshness_and_probe_state() {
+fn proxy_rows_keep_operational_fields_and_remove_sampling_metadata() {
     let mut state = connected_state();
-    let (overview, _) = render_with_backend(&state, 180, 30);
-    assert!(overview.contains("Sampled At: 1000"));
-    assert!(overview.contains("Freshness: fresh"));
-    assert!(overview.contains("Probe: succeeded (generation 1)"));
-
     state.page = Page::Proxies;
     let (proxies, _) = render_with_backend(&state, 180, 30);
-    for expected in [
-        "SAMPLED",
-        "FRESHNESS",
-        "PROBE",
-        "1000",
-        "fresh",
-        "succeeded",
-    ] {
+    for expected in ["NODE", "TYPE", "STATUS", "LATENCY", "Tokyo", "42 ms"] {
         assert!(proxies.contains(expected), "missing {expected}: {proxies}");
+    }
+    for removed in ["SAMPLED", "FRESHNESS", "PROBE", "1000", "succeeded"] {
+        assert!(
+            !proxies.contains(removed),
+            "unexpected {removed}: {proxies}"
+        );
+    }
+}
+
+#[test]
+fn proxy_node_names_reserve_a_guard_cell_after_leading_emoji() {
+    let area = Rect::new(0, 0, 180, 30);
+    let mut state = connected_state();
+    state.page = Page::Proxies;
+    state.proxies.rows = vec![proxy("🇯🇵日本高速01|BGP|CUCM", true)];
+    state
+        .status
+        .as_mut()
+        .and_then(|status| status.selected_node.as_mut())
+        .expect("selected Node should exist")
+        .name = "🇯🇵日本高速01|BGP|CUCM".to_owned();
+    let (regions, _) = ratash::tui::compute_layout(&state, area, 1);
+    let list = regions.list.expect("Proxy node list should render");
+    let mut buffer = Buffer::empty(area);
+
+    render_buffer(&state, area, &mut buffer);
+
+    let flags = (area.y..area.bottom())
+        .flat_map(|row| (area.x..area.right()).map(move |column| (column, row)))
+        .filter(|position| buffer[*position].symbol() == "🇯🇵")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        flags.len(),
+        2,
+        "header and Proxy row should render the flag"
+    );
+    assert!(
+        flags
+            .iter()
+            .any(|(_, row)| *row >= list.y && *row < list.bottom())
+    );
+    for (flag_column, row) in flags {
+        assert_eq!(buffer[(flag_column + 1, row)].symbol(), " ");
+        assert_eq!(buffer[(flag_column + 2, row)].symbol(), " ");
+        assert_eq!(buffer[(flag_column + 3, row)].symbol(), "日");
     }
 }
 
@@ -2692,6 +2834,21 @@ fn status_snapshot() -> StatusSnapshot {
             state: SampleState::Fresh,
         },
         connection_count: 3,
+        upload_total_bytes: 4 * 1024,
+        download_total_bytes: 8 * 1024,
+        memory_bytes: Some(1024 * 1024),
+        connections: vec![ConnectionRecord {
+            id: "fixture-connection".to_owned(),
+            network: "tcp".to_owned(),
+            host: Some("example.com".to_owned()),
+            destination_ip: Some("93.184.216.34".to_owned()),
+            destination_port: Some("443".to_owned()),
+            chains: vec!["provider-only".to_owned(), "Manual".to_owned()],
+            rule: "DOMAIN-SUFFIX".to_owned(),
+            rule_payload: Some("example.com".to_owned()),
+            upload_bytes: 1024,
+            download_bytes: 2048,
+        }],
         runtime_generation: Some(RuntimeGeneration(1)),
         apply_state: ApplyState::Idle,
         runtime_apply: RuntimeApplySnapshot {
@@ -2720,17 +2877,6 @@ fn proxy(name: &str, selected: bool) -> ProxyRow {
         available: true,
         selected,
         delay_ms: selected.then_some(42),
-        sampled_at_unix_ms: selected.then_some(1_000),
-        freshness: if selected {
-            LatencyFreshness::Fresh
-        } else {
-            LatencyFreshness::NotSampled
-        },
-        probe_status: if selected {
-            LatencyProbeStatus::Succeeded
-        } else {
-            LatencyProbeStatus::NotSampled
-        },
     }
 }
 
@@ -2739,6 +2885,7 @@ fn proxy_group() -> ProxyGroupRow {
         id: ProxyGroupId::for_name("Automatic"),
         name: "Automatic".to_owned(),
         proxy_type: "Selector".to_owned(),
+        selectable: true,
         selected_node: Some("Tokyo".to_owned()),
     }
 }
@@ -2748,6 +2895,7 @@ fn manual_proxy_group() -> ProxyGroupRow {
         id: ProxyGroupId::for_name("Manual"),
         name: "Manual".to_owned(),
         proxy_type: "Selector".to_owned(),
+        selectable: true,
         selected_node: Some("Paris".to_owned()),
     }
 }
@@ -2797,7 +2945,7 @@ fn search_for_page(state: &AppState, page: Page) -> &str {
         Page::Proxies => &state.proxies.filter,
         Page::Rules => &state.rules.filter,
         Page::Logs => &state.logs.search,
-        Page::Overview | Page::Connections => "",
+        Page::Connections => "",
     }
 }
 

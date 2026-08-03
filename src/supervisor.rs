@@ -20,7 +20,9 @@ use crate::constants::{
     RULE_STRING_MAX_BYTES, SELECTION_RESTORE_ATTEMPT_LIMIT, WRAPPER_DIAGNOSTIC_CAPACITY,
     YAML_MAX_DEPTH,
 };
-use crate::core::{DelayProbeRequest, DelayTarget, ManagedCoreHandle, ProxyView};
+use crate::core::{
+    ConnectionSummary, DelayProbeRequest, DelayTarget, ManagedCoreHandle, ProxyView,
+};
 use crate::diagnostics::{WrapperDiagnosticRing, WrapperDiagnosticState, WrapperDiagnosticTail};
 use crate::domain::{
     ActiveProfileSummary, CoreInstanceGeneration, ProbeGeneration, ProfileId, RuntimeApplyPhase,
@@ -647,16 +649,22 @@ impl Supervisor {
             .is_some_and(|telemetry| telemetry.publish_traffic(generation, sample)))
     }
 
-    pub fn publish_connection_count(
+    pub fn publish_connections(
         &self,
         generation: crate::domain::CoreInstanceGeneration,
-        count: u64,
+        summary: ConnectionSummary,
     ) -> Result<bool, ApplicationError> {
         let mut state = self.state.lock().map_err(|_| internal_error())?;
-        Ok(state
-            .telemetry
-            .as_mut()
-            .is_some_and(|telemetry| telemetry.publish_connections(generation, count)))
+        Ok(state.telemetry.as_mut().is_some_and(|telemetry| {
+            telemetry.publish_connections(
+                generation,
+                summary.active_connections,
+                summary.upload_total_bytes,
+                summary.download_total_bytes,
+                summary.memory_bytes,
+                summary.connections,
+            )
+        }))
     }
 
     pub fn publish_core_log(
@@ -797,6 +805,24 @@ impl Supervisor {
             .as_ref()
             .and_then(TelemetryStore::connection_count)
             .unwrap_or_default();
+        let upload_total_bytes = state
+            .telemetry
+            .as_ref()
+            .and_then(TelemetryStore::upload_total_bytes)
+            .unwrap_or_default();
+        let download_total_bytes = state
+            .telemetry
+            .as_ref()
+            .and_then(TelemetryStore::download_total_bytes)
+            .unwrap_or_default();
+        let memory_bytes = state
+            .telemetry
+            .as_ref()
+            .and_then(TelemetryStore::memory_bytes);
+        let connections = state
+            .telemetry
+            .as_ref()
+            .map_or_else(Vec::new, |telemetry| telemetry.connections().to_vec());
         let probe_queue = probe_queue_status(state.probes.metrics(self.clock.now_unix_ms()));
         let runtime_apply = self.current_runtime_apply();
         let status = StatusSnapshot {
@@ -818,6 +844,10 @@ impl Supervisor {
             latency,
             traffic,
             connection_count,
+            upload_total_bytes,
+            download_total_bytes,
+            memory_bytes,
+            connections,
             runtime_generation: state.runtime_generation,
             apply_state: runtime_apply.phase.compatibility_state(),
             runtime_apply,

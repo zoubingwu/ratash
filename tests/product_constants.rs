@@ -37,6 +37,9 @@ fn observable_product_limits_are_frozen_for_the_release_contract() {
     assert_eq!(LOG_SUBSCRIBER_MAX_BYTES, 4 * 1_024 * 1_024);
     assert_eq!(IPC_STREAM_CAPACITY, 3);
     assert_eq!(TRAFFIC_SERIES_CAPACITY, 300);
+    assert_eq!(CONNECTION_RECORD_CAPACITY, 256);
+    assert_eq!(CONNECTION_CHAIN_CAPACITY, 16);
+    assert_eq!(CONNECTION_FIELD_MAX_BYTES, 512);
     assert_eq!(MINIMUM_TERMINAL_WIDTH, 80);
     assert_eq!(MINIMUM_TERMINAL_HEIGHT, 24);
     assert_eq!(TUI_SEARCH_MAX_BYTES, 256);
@@ -75,6 +78,7 @@ fn every_input_and_transport_boundary_has_a_positive_limit() {
         LOG_BROKER_RECOVERY_MAX_BYTES,
         LOG_TAIL_MAX_BYTES,
         LOG_SUBSCRIBER_MAX_BYTES,
+        CONNECTION_FIELD_MAX_BYTES,
         JSON_OUTPUT_MAX_BYTES,
         TUI_SEARCH_MAX_BYTES,
     ] {

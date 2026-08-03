@@ -886,6 +886,10 @@ pub struct StatusViewV1 {
     pub latency: Option<LatencySampleViewV1>,
     pub traffic: TrafficSampleViewV1,
     pub connection_count: u64,
+    pub upload_total_bytes: u64,
+    pub download_total_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_generation: Option<String>,
     pub apply_state: ApplyStateViewV1,
@@ -907,6 +911,9 @@ impl From<StatusSnapshot> for StatusViewV1 {
             latency: snapshot.latency.map(Into::into),
             traffic: snapshot.traffic.into(),
             connection_count: snapshot.connection_count,
+            upload_total_bytes: snapshot.upload_total_bytes,
+            download_total_bytes: snapshot.download_total_bytes,
+            memory_bytes: snapshot.memory_bytes,
             runtime_generation: snapshot
                 .runtime_generation
                 .map(|generation| generation.0.to_string()),

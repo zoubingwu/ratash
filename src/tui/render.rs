@@ -9,11 +9,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
-use crate::application::{LatencyFreshness, LatencyProbeStatus, PolicyTargetValidation};
-use crate::domain::{
-    CoreDiagnosticCategory, CoreLifecycle, RuntimeApplyPhase, RuntimeRecoveryStatus, SampleState,
-    StreamState, SupervisorHealthReason, SupervisorLifecycle, TunReason,
-};
+use crate::application::PolicyTargetValidation;
+use crate::domain::{CoreDiagnosticCategory, SupervisorHealthReason, TunReason};
 use crate::telemetry::{LogLevel, LogSource};
 
 use super::{AppState, InteractionMap, Page};
@@ -22,7 +19,6 @@ mod connections;
 mod frame;
 mod layout;
 mod logs;
-mod overview;
 mod proxies;
 mod rules;
 
@@ -46,9 +42,8 @@ pub fn render_buffer(state: &AppState, area: Rect, buffer: &mut Buffer) -> Inter
 
     frame::render_header(state, &regions, buffer);
     match state.page {
-        Page::Overview => overview::render(state, regions.content, buffer),
         Page::Proxies => proxies::render(state, &regions, buffer),
-        Page::Connections => connections::render(state, regions.content, buffer),
+        Page::Connections => connections::render(state, &regions, buffer),
         Page::Rules => rules::render(state, &regions, buffer),
         Page::Logs => logs::render(state, &regions, buffer),
     }
@@ -128,6 +123,31 @@ pub(super) fn fit_column(value: &str, width: usize) -> String {
     fitted
 }
 
+pub(super) fn fit_node_name(value: &str, width: usize) -> String {
+    let safe = terminal_safe(value);
+    let span = Span::raw(safe.as_ref());
+    let Some(first) = span.styled_graphemes(Style::default()).next() else {
+        return fit_column(safe.as_ref(), width);
+    };
+    if !first.symbol.chars().any(is_emoji_scalar) {
+        return fit_column(safe.as_ref(), width);
+    }
+
+    // Reserve one visual guard cell for color emoji in macOS Terminal.
+    let mut guarded = String::with_capacity(safe.len().saturating_add(1));
+    guarded.push_str(first.symbol);
+    guarded.push(' ');
+    guarded.push_str(&safe[first.symbol.len()..]);
+    fit_column(&guarded, width)
+}
+
+fn is_emoji_scalar(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x2300..=0x23ff | 0x2600..=0x27bf | 0x1f000..=0x1faff | 0xfe0f
+    )
+}
+
 fn terminal_safe_with_newlines(value: &str, allow_newlines: bool) -> Cow<'_, str> {
     if value
         .chars()
@@ -165,25 +185,19 @@ pub(super) fn format_rate(bytes_per_second: u64) -> String {
     }
 }
 
-pub(super) fn supervisor_lifecycle_title(value: SupervisorLifecycle) -> &'static str {
-    match value {
-        SupervisorLifecycle::Starting => "Starting",
-        SupervisorLifecycle::Ready => "Ready",
-        SupervisorLifecycle::Stopping => "Stopping",
-        SupervisorLifecycle::Stopped => "Stopped",
-        SupervisorLifecycle::Degraded => "Degraded",
-    }
-}
-
-pub(super) fn core_lifecycle_title(value: CoreLifecycle) -> &'static str {
-    match value {
-        CoreLifecycle::Unconfigured => "Unconfigured",
-        CoreLifecycle::Stopped => "Stopped",
-        CoreLifecycle::Starting => "Starting",
-        CoreLifecycle::Ready => "Ready",
-        CoreLifecycle::Reloading => "Reloading",
-        CoreLifecycle::Stopping => "Stopping",
-        CoreLifecycle::Degraded => "Degraded",
+pub(super) fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else {
+        format!("{} B", bytes as u64)
     }
 }
 
@@ -209,62 +223,6 @@ pub(super) fn tun_reason_title(value: TunReason) -> &'static str {
         TunReason::PermissionDenied => "permission_denied",
         TunReason::Unsupported => "unsupported",
         TunReason::CoreUnavailable => "core_unavailable",
-    }
-}
-
-pub(super) fn runtime_apply_phase_title(value: RuntimeApplyPhase) -> &'static str {
-    match value {
-        RuntimeApplyPhase::Idle => "idle",
-        RuntimeApplyPhase::Applying => "applying",
-        RuntimeApplyPhase::Succeeded => "succeeded",
-        RuntimeApplyPhase::Recovering => "recovering",
-        RuntimeApplyPhase::Failed => "failed",
-    }
-}
-
-pub(super) fn runtime_recovery_status_title(value: RuntimeRecoveryStatus) -> &'static str {
-    match value {
-        RuntimeRecoveryStatus::NotRequired => "not_required",
-        RuntimeRecoveryStatus::Succeeded => "succeeded",
-        RuntimeRecoveryStatus::Pending => "pending",
-        RuntimeRecoveryStatus::Failed => "failed",
-    }
-}
-
-pub(super) fn sample_state_title(value: SampleState) -> &'static str {
-    match value {
-        SampleState::Fresh => "fresh",
-        SampleState::Stale => "stale",
-        SampleState::Unavailable => "unavailable",
-    }
-}
-
-pub(super) fn stream_state_title(value: StreamState) -> &'static str {
-    match value {
-        StreamState::Disconnected => "disconnected",
-        StreamState::Connecting => "connecting",
-        StreamState::Healthy => "healthy",
-        StreamState::Stale => "stale",
-        StreamState::Degraded => "degraded",
-    }
-}
-
-pub(super) fn latency_freshness_title(value: LatencyFreshness) -> &'static str {
-    match value {
-        LatencyFreshness::NotSampled => "not_sampled",
-        LatencyFreshness::Fresh => "fresh",
-        LatencyFreshness::Stale => "stale",
-        LatencyFreshness::Unavailable => "unavailable",
-    }
-}
-
-pub(super) fn latency_probe_status_title(value: LatencyProbeStatus) -> &'static str {
-    match value {
-        LatencyProbeStatus::NotSampled => "not_sampled",
-        LatencyProbeStatus::Queued => "queued",
-        LatencyProbeStatus::InFlight => "in_flight",
-        LatencyProbeStatus::Succeeded => "succeeded",
-        LatencyProbeStatus::Failed => "failed",
     }
 }
 

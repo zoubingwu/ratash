@@ -15,6 +15,7 @@ use ratash::core::{
     MihomoErrorKind, MihomoLogFrame, MihomoLogLevel, MihomoReadiness, MihomoVersion, NodeSelection,
     ProviderState, TrafficFrame,
 };
+use ratash::domain::ConnectionRecord;
 use ratash::domain::{CoreInstanceGeneration, NodeRecordId};
 use ratash::mihomo::{MihomoAdapterConfig, UnixMihomoAdapter};
 use tungstenite::handshake::derive_accept_key;
@@ -656,6 +657,32 @@ fn connection_summary_uses_the_bounded_rest_projection() {
             upload_total_bytes: 4096,
             download_total_bytes: 8192,
             memory_bytes: Some(1_048_576),
+            connections: vec![
+                ConnectionRecord {
+                    id: "fixture-connection".to_owned(),
+                    network: "tcp".to_owned(),
+                    host: Some("example.com".to_owned()),
+                    destination_ip: Some("93.184.216.34".to_owned()),
+                    destination_port: Some("443".to_owned()),
+                    chains: vec!["provider-only".to_owned(), "Manual".to_owned()],
+                    rule: "DOMAIN-SUFFIX".to_owned(),
+                    rule_payload: Some("example.com".to_owned()),
+                    upload_bytes: 1024,
+                    download_bytes: 2048,
+                },
+                ConnectionRecord {
+                    id: "fixture-direct".to_owned(),
+                    network: "udp".to_owned(),
+                    host: Some("dns.google".to_owned()),
+                    destination_ip: Some("1.1.1.1".to_owned()),
+                    destination_port: Some("53".to_owned()),
+                    chains: vec!["DIRECT".to_owned()],
+                    rule: "MATCH".to_owned(),
+                    rule_payload: None,
+                    upload_bytes: 64,
+                    download_bytes: 128,
+                },
+            ],
         }
     );
     fixture.finish();

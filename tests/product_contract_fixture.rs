@@ -98,6 +98,8 @@ fn release_fixture_freezes_capacities_and_input_boundaries() {
         ("wrapper_diagnostics", WRAPPER_DIAGNOSTIC_CAPACITY),
         ("status_subscriber", STATUS_SUBSCRIBER_CAPACITY),
         ("traffic_series", TRAFFIC_SERIES_CAPACITY),
+        ("connection_records", CONNECTION_RECORD_CAPACITY),
+        ("connection_chain_entries", CONNECTION_CHAIN_CAPACITY),
         ("local_rules", LOCAL_RULE_COUNT_MAX),
     ] {
         assert_eq!(capacities[name], actual, "{name} drifted");
@@ -126,6 +128,7 @@ fn release_fixture_freezes_capacities_and_input_boundaries() {
         ("log_broker_recovery", LOG_BROKER_RECOVERY_MAX_BYTES),
         ("log_tail", LOG_TAIL_MAX_BYTES),
         ("log_subscriber", LOG_SUBSCRIBER_MAX_BYTES),
+        ("connection_field", CONNECTION_FIELD_MAX_BYTES),
         ("json_output", JSON_OUTPUT_MAX_BYTES),
         ("tui_search", TUI_SEARCH_MAX_BYTES),
     ] {

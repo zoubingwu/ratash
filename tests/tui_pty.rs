@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use ratash::application::{ApplicationOperation, LatencyFreshness, LatencyProbeStatus};
+use ratash::application::ApplicationOperation;
 use ratash::domain::{
     ActiveProfileSummary, ApplyState, CoreLifecycle, CoreStatus, NodeRecordId, ProbeQueueStatus,
     ProfileId, ProxyGroupId, SampleState, StatusSnapshot, StreamHealthSet, StreamState,
@@ -87,11 +87,11 @@ fn real_pty_interaction_covers_resize_keyboard_mouse_and_restoration() {
     interactive.write_input(b"\r");
     interactive.wait_for_text("RATASH_PTY_COMMAND profile_use");
     interactive.wait_for_text("Success: done");
-    interactive.write_input(b"2");
+    interactive.write_input(b"1");
     interactive.wait_for_text("Nodes (2)");
-    interactive.write_input(b"\x1b[<0;25;7M\x1b[<0;25;7m");
+    interactive.write_input(b"\x1b[<0;25;8M\x1b[<0;25;8m");
     interactive.wait_for_text("RATASH_PTY_COMMAND proxy_select");
-    interactive.write_input(b"5");
+    interactive.write_input(b"4");
     interactive.wait_for_text("LOGS");
     interactive.write_input(b"\x1b[<0;52;4M\x1b[<0;52;4m");
     interactive.wait_for_text("following");
@@ -427,6 +427,10 @@ fn full_snapshot() -> FullViewSnapshot {
                 state: SampleState::Fresh,
             },
             connection_count: 1,
+            upload_total_bytes: 128,
+            download_total_bytes: 256,
+            memory_bytes: Some(1024),
+            connections: Vec::new(),
             runtime_generation: None,
             apply_state: ApplyState::Idle,
             runtime_apply: Default::default(),
@@ -451,6 +455,7 @@ fn proxy_group() -> ProxyGroupRow {
         id: ProxyGroupId::for_name("Automatic"),
         name: "Automatic".to_owned(),
         proxy_type: "Selector".to_owned(),
+        selectable: true,
         selected_node: Some("Tokyo".to_owned()),
     }
 }
@@ -468,9 +473,6 @@ fn proxy_rows() -> Vec<ProxyRow> {
             available: true,
             selected: index == 0,
             delay_ms: Some(20 + index as u64),
-            sampled_at_unix_ms: Some(3),
-            freshness: LatencyFreshness::Fresh,
-            probe_status: LatencyProbeStatus::Succeeded,
         })
         .collect()
 }

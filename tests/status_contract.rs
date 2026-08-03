@@ -71,6 +71,8 @@ fn zero_profile_status_serializes_the_complete_v1_contract() {
                     "state": "unavailable"
                 },
                 "connection_count": 0,
+                "upload_total_bytes": 0,
+                "download_total_bytes": 0,
                 "apply_state": "idle",
                 "runtime_apply": {
                     "phase": "idle",

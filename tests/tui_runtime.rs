@@ -166,20 +166,16 @@ fn application_snapshot_adapter_loads_proxy_groups_on_demand() {
             .iter()
             .map(|group| group.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["Automatic", "Manual"]
+        vec!["Manual", "Automatic", "Fallback"]
     );
-    assert_eq!(full.proxies[0].name, "Tokyo");
+    assert_eq!(full.proxies[0].name, "Paris");
 
-    let manual = source
-        .fetch_proxy_group("Manual", 8, &CancellationToken::default())
-        .expect("selected Proxy Group should load on demand");
-    assert_eq!(manual.group.name, "Manual");
-    assert_eq!(manual.proxies[0].name, "Paris");
-    assert_eq!(manual.proxies[0].freshness, LatencyFreshness::Fresh);
-    assert_eq!(
-        manual.proxies[0].probe_status,
-        LatencyProbeStatus::Succeeded
-    );
+    let automatic = source
+        .fetch_proxy_group("Automatic", 8, &CancellationToken::default())
+        .expect("automatic Proxy Group should load on demand");
+    assert_eq!(automatic.group.name, "Automatic");
+    assert_eq!(automatic.proxies[0].name, "Tokyo");
+    assert_eq!(automatic.proxies[0].delay_ms, Some(21));
     assert_eq!(
         client
             .operations
@@ -191,7 +187,7 @@ fn application_snapshot_adapter_loads_proxy_groups_on_demand() {
                 _ => None,
             })
             .collect::<Vec<_>>(),
-        vec!["Automatic", "Manual"]
+        vec!["Manual", "Automatic"]
     );
 }
 
@@ -470,9 +466,6 @@ fn background_snapshot_refresh_replaces_profiles_and_proxies() {
         available: true,
         selected: true,
         delay_ms: Some(24),
-        sampled_at_unix_ms: Some(30_000),
-        freshness: LatencyFreshness::Fresh,
-        probe_status: LatencyProbeStatus::Succeeded,
     });
     let mut dispatcher = RecordingDispatcher::default();
     dispatcher.results.push_back(DispatchedEvent {
@@ -986,6 +979,7 @@ fn background_dispatcher_loads_one_proxy_group_without_a_full_snapshot() {
         id: ProxyGroupId::for_name("Manual"),
         name: "Manual".to_owned(),
         proxy_type: "Selector".to_owned(),
+        selectable: true,
         selected_node: Some("Paris".to_owned()),
     }];
     let sources = StatusInterfaceSources {
@@ -1321,6 +1315,10 @@ fn status(upload: u64) -> StatusSnapshot {
             state: SampleState::Fresh,
         },
         connection_count: 0,
+        upload_total_bytes: 0,
+        download_total_bytes: 0,
+        memory_bytes: None,
+        connections: Vec::new(),
         runtime_generation: None,
         apply_state: ApplyState::Idle,
         runtime_apply: RuntimeApplySnapshot::default(),
@@ -1397,6 +1395,7 @@ impl FullSnapshotSource for FakeSnapshots {
                 id: ProxyGroupId::parse(group).unwrap_or_else(|_| ProxyGroupId::for_name(group)),
                 name: group.to_owned(),
                 proxy_type: "Selector".to_owned(),
+                selectable: true,
                 selected_node: None,
             });
         let groups = if self.snapshot.proxy_groups.is_empty() {
@@ -1707,7 +1706,7 @@ impl ApplicationClient for ProxySnapshotClient {
         match operation {
             ApplicationOperation::GetStatus => {
                 let mut snapshot = status(55);
-                snapshot.primary_proxy_group = Some("Automatic".to_owned());
+                snapshot.primary_proxy_group = Some("Manual".to_owned());
                 Ok(ApplicationOutput::Status(snapshot))
             }
             ApplicationOperation::ProfileList => {
@@ -1725,8 +1724,10 @@ impl ApplicationClient for ProxySnapshotClient {
                 Ok(ApplicationOutput::Proxies(ProxyListOutcome {
                     group: proxy_group_summary(&group, node_name),
                     groups: vec![
-                        proxy_group_summary("Automatic", "Tokyo"),
                         proxy_group_summary("Manual", "Paris"),
+                        proxy_group_summary_with_type("Automatic", "Tokyo", "URLTest", false),
+                        proxy_group_summary_with_type("Fallback", "Paris", "Fallback", false),
+                        proxy_group_summary("GLOBAL", "DIRECT"),
                     ],
                     nodes: vec![ProxyNodeRow {
                         id: Some(NodeRecordId::for_core(node_name)),
@@ -1750,11 +1751,20 @@ impl ApplicationClient for ProxySnapshotClient {
 }
 
 fn proxy_group_summary(name: &str, selected_node: &str) -> ProxyGroupSummary {
+    proxy_group_summary_with_type(name, selected_node, "Selector", true)
+}
+
+fn proxy_group_summary_with_type(
+    name: &str,
+    selected_node: &str,
+    proxy_type: &str,
+    selectable: bool,
+) -> ProxyGroupSummary {
     ProxyGroupSummary {
         id: ProxyGroupId::for_name(name),
         name: name.to_owned(),
-        proxy_type: "Selector".to_owned(),
-        selectable: true,
+        proxy_type: proxy_type.to_owned(),
+        selectable,
         selected_node: Some(ratash::application::SelectorIdentity {
             id: NodeRecordId::for_core(selected_node).as_str().to_owned(),
             name: selected_node.to_owned(),

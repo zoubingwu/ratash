@@ -1,7 +1,10 @@
 use std::collections::VecDeque;
 use std::fmt;
 
-use crate::constants::{LOG_RETENTION_MAX_BYTES, LOG_TAIL_MAX_BYTES, LOG_TAIL_MAX_RECORDS};
+use crate::constants::{
+    CONNECTION_RECORD_CAPACITY, LOG_RETENTION_MAX_BYTES, LOG_TAIL_MAX_BYTES, LOG_TAIL_MAX_RECORDS,
+};
+use crate::domain::ConnectionRecord;
 use crate::domain::{CoreInstanceGeneration, TrafficSample};
 
 const LOG_TAIL_ENVELOPE_MAX_BYTES: usize = 512;
@@ -319,6 +322,10 @@ pub struct TelemetryStore {
     traffic_history: VecDeque<TrafficSample>,
     latest_traffic: Option<TrafficSample>,
     connection_count: Option<u64>,
+    upload_total_bytes: Option<u64>,
+    download_total_bytes: Option<u64>,
+    memory_bytes: Option<u64>,
+    connections: Vec<ConnectionRecord>,
 }
 
 impl TelemetryStore {
@@ -338,6 +345,10 @@ impl TelemetryStore {
             traffic_history: VecDeque::with_capacity(traffic_capacity),
             latest_traffic: None,
             connection_count: None,
+            upload_total_bytes: None,
+            download_total_bytes: None,
+            memory_bytes: None,
+            connections: Vec::with_capacity(CONNECTION_RECORD_CAPACITY),
         })
     }
 
@@ -346,6 +357,10 @@ impl TelemetryStore {
         self.latest_traffic = None;
         self.traffic_history.clear();
         self.connection_count = None;
+        self.upload_total_bytes = None;
+        self.download_total_bytes = None;
+        self.memory_bytes = None;
+        self.connections.clear();
     }
 
     pub fn publish_traffic(
@@ -364,11 +379,26 @@ impl TelemetryStore {
         true
     }
 
-    pub fn publish_connections(&mut self, generation: CoreInstanceGeneration, count: u64) -> bool {
+    pub fn publish_connections(
+        &mut self,
+        generation: CoreInstanceGeneration,
+        count: u64,
+        upload_total_bytes: u64,
+        download_total_bytes: u64,
+        memory_bytes: Option<u64>,
+        connections: Vec<ConnectionRecord>,
+    ) -> bool {
         if generation != self.core_generation {
             return false;
         }
         self.connection_count = Some(count);
+        self.upload_total_bytes = Some(upload_total_bytes);
+        self.download_total_bytes = Some(download_total_bytes);
+        self.memory_bytes = memory_bytes;
+        self.connections = connections
+            .into_iter()
+            .take(CONNECTION_RECORD_CAPACITY)
+            .collect();
         true
     }
 
@@ -417,6 +447,26 @@ impl TelemetryStore {
     #[must_use]
     pub fn connection_count(&self) -> Option<u64> {
         self.connection_count
+    }
+
+    #[must_use]
+    pub fn upload_total_bytes(&self) -> Option<u64> {
+        self.upload_total_bytes
+    }
+
+    #[must_use]
+    pub fn download_total_bytes(&self) -> Option<u64> {
+        self.download_total_bytes
+    }
+
+    #[must_use]
+    pub fn memory_bytes(&self) -> Option<u64> {
+        self.memory_bytes
+    }
+
+    #[must_use]
+    pub fn connections(&self) -> &[ConnectionRecord] {
+        &self.connections
     }
 }
 

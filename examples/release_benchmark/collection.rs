@@ -41,8 +41,8 @@ use super::reporting::{
     validate_sample_environment, validate_sample_inputs, write_json_new,
 };
 use super::runtime_support::{
-    LifecycleGuard, command_json, curve_point, parse_log_level, parse_page, push_bounded_series,
-    spawn_fixture_service, validate_release_application_scale, wait_for_active_status,
+    LifecycleGuard, command_json, curve_point, parse_log_level, parse_page, spawn_fixture_service,
+    validate_release_application_scale, wait_for_active_status,
 };
 use super::support::{elapsed_ms, ensure_collection_running, invalid};
 use super::workload::generate_workload;
@@ -584,8 +584,6 @@ fn collect_product_metrics(
                             state: SampleState::Fresh,
                         },
                     );
-                    push_bounded_series(&mut state.upload_series, upload);
-                    push_bounded_series(&mut state.download_series, download);
                 }
                 _ => return Err(invalid("telemetry record type is unsupported")),
             }

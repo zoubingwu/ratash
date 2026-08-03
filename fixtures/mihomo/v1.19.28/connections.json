@@ -2,11 +2,34 @@
   "connections": [
     {
       "chains": ["provider-only", "Manual"],
-      "id": "fixture-connection"
+      "download": 2048,
+      "id": "fixture-connection",
+      "metadata": {
+        "destinationIP": "93.184.216.34",
+        "destinationPort": "443",
+        "host": "example.com",
+        "network": "tcp"
+      },
+      "rule": "DOMAIN-SUFFIX",
+      "rulePayload": "example.com",
+      "start": "2026-08-03T10:00:00.000000+08:00",
+      "upload": 1024
     },
     {
       "chains": ["DIRECT"],
-      "id": "fixture-direct"
+      "download": 128,
+      "id": "fixture-direct",
+      "metadata": {
+        "destinationIP": "1.1.1.1",
+        "destinationPort": "53",
+        "host": "",
+        "network": "udp",
+        "sniffHost": "dns.google"
+      },
+      "rule": "MATCH",
+      "rulePayload": "",
+      "start": "2026-08-03T10:00:01.000000+08:00",
+      "upload": 64
     }
   ],
   "downloadTotal": 8192,

@@ -133,8 +133,8 @@ pub(super) fn collect_tui_process_metrics(
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut output = Vec::new();
         while !output
-            .windows("Overview".len())
-            .any(|bytes| bytes == b"Overview")
+            .windows("Proxies".len())
+            .any(|bytes| bytes == b"Proxies")
         {
             ensure_collection_running(signal)?;
             let remaining = deadline.saturating_duration_since(Instant::now());

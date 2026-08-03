@@ -1,6 +1,5 @@
 //! Provides exact-process cleanup and fixture command support.
 
-use std::collections::VecDeque;
 use std::env;
 use std::error::Error;
 use std::io;
@@ -13,7 +12,6 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde_json::{Value, json};
 
-use ratash::constants::TRAFFIC_SERIES_CAPACITY;
 use ratash::lifecycle::{ProcessIdentity, ProcessInspector, PsProcessInspector};
 use ratash::telemetry::LogLevel;
 use ratash::tui::Page;
@@ -43,20 +41,12 @@ pub(super) fn parse_log_level(value: &str) -> Result<LogLevel, Box<dyn Error>> {
 
 pub(super) fn parse_page(value: &str) -> Result<Page, Box<dyn Error>> {
     match value {
-        "overview" => Ok(Page::Overview),
         "proxies" => Ok(Page::Proxies),
         "connections" => Ok(Page::Connections),
         "rules" => Ok(Page::Rules),
         "logs" => Ok(Page::Logs),
         _ => Err(invalid("TUI event page is unsupported")),
     }
-}
-
-pub(super) fn push_bounded_series(series: &mut VecDeque<u64>, value: u64) {
-    if series.len() == TRAFFIC_SERIES_CAPACITY {
-        series.pop_front();
-    }
-    series.push_back(value);
 }
 
 pub(super) struct LifecycleGuard {

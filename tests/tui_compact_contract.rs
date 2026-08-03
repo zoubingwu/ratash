@@ -6,17 +6,11 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
 #[test]
-fn shared_frame_renders_the_five_page_information_architecture_at_minimum_size() {
+fn shared_frame_renders_the_four_page_information_architecture_at_minimum_size() {
     let area = Rect::new(0, 0, 80, 24);
     let mut state = AppState::new();
 
-    for page in [
-        Page::Overview,
-        Page::Proxies,
-        Page::Connections,
-        Page::Rules,
-        Page::Logs,
-    ] {
+    for page in [Page::Proxies, Page::Connections, Page::Rules, Page::Logs] {
         state.page = page;
         let mut buffer = Buffer::empty(area);
 
@@ -24,7 +18,7 @@ fn shared_frame_renders_the_five_page_information_architecture_at_minimum_size()
 
         let text = buffer_text(&buffer);
         assert!(
-            ["Overview", "Proxies", "Connections", "Rules", "Logs"]
+            ["Proxies", "Connections", "Rules", "Logs"]
                 .iter()
                 .all(|title| text.lines().take(3).any(|line| line.contains(title))),
             "missing compact navigation at {page:?}:\n{text}"
@@ -46,7 +40,7 @@ fn proxy_layout_switches_at_the_compact_breakpoints() {
     let (wide, _) = compute_layout(&state, Rect::new(0, 0, 130, 30), 1);
     assert!(wide.proxy_groups.is_some());
     assert!(wide.list.is_some());
-    assert!(wide.detail.is_some());
+    assert!(wide.detail.is_none());
 
     let (medium, _) = compute_layout(&state, Rect::new(0, 0, 129, 30), 1);
     assert!(medium.proxy_groups.is_some());
@@ -92,7 +86,7 @@ fn proxy_node_fields_follow_the_actual_pane_width() {
         .map(|column| medium_buffer[(column, medium_list.y)].symbol())
         .collect::<String>();
     assert!(medium_header.contains("STATUS"));
-    assert!(medium_header.contains("DELAY"));
+    assert!(medium_header.contains("LATENCY"));
     assert!(!medium_header.contains("FRESHNESS"));
     assert!(!medium_header.contains("PROBE"));
 
@@ -104,33 +98,30 @@ fn proxy_node_fields_follow_the_actual_pane_width() {
     let extended_header = (extended_list.x..extended_list.right())
         .map(|column| extended_buffer[(column, extended_list.y)].symbol())
         .collect::<String>();
-    assert!(extended_header.contains("FRESHNESS"));
-    assert!(extended_header.contains("PROBE"));
+    assert!(extended_header.contains("TYPE"));
+    assert!(extended_header.contains("STATUS"));
+    assert!(extended_header.contains("LATENCY"));
+    assert!(!extended_header.contains("SAMPLED"));
+    assert!(!extended_header.contains("FRESHNESS"));
+    assert!(!extended_header.contains("PROBE"));
 }
 
 #[test]
-fn proxy_detail_drawer_and_focus_zoom_are_reversible() {
+fn proxy_focus_zoom_is_reversible() {
     let area = Rect::new(0, 0, 100, 30);
     let mut state = AppState::new();
     state.page = Page::Proxies;
     state.focus = Focus::Content;
 
-    update(&mut state, UiEvent::Intent(UiIntent::ToggleProxyDetail));
-    let (detail, _) = compute_layout(&state, area, 1);
-    assert!(detail.detail.is_some());
-    assert!(detail.proxy_groups.is_none());
-    assert!(detail.list.is_none());
-
-    update(&mut state, UiEvent::Intent(UiIntent::Escape));
     state.focus = Focus::ProxyGroups;
     update(&mut state, UiEvent::Intent(UiIntent::ToggleZoom));
-    let (zoomed, _) = compute_layout(&state, area, 2);
+    let (zoomed, _) = compute_layout(&state, area, 1);
     assert!(zoomed.proxy_groups.is_some());
     assert!(zoomed.list.is_none());
     assert!(zoomed.detail.is_none());
 
     update(&mut state, UiEvent::Intent(UiIntent::Escape));
-    let (restored, _) = compute_layout(&state, area, 3);
+    let (restored, _) = compute_layout(&state, area, 2);
     assert!(restored.proxy_groups.is_some());
     assert!(restored.list.is_some());
 }

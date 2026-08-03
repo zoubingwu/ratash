@@ -59,10 +59,10 @@ pub trait BackgroundApplication: Send + Sync {
         sample: TrafficSample,
     ) -> Result<bool, ApplicationError>;
 
-    fn publish_connection_count(
+    fn publish_connections(
         &self,
         generation: CoreInstanceGeneration,
-        count: u64,
+        summary: ConnectionSummary,
     ) -> Result<bool, ApplicationError>;
 
     fn publish_core_log(
@@ -135,12 +135,12 @@ impl BackgroundApplication for Supervisor {
         Supervisor::publish_traffic(self, generation, sample)
     }
 
-    fn publish_connection_count(
+    fn publish_connections(
         &self,
         generation: CoreInstanceGeneration,
-        count: u64,
+        summary: ConnectionSummary,
     ) -> Result<bool, ApplicationError> {
-        Supervisor::publish_connection_count(self, generation, count)
+        Supervisor::publish_connections(self, generation, summary)
     }
 
     fn publish_core_log(
@@ -637,7 +637,7 @@ fn spawn_connection_thread(
             TelemetryStream::Connections,
             |port, handle| port.open_connection_stream(handle),
             |application, generation, frame, _now| {
-                application.publish_connection_count(generation, frame.active_connections)
+                application.publish_connections(generation, frame)
             },
             None,
         );

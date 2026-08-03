@@ -16,11 +16,11 @@ pub(crate) use reducer::status_requires_snapshot_refresh;
 pub use reducer::{Command, UiEvent, UiIntent, update};
 pub use render::{LayoutRegions, compute_layout, render, render_buffer};
 pub use state::{
-    AppState, CommandPaletteAction, CommandPaletteState, ConnectionState, ConnectionStatus, Focus,
-    FullViewSnapshot, LogLevelFilter, LogsState, Modal, MutationSuccess, Page, PendingOperation,
-    PendingOperationKind, PendingProxyGroupLoad, PendingRuleLoad, ProfileRow, ProfilesState,
-    ProxiesState, ProxyGroupRow, ProxyGroupSnapshot, ProxyRow, ProxySort, RuleListSnapshot,
-    RuleRow, RulesState, ViewLogRecord,
+    AppState, CommandPaletteAction, CommandPaletteState, ConnectionState, ConnectionStatus,
+    ConnectionsState, Focus, FullViewSnapshot, LogLevelFilter, LogsState, Modal, MutationSuccess,
+    Page, PendingOperation, PendingOperationKind, PendingProxyGroupLoad, PendingRuleLoad,
+    ProfileRow, ProfilesState, ProxiesState, ProxyGroupRow, ProxyGroupSnapshot, ProxyRow,
+    ProxySort, RuleListSnapshot, RuleRow, RulesState, ViewLogRecord,
 };
 pub use terminal::{
     CrosstermControl, TerminalAction, TerminalControl, TerminalSession, TerminalSessionError,
@@ -29,7 +29,7 @@ pub use terminal::{
 use reducer::filtered_palette_actions;
 use state::{
     filtered_log_indices, filtered_profiles, filtered_proxy_indices, filtered_rule_indices,
-    selected_log_position, visible_log_start,
+    selected_log_position, visible_log_start, visible_window_start,
 };
 
 pub const PROFILE_VIEW_CAPACITY: usize = 100;

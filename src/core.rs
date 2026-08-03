@@ -5,9 +5,12 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::constants::{
+    CONNECTION_CHAIN_CAPACITY, CONNECTION_FIELD_MAX_BYTES, CONNECTION_RECORD_CAPACITY,
+};
 use crate::domain::{
-    CoreInstanceGeneration, LatencySample, NodeRecordId, ProxyGroupId, RuntimeGeneration,
-    SampleState,
+    ConnectionRecord, CoreInstanceGeneration, LatencySample, NodeRecordId, ProxyGroupId,
+    RuntimeGeneration, SampleState,
 };
 
 pub const PROXY_VIEW_SCHEMA_VERSION: u8 = 1;
@@ -1213,6 +1216,7 @@ pub struct ConnectionSummary {
     pub upload_total_bytes: u64,
     pub download_total_bytes: u64,
     pub memory_bytes: Option<u64>,
+    pub connections: Vec<ConnectionRecord>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1396,11 +1400,18 @@ impl MihomoJsonCodec {
                 "Mihomo connection count exceeds the projection range",
             )
         })?;
+        let connections = raw
+            .connections
+            .into_iter()
+            .take(CONNECTION_RECORD_CAPACITY)
+            .map(project_connection)
+            .collect();
         Ok(ConnectionSummary {
             active_connections,
             upload_total_bytes: raw.upload_total,
             download_total_bytes: raw.download_total,
             memory_bytes: raw.memory,
+            connections,
         })
     }
 
@@ -1471,7 +1482,39 @@ struct RawConnections {
     download_total: u64,
     #[serde(default)]
     memory: Option<u64>,
-    connections: Vec<serde_json::Value>,
+    connections: Vec<RawConnection>,
+}
+
+#[derive(Deserialize)]
+struct RawConnection {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    metadata: RawConnectionMetadata,
+    #[serde(default)]
+    chains: Vec<String>,
+    #[serde(default)]
+    rule: String,
+    #[serde(default, rename = "rulePayload")]
+    rule_payload: String,
+    #[serde(default)]
+    upload: u64,
+    #[serde(default)]
+    download: u64,
+}
+
+#[derive(Default, Deserialize)]
+struct RawConnectionMetadata {
+    #[serde(default)]
+    network: String,
+    #[serde(default)]
+    host: String,
+    #[serde(default, rename = "sniffHost")]
+    sniff_host: String,
+    #[serde(default, rename = "destinationIP")]
+    destination_ip: String,
+    #[serde(default, rename = "destinationPort")]
+    destination_port: String,
 }
 
 #[derive(Deserialize)]
@@ -1480,4 +1523,41 @@ struct RawLog {
     #[serde(rename = "type")]
     kind: String,
     payload: String,
+}
+
+fn project_connection(connection: RawConnection) -> ConnectionRecord {
+    ConnectionRecord {
+        id: bounded_connection_field(connection.id),
+        network: bounded_connection_field(connection.metadata.network),
+        host: bounded_optional_connection_field(connection.metadata.host)
+            .or_else(|| bounded_optional_connection_field(connection.metadata.sniff_host)),
+        destination_ip: bounded_optional_connection_field(connection.metadata.destination_ip),
+        destination_port: bounded_optional_connection_field(connection.metadata.destination_port),
+        chains: connection
+            .chains
+            .into_iter()
+            .take(CONNECTION_CHAIN_CAPACITY)
+            .map(bounded_connection_field)
+            .collect(),
+        rule: bounded_connection_field(connection.rule),
+        rule_payload: bounded_optional_connection_field(connection.rule_payload),
+        upload_bytes: connection.upload,
+        download_bytes: connection.download,
+    }
+}
+
+fn bounded_optional_connection_field(value: String) -> Option<String> {
+    let value = bounded_connection_field(value);
+    (!value.is_empty()).then_some(value)
+}
+
+fn bounded_connection_field(mut value: String) -> String {
+    if value.len() > CONNECTION_FIELD_MAX_BYTES {
+        let mut boundary = CONNECTION_FIELD_MAX_BYTES;
+        while !value.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        value.truncate(boundary);
+    }
+    value
 }

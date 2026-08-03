@@ -11,8 +11,8 @@ use ratash::core::{
     TrafficFrame,
 };
 use ratash::domain::{
-    CoreInstanceGeneration, NodeRecordId, ProbeGeneration, RuntimeGeneration, StreamState,
-    TrafficSample,
+    ConnectionRecord, CoreInstanceGeneration, NodeRecordId, ProbeGeneration, RuntimeGeneration,
+    StreamState, TrafficSample,
 };
 use ratash::profile::ProfileRevision;
 use ratash::scheduler::{
@@ -93,7 +93,7 @@ struct Observed {
     refresh_completed: usize,
     probe_completions: Vec<ProbeCompletion>,
     traffic: Vec<(CoreInstanceGeneration, TrafficSample)>,
-    connections: Vec<(CoreInstanceGeneration, u64)>,
+    connections: Vec<(CoreInstanceGeneration, ConnectionSummary)>,
     logs: Vec<(CoreInstanceGeneration, LogLevel, LogSource, String)>,
     log_drops: Vec<(CoreInstanceGeneration, u64)>,
     stream_states: Vec<(CoreInstanceGeneration, TelemetryStream, StreamState)>,
@@ -336,16 +336,16 @@ impl BackgroundApplication for HarnessApplication {
         Ok(true)
     }
 
-    fn publish_connection_count(
+    fn publish_connections(
         &self,
         generation: CoreInstanceGeneration,
-        count: u64,
+        summary: ConnectionSummary,
     ) -> Result<bool, ApplicationError> {
         if generation.0 != self.managed_generation.load(Ordering::Acquire) {
             return Ok(false);
         }
         let mut observed = self.observed.lock().expect("observations should lock");
-        observed.connections.push((generation, count));
+        observed.connections.push((generation, summary));
         self.changed.notify_all();
         Ok(true)
     }
@@ -513,6 +513,18 @@ impl BackgroundCorePort for HarnessCore {
                 upload_total_bytes: 100,
                 download_total_bytes: 200,
                 memory_bytes: Some(300),
+                connections: vec![ConnectionRecord {
+                    id: "fixture-connection".to_owned(),
+                    network: "tcp".to_owned(),
+                    host: Some("example.com".to_owned()),
+                    destination_ip: Some("93.184.216.34".to_owned()),
+                    destination_port: Some("443".to_owned()),
+                    chains: vec!["Automatic".to_owned()],
+                    rule: "MATCH".to_owned(),
+                    rule_payload: None,
+                    upload_bytes: 100,
+                    download_bytes: 200,
+                }],
             },
             Arc::clone(&self.events_read),
         )))
@@ -727,7 +739,13 @@ fn telemetry_streams_publish_fresh_generation_scoped_values() {
             }
         )]
     );
-    assert_eq!(observed.connections, vec![(generation, 7)]);
+    assert_eq!(observed.connections.len(), 1);
+    assert_eq!(observed.connections[0].0, generation);
+    assert_eq!(observed.connections[0].1.active_connections, 7);
+    assert_eq!(
+        observed.connections[0].1.connections[0].host.as_deref(),
+        Some("example.com")
+    );
     assert_eq!(
         observed.logs,
         vec![(

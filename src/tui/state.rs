@@ -3,10 +3,10 @@
 use std::collections::VecDeque;
 use std::fmt;
 
-use crate::application::{LatencyFreshness, LatencyProbeStatus, PolicyTargetValidation};
+use crate::application::PolicyTargetValidation;
 use crate::constants::{
     LOG_CAPACITY, LOG_RETENTION_MAX_BYTES, MAX_ACTIVE_NODES, MINIMUM_TERMINAL_HEIGHT,
-    MINIMUM_TERMINAL_WIDTH, TRAFFIC_SERIES_CAPACITY,
+    MINIMUM_TERMINAL_WIDTH,
 };
 use crate::domain::{
     LocalRuleSetRevision, NodeRecordId, ProfileId, ProxyGroupId, RuntimeGeneration, StatusSnapshot,
@@ -20,7 +20,6 @@ use super::input::InteractionMap;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Page {
     #[default]
-    Overview,
     Proxies,
     Connections,
     Rules,
@@ -28,21 +27,15 @@ pub enum Page {
 }
 
 impl Page {
-    pub(in crate::tui) const ALL: [Self; 5] = [
-        Self::Overview,
-        Self::Proxies,
-        Self::Connections,
-        Self::Rules,
-        Self::Logs,
-    ];
+    pub(in crate::tui) const ALL: [Self; 4] =
+        [Self::Proxies, Self::Connections, Self::Rules, Self::Logs];
 
     pub(in crate::tui) fn index(self) -> usize {
         match self {
-            Self::Overview => 0,
-            Self::Proxies => 1,
-            Self::Connections => 2,
-            Self::Rules => 3,
-            Self::Logs => 4,
+            Self::Proxies => 0,
+            Self::Connections => 1,
+            Self::Rules => 2,
+            Self::Logs => 3,
         }
     }
 
@@ -56,7 +49,6 @@ impl Page {
 
     pub(in crate::tui) fn title(self) -> &'static str {
         match self {
-            Self::Overview => "Overview",
             Self::Proxies => "Proxies",
             Self::Connections => "Connections",
             Self::Rules => "Rules",
@@ -101,9 +93,6 @@ pub struct ProxyRow {
     pub available: bool,
     pub selected: bool,
     pub delay_ms: Option<u64>,
-    pub sampled_at_unix_ms: Option<u64>,
-    pub freshness: LatencyFreshness,
-    pub probe_status: LatencyProbeStatus,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,6 +100,7 @@ pub struct ProxyGroupRow {
     pub id: ProxyGroupId,
     pub name: String,
     pub proxy_type: String,
+    pub selectable: bool,
     pub selected_node: Option<String>,
 }
 
@@ -237,6 +227,12 @@ pub struct ProxiesState {
     pub sort: ProxySort,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ConnectionsState {
+    pub selected: usize,
+    pub scroll: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingProxyGroupLoad {
     pub request_id: RequestId,
@@ -329,6 +325,7 @@ pub struct LogsState {
     pub since_unix_ms: Option<u64>,
     pub until_unix_ms: Option<u64>,
     pub scroll: usize,
+    pub viewport_start: usize,
     pub follow: bool,
     pub paused: bool,
     pub paused_anchor: Option<u64>,
@@ -342,11 +339,12 @@ impl Default for LogsState {
     fn default() -> Self {
         Self {
             records: VecDeque::with_capacity(LOG_CAPACITY),
-            level_filter: LogLevelFilter::All,
+            level_filter: LogLevelFilter::Info,
             search: String::new(),
             since_unix_ms: None,
             until_unix_ms: None,
             scroll: 0,
+            viewport_start: 0,
             follow: true,
             paused: false,
             paused_anchor: None,
@@ -433,13 +431,11 @@ pub struct AppState {
     pub connection: ConnectionState,
     pub status: Option<StatusSnapshot>,
     pub proxies: ProxiesState,
+    pub connections: ConnectionsState,
     pub profiles: ProfilesState,
     pub command_palette: CommandPaletteState,
     pub rules: RulesState,
     pub logs: LogsState,
-    pub upload_series: VecDeque<u64>,
-    pub download_series: VecDeque<u64>,
-    pub proxy_detail_open: bool,
     pub zoomed_focus: bool,
     pub modal: Option<Modal>,
     pub toast: Option<String>,
@@ -465,7 +461,7 @@ impl AppState {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            page: Page::Overview,
+            page: Page::Proxies,
             focus: Focus::Content,
             connection: ConnectionState {
                 status: ConnectionStatus::Connecting,
@@ -474,13 +470,11 @@ impl AppState {
             },
             status: None,
             proxies: ProxiesState::default(),
+            connections: ConnectionsState::default(),
             profiles: ProfilesState::default(),
             command_palette: CommandPaletteState::default(),
             rules: RulesState::default(),
             logs: LogsState::default(),
-            upload_series: VecDeque::with_capacity(TRAFFIC_SERIES_CAPACITY),
-            download_series: VecDeque::with_capacity(TRAFFIC_SERIES_CAPACITY),
-            proxy_detail_open: false,
             zoomed_focus: false,
             modal: None,
             toast: None,
@@ -556,6 +550,7 @@ impl AppState {
         self.profiles.activation_pending = None;
         self.proxies.group_load_pending = None;
         self.proxies.selection_pending = None;
+        self.connections = ConnectionsState::default();
         self.rules.load_pending = None;
         self.rules.loaded_connection_generation = None;
         self.rules.loaded_runtime_generation = None;
@@ -600,7 +595,6 @@ impl AppState {
                     .position(|group| &group.name == selected)
             })
             .unwrap_or(0);
-        self.push_traffic_sample();
         self.clamp_selections();
         self.render_dirty = true;
     }
@@ -677,7 +671,7 @@ impl AppState {
             self.profiles.selected = index;
         }
         if replace_status {
-            self.status = Some(snapshot.status);
+            self.set_status_preserving_connection_selection(snapshot.status);
             self.status_revision = self.status_revision.wrapping_add(1).max(1);
         }
         self.connection.snapshot_stale = false;
@@ -703,20 +697,31 @@ impl AppState {
         self.render_dirty = true;
     }
 
-    pub(in crate::tui) fn push_traffic_sample(&mut self) {
-        let Some(status) = &self.status else {
-            return;
-        };
-        push_bounded(
-            &mut self.upload_series,
-            status.traffic.upload_bytes_per_second,
-            TRAFFIC_SERIES_CAPACITY,
-        );
-        push_bounded(
-            &mut self.download_series,
-            status.traffic.download_bytes_per_second,
-            TRAFFIC_SERIES_CAPACITY,
-        );
+    pub(in crate::tui) fn set_status_preserving_connection_selection(
+        &mut self,
+        status: StatusSnapshot,
+    ) {
+        let selected_connection = self
+            .status
+            .as_ref()
+            .and_then(|current| current.connections.get(self.connections.selected))
+            .map(|connection| connection.id.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
+        self.status = Some(status);
+        if let Some(selected_connection) = selected_connection
+            && let Some(index) = self.status.as_ref().and_then(|current| {
+                current
+                    .connections
+                    .iter()
+                    .position(|connection| connection.id == selected_connection)
+            })
+        {
+            self.connections.selected = index;
+        }
+        self.connections.selected =
+            clamp_index(self.connections.selected, self.connection_record_count());
+        self.connections.scroll = self.connections.scroll.min(self.connections.selected);
     }
 
     pub(in crate::tui) fn clamp_selections(&mut self) {
@@ -725,11 +730,18 @@ impl AppState {
         self.proxies.selected = clamp_index(self.proxies.selected, self.filtered_proxy_count());
         self.profiles.selected = clamp_index(self.profiles.selected, self.filtered_profile_count());
         self.rules.selected = clamp_index(self.rules.selected, self.filtered_rule_count());
+        self.connections.selected =
+            clamp_index(self.connections.selected, self.connection_record_count());
+        self.connections.scroll = self.connections.scroll.min(self.connections.selected);
         if self.logs.follow {
             self.logs.scroll = 0;
         } else {
             self.logs.scroll = clamp_index(self.logs.scroll, self.filtered_log_count());
         }
+        self.logs.viewport_start = self
+            .logs
+            .viewport_start
+            .min(self.filtered_log_count().saturating_sub(1));
     }
 
     pub(in crate::tui) fn filtered_proxy_count(&self) -> usize {
@@ -746,6 +758,12 @@ impl AppState {
 
     pub(in crate::tui) fn filtered_log_count(&self) -> usize {
         filtered_log_indices(&self.logs).len()
+    }
+
+    pub(in crate::tui) fn connection_record_count(&self) -> usize {
+        self.status
+            .as_ref()
+            .map_or(0, |status| status.connections.len())
     }
 
     pub(in crate::tui) fn rules_projection_ready(&self) -> bool {
@@ -866,7 +884,8 @@ pub(in crate::tui) fn filtered_log_indices(state: &LogsState) -> Vec<usize> {
         .records
         .iter()
         .enumerate()
-        .filter(|(_, record)| state.level_filter.matches(record.level))
+        .filter(|(_, record)| record.source == LogSource::CoreApi)
+        .filter(|(_, record)| query.level.is_some() || state.level_filter.matches(record.level))
         .filter(|(_, record)| query.level.is_none_or(|level| level.matches(record.level)))
         .filter(|(_, record)| since.is_none_or(|since| record.timestamp_unix_ms >= since))
         .filter(|(_, record)| until.is_none_or(|until| record.timestamp_unix_ms <= until))
@@ -898,8 +917,40 @@ pub(in crate::tui) fn visible_log_start(
 ) -> usize {
     selected_log_position(state, filtered_count).map_or_else(
         || filtered_count.saturating_sub(visible_count),
-        |selected| selected.saturating_add(1).saturating_sub(visible_count),
+        |selected| {
+            visible_window_start(
+                state.viewport_start,
+                selected,
+                visible_count,
+                filtered_count,
+            )
+        },
     )
+}
+
+pub(in crate::tui) fn visible_window_start(
+    current: usize,
+    selected: usize,
+    visible_count: usize,
+    total: usize,
+) -> usize {
+    if total == 0 || visible_count >= total {
+        return 0;
+    }
+    if visible_count == 0 {
+        return selected.min(total.saturating_sub(1));
+    }
+    let current = current.min(total.saturating_sub(visible_count));
+    if selected < current {
+        selected
+    } else if selected >= current.saturating_add(visible_count) {
+        selected
+            .saturating_add(1)
+            .saturating_sub(visible_count)
+            .min(total.saturating_sub(visible_count))
+    } else {
+        current
+    }
 }
 
 #[derive(Debug, Default)]
@@ -981,11 +1032,4 @@ pub(in crate::tui) fn push_view_log(logs: &mut LogsState, mut record: ViewLogRec
     }
     logs.retained_bytes = logs.retained_bytes.saturating_add(record.message.len());
     logs.records.push_back(record);
-}
-
-fn push_bounded(values: &mut VecDeque<u64>, value: u64, capacity: usize) {
-    if values.len() == capacity {
-        values.pop_front();
-    }
-    values.push_back(value);
 }

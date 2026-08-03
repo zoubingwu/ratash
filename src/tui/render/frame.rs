@@ -6,94 +6,83 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Widget};
 
+use crate::config::BUNDLED_CORE_VERSION;
 use crate::constants::{MINIMUM_TERMINAL_HEIGHT, MINIMUM_TERMINAL_WIDTH};
 use crate::domain::{CoreLifecycle, RuntimeRecoveryStatus, SupervisorLifecycle};
 
 use super::super::{
     AppState, CommandPaletteAction, ConnectionStatus, Focus, Modal, Page, filtered_palette_actions,
-    filtered_profiles,
+    filtered_profiles, visible_window_start,
 };
 use super::layout::{
     LayoutRegions, command_palette_area, footer_controls_visible, footer_help_area,
     footer_quit_area, navigation_items, profile_sheet_regions, sheet_action_area, sheet_close_area,
 };
 use super::{
-    ACCENT, GOOD, MUTED, WARN, diagnostic_title, fit_column, format_rate, health_reason_title,
-    render_separator, selected_style, terminal_safe, terminal_safe_multiline, title_line,
-    tun_reason_title,
+    ACCENT, GOOD, MUTED, WARN, diagnostic_title, fit_column, fit_node_name, format_bytes,
+    format_rate, health_reason_title, render_separator, selected_style, terminal_safe,
+    terminal_safe_multiline, title_line, tun_reason_title,
 };
 
 pub(super) fn render_header(state: &AppState, regions: &LayoutRegions, buffer: &mut Buffer) {
-    let (profile, tun, download, upload, connections) = state.status.as_ref().map_or_else(
-        || {
-            (
-                Cow::Borrowed("-"),
-                "--",
-                "-".to_owned(),
-                "-".to_owned(),
-                "-".to_owned(),
-            )
-        },
+    let status = state.status.as_ref();
+    let profile = status
+        .and_then(|status| status.active_profile.as_ref())
+        .map_or_else(
+            || Cow::Borrowed("-"),
+            |profile| terminal_safe(&profile.name),
+        );
+    let node = status
+        .and_then(|status| status.selected_node.as_ref())
+        .map_or_else(|| Cow::Borrowed("-"), |node| terminal_safe(&node.name));
+    let latency = status
+        .and_then(|status| status.latency.as_ref())
+        .and_then(|sample| sample.delay_ms)
+        .map_or_else(|| "-".to_owned(), |delay| format!("{delay} ms"));
+    let tun = status.map_or(
+        "--",
         |status| {
-            (
-                status.active_profile.as_ref().map_or_else(
-                    || Cow::Borrowed("-"),
-                    |profile| terminal_safe(&profile.name),
-                ),
-                if status.tun.effective { "ON" } else { "OFF" },
-                format_rate(status.traffic.download_bytes_per_second),
-                format_rate(status.traffic.upload_bytes_per_second),
-                status.connection_count.to_string(),
-            )
+            if status.tun.effective { "ON" } else { "OFF" }
         },
     );
     let (health, dot_color) = header_health(state);
-    if regions.status.width < 90 {
-        render_compact_status(
-            state,
-            regions.status,
-            health,
-            dot_color,
-            profile.as_ref(),
-            tun,
-            buffer,
-        );
+    let compact = regions.status.width < 110;
+    let health = if regions.status.width < 100 {
+        compact_health_title(health)
     } else {
-        render_full_status(
-            state,
-            regions.status,
-            health,
-            dot_color,
-            profile,
-            tun,
-            download,
-            upload,
-            connections,
-            buffer,
-        );
-    }
-
-    render_navigation(state, regions, buffer);
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_full_status(
-    state: &AppState,
-    area: Rect,
-    health: &'static str,
-    dot_color: Color,
-    profile: Cow<'_, str>,
-    tun: &'static str,
-    download: String,
-    upload: String,
-    connections: String,
-    buffer: &mut Buffer,
-) {
-    let prefix_width =
-        Span::raw("● ").width() + Span::raw(health).width() + Span::raw("  Profile: ").width();
-    let mode_and_tun_width = Span::raw("  Mode: RULE  TUN: ").width() + Span::raw(tun).width();
-    let profile = terminal_safe(profile.as_ref());
-    let mut line = vec![
+        health
+    };
+    let traffic = status.map_or_else(
+        || "Traffic: -".to_owned(),
+        |status| {
+            if compact {
+                format!(
+                    "Traffic: ↓{} ↑{}",
+                    compact_rate(status.traffic.download_bytes_per_second),
+                    compact_rate(status.traffic.upload_bytes_per_second)
+                )
+            } else {
+                format!(
+                    "Traffic: ↓ {}  ↑ {}",
+                    format_rate(status.traffic.download_bytes_per_second),
+                    format_rate(status.traffic.upload_bytes_per_second)
+                )
+            }
+        },
+    );
+    let first = Rect::new(regions.status.x, regions.status.y, regions.status.width, 1);
+    let traffic_width = u16::try_from(Span::raw(traffic.as_str()).width())
+        .unwrap_or(u16::MAX)
+        .min(first.width);
+    let traffic_area = Rect::new(
+        first.right().saturating_sub(traffic_width),
+        first.y,
+        traffic_width,
+        1,
+    );
+    let profile_width = if compact { 10 } else { 24 };
+    let node_width = if compact { 12 } else { 28 };
+    let mut first_line = vec![
         Span::styled("●", Style::default().fg(dot_color)),
         Span::raw(" "),
         Span::styled(
@@ -103,124 +92,111 @@ fn render_full_status(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  Profile: "),
+        Span::styled(
+            fit_column(profile.as_ref(), profile_width),
+            Style::default().fg(ACCENT),
+        ),
+        Span::raw("  Node: "),
+        Span::styled(
+            fit_node_name(node.as_ref(), node_width),
+            Style::default().fg(ACCENT),
+        ),
     ];
-    if health == "CONNECTED" {
-        let metrics = format!("  ↓ {download}  ↑ {upload}  {connections} conn");
-        let profile_width = (area.width as usize)
-            .saturating_sub(prefix_width)
-            .saturating_sub(mode_and_tun_width)
-            .saturating_sub(Span::raw(&metrics).width());
-        line.push(Span::styled(
-            fit_column(profile.as_ref(), profile_width),
-            Style::default().fg(ACCENT),
-        ));
-        push_mode_and_tun(&mut line, tun);
-        line.push(Span::raw(metrics));
-    } else {
-        let recovery_label = "  Recovery: ";
-        let reason = header_recovery_reason(state);
-        let available = (area.width as usize)
-            .saturating_sub(prefix_width)
-            .saturating_sub(mode_and_tun_width)
-            .saturating_sub(Span::raw(recovery_label).width());
-        let reason_width = Span::raw(reason.as_ref()).width().min(available);
-        let profile_width = Span::raw(profile.as_ref())
-            .width()
-            .min(available.saturating_sub(reason_width));
-        let reason_width = available.saturating_sub(profile_width);
-        line.push(Span::styled(
-            fit_column(profile.as_ref(), profile_width),
-            Style::default().fg(ACCENT),
-        ));
-        push_mode_and_tun(&mut line, tun);
-        line.push(Span::raw("  Recovery: "));
-        line.push(Span::styled(
-            fit_column(reason.as_ref(), reason_width),
-            Style::default().fg(WARN),
-        ));
+    if !compact {
+        first_line.push(Span::raw("  Latency: "));
+        first_line.push(Span::raw(latency));
     }
-    Paragraph::new(Line::from(line)).render(area, buffer);
-}
+    let left_width = traffic_area.x.saturating_sub(first.x).saturating_sub(2);
+    Paragraph::new(Line::from(first_line))
+        .render(Rect::new(first.x, first.y, left_width, 1), buffer);
+    Paragraph::new(traffic)
+        .style(Style::default().fg(ACCENT))
+        .render(traffic_area, buffer);
 
-fn push_mode_and_tun<'a>(line: &mut Vec<Span<'a>>, tun: &'static str) {
-    line.push(Span::raw("  Mode: "));
-    line.push(Span::styled("RULE", Style::default().fg(ACCENT)));
-    line.push(Span::raw("  TUN: "));
-    line.push(Span::styled(
-        tun,
-        Style::default().fg(if tun == "ON" { ACCENT } else { WARN }),
-    ));
-}
-
-fn render_compact_status(
-    state: &AppState,
-    area: Rect,
-    health: &'static str,
-    dot_color: Color,
-    profile: &str,
-    tun: &'static str,
-    buffer: &mut Buffer,
-) {
-    let short_health = compact_health_title(health);
-    let prefix = format!("● {short_health}  ");
-    if health == "CONNECTED" {
-        let status = state
-            .status
-            .as_ref()
-            .expect("connected header health requires a status snapshot");
-        let tun_badge = if tun == "ON" { "[TUN]" } else { "[TUN OFF]" };
-        let suffix = format!(
-            "  [RULE] {tun_badge}  ↓{} ↑{} {}",
-            compact_rate(status.traffic.download_bytes_per_second),
-            compact_rate(status.traffic.upload_bytes_per_second),
-            status.connection_count,
-        );
-        let profile_width = (area.width as usize)
-            .saturating_sub(Span::raw(&prefix).width())
-            .saturating_sub(Span::raw(&suffix).width());
-        Paragraph::new(Line::from(vec![
-            Span::styled("●", Style::default().fg(dot_color)),
-            Span::raw(format!(" {short_health}  ")),
+    let compact_details = regions.status.width < 140;
+    let (download_total, upload_total, memory, connections) = status.map_or_else(
+        || {
+            (
+                "-".to_owned(),
+                "-".to_owned(),
+                "-".to_owned(),
+                "-".to_owned(),
+            )
+        },
+        |status| {
+            if compact_details {
+                (
+                    compact_bytes(status.download_total_bytes),
+                    compact_bytes(status.upload_total_bytes),
+                    status
+                        .memory_bytes
+                        .map_or_else(|| "-".to_owned(), compact_bytes),
+                    status.connection_count.to_string(),
+                )
+            } else {
+                (
+                    format_bytes(status.download_total_bytes),
+                    format_bytes(status.upload_total_bytes),
+                    status
+                        .memory_bytes
+                        .map_or_else(|| "-".to_owned(), format_bytes),
+                    status.connection_count.to_string(),
+                )
+            }
+        },
+    );
+    let second = Rect::new(
+        regions.status.x,
+        regions.status.y.saturating_add(1),
+        regions.status.width,
+        1,
+    );
+    let pid = status
+        .and_then(|status| status.core.pid)
+        .map_or_else(|| "-".to_owned(), |pid| pid.to_string());
+    let mut details = if compact_details {
+        vec![
+            Span::raw("Total:"),
             Span::styled(
-                fit_column(profile, profile_width),
+                format!("↓{download_total} ↑{upload_total}"),
                 Style::default().fg(ACCENT),
             ),
-            Span::raw("  "),
-            Span::styled("[RULE]", Style::default().fg(ACCENT)),
-            Span::raw(" "),
-            Span::styled(tun_badge, Style::default().fg(ACCENT)),
+            Span::raw(format!(" Mem:{memory} Connections: {connections} Mihomo:")),
+            Span::styled(BUNDLED_CORE_VERSION, Style::default().fg(ACCENT)),
+            Span::raw(" RULE API:UNIX TUN:"),
+            Span::styled(
+                tun,
+                Style::default().fg(if tun == "ON" { ACCENT } else { WARN }),
+            ),
+        ]
+    } else {
+        vec![
+            Span::raw("Total: "),
+            Span::styled(format!("↓ {download_total}"), Style::default().fg(ACCENT)),
+            Span::styled(format!("  ↑ {upload_total}"), Style::default().fg(ACCENT)),
             Span::raw(format!(
-                "  ↓{} ↑{} {}",
-                compact_rate(status.traffic.download_bytes_per_second),
-                compact_rate(status.traffic.upload_bytes_per_second),
-                status.connection_count,
+                "  Memory: {memory}  Connections: {connections}  Mihomo: "
             )),
-        ]))
-        .render(area, buffer);
-        return;
-    }
-
-    let recovery_label = "  Recovery: ";
-    let available = (area.width as usize)
-        .saturating_sub(Span::raw(&prefix).width())
-        .saturating_sub(Span::raw(recovery_label).width());
-    let natural_profile_width = Span::raw(profile).width().max(1);
-    let profile_width = natural_profile_width.min(available.saturating_sub(12).min(18));
-    let reason_width = available.saturating_sub(profile_width);
-    Paragraph::new(Line::from(vec![
-        Span::styled("●", Style::default().fg(dot_color)),
-        Span::raw(format!(" {short_health}  ")),
-        Span::styled(
-            fit_column(profile, profile_width),
-            Style::default().fg(ACCENT),
-        ),
-        Span::raw(recovery_label),
-        Span::styled(
-            fit_column(header_recovery_reason(state).as_ref(), reason_width),
+            Span::styled(BUNDLED_CORE_VERSION, Style::default().fg(ACCENT)),
+            Span::raw(format!("  PID: {pid}  Mode: ")),
+            Span::styled("RULE", Style::default().fg(ACCENT)),
+            Span::raw("  Mixed: OFF  API: UNIX  TUN: "),
+            Span::styled(
+                tun,
+                Style::default().fg(if tun == "ON" { ACCENT } else { WARN }),
+            ),
+        ]
+    };
+    if regions.status.width >= 120 && health != "CONNECTED" && health != "UP" {
+        details.push(Span::raw("  Recovery: "));
+        details.push(Span::styled(
+            header_recovery_reason(state),
             Style::default().fg(WARN),
-        ),
-    ]))
-    .render(area, buffer);
+        ));
+    }
+    Paragraph::new(Line::from(details)).render(second, buffer);
+
+    render_navigation(state, regions, buffer);
 }
 
 fn compact_health_title(health: &str) -> &str {
@@ -256,6 +232,25 @@ fn compact_rate(bytes_per_second: u64) -> String {
         format!("{:.1}K", rate / KIB)
     } else {
         format!("{bytes_per_second}B")
+    }
+}
+
+fn compact_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    const TIB: f64 = GIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= TIB {
+        format!("{:.1}T", bytes / TIB)
+    } else if bytes >= GIB {
+        format!("{:.1}G", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1}M", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1}K", bytes / KIB)
+    } else {
+        format!("{bytes:.0}B")
     }
 }
 
@@ -432,16 +427,31 @@ fn footer_context(state: &AppState) -> &'static str {
         Some(Modal::LifecycleConfirmation { .. }) => "Enter Confirm  Esc Cancel",
         Some(Modal::Help | Modal::Message { .. }) => "Esc Close",
         None => match state.focus {
-            Focus::Tabs => "1–5 Pages  Tab Next Focus",
+            Focus::Tabs => "1–4 Pages  Tab Next Focus",
             Focus::ProxyGroups => "j/k Move  Enter Open  l Nodes  z Zoom",
             Focus::Search => "Type Filter  Backspace Delete  Enter Done  Esc Close",
             Focus::FooterHelp => "Enter Help  Tab Next Focus",
             Focus::FooterQuit => "Enter Quit  Tab Next Focus",
             Focus::Modal => "Esc Close",
             Focus::Content => match state.page {
-                Page::Overview => "p Profiles  1–5 Pages",
-                Page::Proxies => "j/k Move  Enter Select  / Search  d Details",
-                Page::Connections => "1–5 Pages  : Commands",
+                Page::Proxies
+                    if state
+                        .proxies
+                        .selected_group
+                        .as_ref()
+                        .and_then(|selected| {
+                            state
+                                .proxies
+                                .groups
+                                .iter()
+                                .find(|group| &group.name == selected)
+                        })
+                        .is_some_and(|group| !group.selectable) =>
+                {
+                    "j/k Move  Automatic Group  / Search  p Profiles"
+                }
+                Page::Proxies => "j/k Move  Enter Select  / Search  p Profiles",
+                Page::Connections => "j/k Move  p Profiles  : Commands",
                 Page::Rules if state.rules_projection_ready() => {
                     "j/k Move  Enter Edit  a Add  x Remove"
                 }
@@ -480,8 +490,8 @@ pub(super) fn render_modal(
         }
         Modal::Help => render_message_sheet(
             "Keyboard and mouse help",
-            "1–5 pages · Tab/Shift+Tab focus · arrows or j/k move\n\
-             Enter activates · / searches · d opens Node detail · z zooms Proxy focus\n\
+            "1–4 pages · Tab/Shift+Tab focus · arrows or j/k move\n\
+             Enter activates · / searches · z zooms Proxy focus · p opens Profiles\n\
              s sorts Nodes · a adds, Enter edits, x removes Rules\n\
              p pauses Logs · f follows Logs\n\
              Logs: a/d/i/w/e selects All/Debug/Info/Warn/Error\n\
@@ -695,12 +705,18 @@ fn render_profiles(state: &AppState, area: Rect, buffer: &mut Buffer) {
     Paragraph::new(format!("/{}", terminal_safe(&state.profiles.filter)))
         .style(search_style)
         .render(regions.search, buffer);
-    Paragraph::new("  STATE               PROFILE                      FRESH  NEXT REFRESH")
+    Paragraph::new("  STATE               PROFILE                      ERROR")
         .style(Style::default().fg(MUTED))
         .render(regions.header, buffer);
 
     let rows = filtered_profiles(&state.profiles);
-    let offset = state.profiles.scroll.min(state.profiles.selected);
+    let visible = regions.list.height as usize;
+    let offset = visible_window_start(
+        state.profiles.scroll,
+        state.profiles.selected,
+        visible,
+        rows.len(),
+    );
     for (visible_index, row) in rows
         .into_iter()
         .skip(offset)
@@ -715,16 +731,14 @@ fn render_profiles(state: &AppState, area: Rect, buffer: &mut Buffer) {
             (false, true) => "         [pending]",
             (false, false) => "                  ",
         };
-        let freshness = if row.fresh { "fresh" } else { "stale" };
         let error = row
             .error
             .as_deref()
             .map_or_else(|| Cow::Borrowed(""), terminal_safe);
         let line = format!(
-            "{} {state_label:<18} {} {freshness:<6} {} {error}",
+            "{} {state_label:<18} {} {error}",
             if selected { "▌" } else { " " },
             fit_column(&row.name, 28),
-            row.next_refresh_at_unix_ms,
         );
         Paragraph::new(line)
             .style(if selected {

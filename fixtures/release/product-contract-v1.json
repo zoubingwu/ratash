@@ -59,6 +59,8 @@
     "wrapper_diagnostics": 256,
     "status_subscriber": 64,
     "traffic_series": 300,
+    "connection_records": 256,
+    "connection_chain_entries": 16,
     "local_rules": 20000
   },
   "byte_limits": {
@@ -80,6 +82,7 @@
     "log_broker_recovery": 4194304,
     "log_tail": 4194304,
     "log_subscriber": 4194304,
+    "connection_field": 512,
     "json_output": 134217728,
     "tui_search": 256
   },

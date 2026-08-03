@@ -6,7 +6,7 @@ use super::super::{
     AppState, Focus, Interaction, InteractionMap, LogLevelFilter, Modal, Page, ProxiesState,
     ProxySort, ScrollInteraction, UiIntent, filtered_log_indices, filtered_palette_actions,
     filtered_profiles, filtered_proxy_indices, filtered_rule_indices, selected_log_position,
-    visible_log_start,
+    visible_log_start, visible_window_start,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -65,7 +65,7 @@ pub fn compute_layout(
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            Constraint::Length(2),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(1),
@@ -136,7 +136,10 @@ fn page_regions(
     filtered_log_count: usize,
 ) -> (Option<Rect>, Option<Rect>, Option<Rect>, Option<Rect>) {
     match state.page {
-        Page::Overview | Page::Connections => (None, None, None, None),
+        Page::Connections => {
+            let (_, list) = title_and_list(content, 1);
+            (None, None, Some(list), None)
+        }
         Page::Proxies => proxy_regions(state, content),
         Page::Rules => {
             let (search, list) = title_and_list(content, 1);
@@ -175,9 +178,6 @@ fn proxy_regions(
     content: Rect,
 ) -> (Option<Rect>, Option<Rect>, Option<Rect>, Option<Rect>) {
     let (title, body) = title_and_list(content, 1);
-    if state.proxy_detail_open {
-        return (None, None, None, Some(content));
-    }
     if state.zoomed_focus {
         return if state.focus == Focus::ProxyGroups {
             (Some(content), None, None, None)
@@ -193,34 +193,15 @@ fn proxy_regions(
         };
     }
 
-    if content.width >= 130 {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(22),
-                Constraint::Length(1),
-                Constraint::Min(30),
-                Constraint::Length(1),
-                Constraint::Length(34),
-            ])
-            .split(body);
-        (
-            Some(columns[0]),
-            Some(title),
-            Some(columns[2]),
-            Some(columns[4]),
-        )
-    } else {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(22),
-                Constraint::Length(1),
-                Constraint::Min(30),
-            ])
-            .split(body);
-        (Some(columns[0]), Some(title), Some(columns[2]), None)
-    }
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(22),
+            Constraint::Length(1),
+            Constraint::Min(30),
+        ])
+        .split(body);
+    (Some(columns[0]), Some(title), Some(columns[2]), None)
 }
 
 fn title_and_list(content: Rect, title_height: u16) -> (Rect, Rect) {
@@ -434,7 +415,9 @@ fn interaction_map(
     }
 
     match state.page {
-        Page::Overview | Page::Connections => {}
+        Page::Connections => {
+            connections_interactions(state, regions, &mut interactions, &mut scroll_regions)
+        }
         Page::Proxies => proxy_interactions(state, regions, &mut interactions, &mut scroll_regions),
         Page::Rules => rules_interactions(state, regions, &mut interactions, &mut scroll_regions),
         Page::Logs => logs_interactions(state, regions, &mut interactions, &mut scroll_regions),
@@ -477,7 +460,12 @@ fn interaction_map(
                 });
                 scroll_regions.push(ScrollInteraction { area: sheet.list });
                 let visible = sheet.list.height as usize;
-                let offset = state.profiles.scroll.min(state.profiles.selected);
+                let offset = visible_window_start(
+                    state.profiles.scroll,
+                    state.profiles.selected,
+                    visible,
+                    state.filtered_profile_count(),
+                );
                 for (row_index, row) in filtered_profiles(&state.profiles)
                     .into_iter()
                     .skip(offset)
@@ -600,7 +588,12 @@ fn proxy_interactions(
             return;
         }
         let visible = list.height.saturating_sub(1) as usize;
-        let offset = state.proxies.scroll.min(state.proxies.selected);
+        let offset = visible_window_start(
+            state.proxies.scroll,
+            state.proxies.selected,
+            visible,
+            regions.proxy_row_indices().len(),
+        );
         for (row_index, row_index_in_state) in regions
             .proxy_row_indices()
             .iter()
@@ -610,6 +603,15 @@ fn proxy_interactions(
             .enumerate()
         {
             let row = &state.proxies.rows[row_index_in_state];
+            if !state
+                .proxies
+                .groups
+                .iter()
+                .find(|group| group.id == row.group_id)
+                .is_some_and(|group| group.selectable)
+            {
+                continue;
+            }
             let Some(node_id) = row.node_id.clone() else {
                 continue;
             };
@@ -657,7 +659,13 @@ fn rules_interactions(
             list.height.saturating_sub(detail_height),
         );
         scroll_regions.push(ScrollInteraction { area: table });
-        let offset = state.rules.scroll.min(state.rules.selected);
+        let visible = table.height.saturating_sub(1) as usize;
+        let offset = visible_window_start(
+            state.rules.scroll,
+            state.rules.selected,
+            visible,
+            regions.rule_row_indices().len(),
+        );
         for visible_index in 0..regions
             .rule_row_indices()
             .len()
@@ -674,6 +682,37 @@ fn rules_interactions(
                 intent: UiIntent::SelectRule(offset + visible_index),
             });
         }
+    }
+}
+
+fn connections_interactions(
+    state: &AppState,
+    regions: &LayoutRegions,
+    interactions: &mut Vec<Interaction>,
+    scroll_regions: &mut Vec<ScrollInteraction>,
+) {
+    let Some(list) = regions.list else {
+        return;
+    };
+    scroll_regions.push(ScrollInteraction { area: list });
+    let total = state.connection_record_count();
+    let visible = list.height.saturating_sub(1) as usize;
+    let offset = visible_window_start(
+        state.connections.scroll,
+        state.connections.selected,
+        visible,
+        total,
+    );
+    for visible_index in 0..total.saturating_sub(offset).min(visible) {
+        interactions.push(Interaction {
+            area: Rect::new(
+                list.x,
+                list.y.saturating_add(1 + visible_index as u16),
+                list.width,
+                1,
+            ),
+            intent: UiIntent::SelectConnection(offset + visible_index),
+        });
     }
 }
 
