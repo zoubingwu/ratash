@@ -2344,7 +2344,7 @@ fn core_replacement_retries_provider_warmup_then_restores_selections_and_probes(
 }
 
 #[test]
-fn unresolved_selection_restoration_has_a_fixed_retry_limit() {
+fn unresolved_selection_restoration_recovers_when_the_provider_view_stabilizes() {
     let harness = Harness::new("selection-restore-limit");
     harness.core.state.lock().expect("the Core lock").view = two_node_proxy_view();
     harness.queue_profile("Primary", "node-a");
@@ -2397,11 +2397,9 @@ fn unresolved_selection_restoration_has_a_fixed_retry_limit() {
     assert!(!status.selection_restore_pending);
 
     harness.core.state.lock().expect("the Core lock").view = two_node_proxy_view();
-    assert!(
-        supervisor
-            .retry_selection_restore()
-            .expect("an explicit retry should restore the saved selection")
-    );
+    supervisor
+        .reconcile_runtime_state()
+        .expect("background reconciliation should restore the saved selection");
     let recovered = get_status(&supervisor);
     assert_eq!(
         recovered.supervisor.lifecycle,

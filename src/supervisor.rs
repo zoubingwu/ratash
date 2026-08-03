@@ -1606,6 +1606,13 @@ impl Supervisor {
             self.set_health_reason(state, SupervisorHealthReason::SelectionRestoration, false);
             return;
         }
+        if !state.selection_restore_pending
+            && state
+                .health_reasons
+                .contains(&SupervisorHealthReason::SelectionRestoration)
+        {
+            self.begin_selection_restore(state);
+        }
         let core = self
             .core
             .runtime_status()
