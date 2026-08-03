@@ -8,7 +8,9 @@ use crate::domain::ConnectionRecord;
 
 use super::super::{AppState, Focus, visible_window_start};
 use super::layout::LayoutRegions;
-use super::{MUTED, fit_column, format_bytes, selected_style, terminal_safe, title_line};
+use super::{
+    MUTED, fit_column, fit_node_name, format_bytes, selected_style, terminal_safe, title_line,
+};
 
 pub(super) fn render(state: &AppState, regions: &LayoutRegions, buffer: &mut Buffer) {
     let Some(status) = &state.status else {
@@ -69,23 +71,19 @@ pub(super) fn render(state: &AppState, regions: &LayoutRegions, buffer: &mut Buf
         let cursor = if selected { "▌" } else { " " };
         let target = connection_target(connection);
         let rule = connection_rule(connection);
-        let chain = if connection.chains.is_empty() {
-            "-".to_owned()
-        } else {
-            connection.chains.join(" → ")
-        };
+        let node = connection.chains.first().map_or("-", String::as_str);
         let line = match density {
             ConnectionRowDensity::Compact => format!(
                 "{cursor} {} {} {}",
                 fit_column(&target, 31),
                 fit_column(&rule, 22),
-                fit_column(&chain, 20),
+                fit_node_name(node, 20),
             ),
             ConnectionRowDensity::Standard => format!(
                 "{cursor} {} {} {} {}",
                 fit_column(&target, 30),
                 fit_column(&rule, 24),
-                fit_column(&chain, 22),
+                fit_node_name(node, 22),
                 fit_column(&connection_traffic(connection), 17),
             ),
             ConnectionRowDensity::Extended => format!(
@@ -93,7 +91,7 @@ pub(super) fn render(state: &AppState, regions: &LayoutRegions, buffer: &mut Buf
                 fit_column(&target, 34),
                 fit_column(&connection.network, 8),
                 fit_column(&rule, 30),
-                fit_column(&chain, 28),
+                fit_node_name(node, 28),
                 fit_column(&format_bytes(connection.download_bytes), 10),
                 fit_column(&format_bytes(connection.upload_bytes), 10),
             ),
@@ -138,13 +136,13 @@ impl ConnectionRowDensity {
 fn connection_header(density: ConnectionRowDensity) -> &'static str {
     match density {
         ConnectionRowDensity::Compact => {
-            "  TARGET                          RULE                   CHAIN"
+            "  TARGET                          RULE                   NODE"
         }
         ConnectionRowDensity::Standard => {
-            "  TARGET                         RULE                     CHAIN                  TRAFFIC"
+            "  TARGET                         RULE                     NODE                   TRAFFIC"
         }
         ConnectionRowDensity::Extended => {
-            "  TARGET                              NETWORK  RULE                           CHAIN                        DOWNLOAD   UPLOAD"
+            "  TARGET                              NETWORK  RULE                           NODE                         DOWNLOAD   UPLOAD"
         }
     }
 }

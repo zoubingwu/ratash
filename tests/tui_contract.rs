@@ -102,7 +102,7 @@ fn logs_default_to_info_from_the_mihomo_api() {
 }
 
 #[test]
-fn connections_page_renders_target_rule_chain_and_traffic() {
+fn connections_page_renders_target_rule_node_and_traffic() {
     let mut state = connected_state();
     state.page = Page::Connections;
 
@@ -111,15 +111,42 @@ fn connections_page_renders_target_rule_chain_and_traffic() {
     for expected in [
         "example.com:443",
         "DOMAIN-SUFFIX · example.com",
+        "NODE",
         "provider-only",
-        "Manual",
         "2.0 KiB",
         "1.0 KiB",
     ] {
         assert!(text.contains(expected), "missing {expected}: {text}");
     }
+    assert!(!text.contains("Manual"));
     assert!(!text.contains("bounded Core projection"));
     assert!(!text.contains("Traffic sample"));
+}
+
+#[test]
+fn connection_nodes_reserve_a_guard_cell_after_leading_emoji() {
+    let area = Rect::new(0, 0, 140, 30);
+    let mut state = connected_state();
+    state.page = Page::Connections;
+    state
+        .status
+        .as_mut()
+        .expect("status should exist")
+        .connections[0]
+        .chains = vec!["🇯🇵日本高速01|BGP|CUCM".to_owned(), "Manual".to_owned()];
+    let (regions, _) = ratash::tui::compute_layout(&state, area, 1);
+    let list = regions.list.expect("Connection list should render");
+    let mut buffer = Buffer::empty(area);
+
+    render_buffer(&state, area, &mut buffer);
+
+    let (flag_column, row) = (list.y..list.bottom())
+        .flat_map(|row| (list.x..list.right()).map(move |column| (column, row)))
+        .find(|position| buffer[*position].symbol() == "🇯🇵")
+        .expect("the Connection node flag should render");
+    assert_eq!(buffer[(flag_column + 1, row)].symbol(), " ");
+    assert_eq!(buffer[(flag_column + 2, row)].symbol(), " ");
+    assert_eq!(buffer[(flag_column + 3, row)].symbol(), "日");
 }
 
 #[test]
