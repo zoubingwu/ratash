@@ -10,7 +10,7 @@ The persistent top area has two summary rows, one navigation row, and one separa
 
 ~~~text
 ● CONNECTED  Profile: Daily              Node: Hong Kong 01                  Traffic: ↓ 18.4 MiB/s  ↑ 2.1 MiB/s
-Total: ↓ 28.4 GiB  ↑ 3.2 GiB  Memory: 78.4 MiB  Connections: 428  Mihomo: v1.19.28  PID: 4821  Mode: RULE  Mixed: OFF  API: UNIX  TUN: ON
+Total: ↓ 28.4 GiB  ↑ 3.2 GiB  Memory: 78.4 MiB  Connections: 428  Mihomo: v1.19.28  Core PID: 4821  Mode: RULE  Mixed: OFF  API: UNIX  TUN: ON
 1 Proxies   2 Connections   3 Rules   4 Logs                              : commands
 ───────────────────────────────────────────────────────────────────────────────────────────────
   page content

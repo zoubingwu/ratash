@@ -73,6 +73,7 @@ fn global_header_uses_two_status_rows_above_navigation() {
     assert!(lines[1].contains("Total:"));
     assert!(lines[1].contains("Memory:"));
     assert!(lines[1].contains("Mihomo: v1.19.28"));
+    assert!(lines[1].contains("Core PID: 42"));
     assert!(lines[1].contains("Mode: RULE"));
     assert!(lines[1].contains("Mixed: OFF"));
     assert!(lines[2].contains("Proxies"));

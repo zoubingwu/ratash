@@ -178,7 +178,7 @@ pub(super) fn render_header(state: &AppState, regions: &LayoutRegions, buffer: &
                 "  Memory: {memory}  Connections: {connections}  Mihomo: "
             )),
             Span::styled(BUNDLED_CORE_VERSION, Style::default().fg(ACCENT)),
-            Span::raw(format!("  PID: {pid}  Mode: ")),
+            Span::raw(format!("  Core PID: {pid}  Mode: ")),
             Span::styled("RULE", Style::default().fg(ACCENT)),
             Span::raw("  Mixed: OFF  API: UNIX  TUN: "),
             Span::styled(
