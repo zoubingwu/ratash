@@ -18,17 +18,17 @@ Build a complete package from a source checkout without an Apple Developer accou
 ./scripts/package-local-macos.sh --output dist
 ```
 
-The script builds Ratash with the `local-unsigned` trust policy, downloads and verifies the pinned Mihomo Core, adds an ad-hoc code identity, and creates one installer plus its SHA-256 file. The resulting package requires no signing credentials. macOS may show a developer warning; approve the package in **System Settings > Privacy & Security** when prompted.
+The script builds Ratash with the `local-unsigned` trust policy, downloads and verifies the pinned Mihomo Core, adds an ad-hoc code identity, and creates a package, its SHA-256 file, and `install-ratash.sh`. The resulting package requires no signing credentials. macOS may show a developer warning; approve the package in **System Settings > Privacy & Security** when prompted.
 
 The personal trust policy requires `/usr/local` and `/usr/local/bin` to be root-owned and protected from group and other writes.
 
-Copy the matching `*-local-unsigned.pkg` and `.pkg.sha256` files to the target Mac. Verify and install them from the download directory:
+Copy `install-ratash.sh`, the matching `*-local-unsigned.pkg`, and its `.pkg.sha256` file to the target Mac. Run the installer from the download directory:
 
 ```sh
-PACKAGE='ratash-0.1.1-aarch64-apple-darwin-local-unsigned.pkg'
-shasum -a 256 -c "$PACKAGE.sha256"
-sudo env RATASH_OWNER_UID="$(id -u)" /usr/sbin/installer -allowUntrusted -pkg "$PACKAGE" -target /
+./install-ratash.sh
 ```
+
+The installer verifies the package, stops an existing Ratash Supervisor before the Core service upgrade, and starts the replacement Supervisor after installation.
 
 ### Signed release package
 

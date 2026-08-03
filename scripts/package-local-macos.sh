@@ -55,12 +55,17 @@ output=$(CDPATH= cd -- "$output" && pwd)
 package_name="ratash-$version-$target-local-unsigned.pkg"
 package="$output/$package_name"
 checksum="$package.sha256"
+installer="$output/install-ratash.sh"
 [ ! -e "$package" ] || {
     echo "The personal package already exists: $package" >&2
     exit 1
 }
 [ ! -e "$checksum" ] || {
     echo "The personal package checksum already exists: $checksum" >&2
+    exit 1
+}
+[ ! -e "$installer" ] || {
+    echo "The personal package installer already exists: $installer" >&2
     exit 1
 }
 
@@ -161,4 +166,7 @@ unset RATASH_TEST_ALLOW_CUSTOM_GEODATA_MANIFEST
     CDPATH= cd -- "$output"
     /usr/bin/shasum -a 256 "$package_name" >"$package_name.sha256"
 )
-printf '%s\n' "$package"
+/usr/bin/sed "s/@PACKAGE_NAME@/$package_name/g" \
+    "$project_root/packaging/macos/install-local.sh" >"$installer"
+/bin/chmod 0755 "$installer"
+printf '%s\n' "$package" "$installer"

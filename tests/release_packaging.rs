@@ -368,6 +368,32 @@ fn postinstall_waits_for_a_booted_out_service_before_bootstrap() {
 }
 
 #[test]
+fn local_installer_restarts_ratash_around_the_package_upgrade() {
+    let installer = fs::read_to_string(project_path("packaging/macos/install-local.sh"))
+        .expect("local installer should be readable");
+    let checksum = installer
+        .find("/usr/bin/shasum -a 256 -c")
+        .expect("local installer should verify the package");
+    let stop = installer
+        .find("/usr/local/bin/ratash stop --json")
+        .expect("local installer should stop the existing Supervisor");
+    let package = installer
+        .find("/usr/sbin/installer")
+        .expect("local installer should install the package");
+    let start = installer
+        .find("/usr/local/bin/ratash start --json")
+        .expect("local installer should start the replacement Supervisor");
+
+    assert!(checksum < stop && stop < package && package < start);
+    assert!(installer.contains("package_name='@PACKAGE_NAME@'"));
+
+    let builder = fs::read_to_string(project_path("scripts/package-local-macos.sh"))
+        .expect("local package builder should be readable");
+    assert!(builder.contains("packaging/macos/install-local.sh"));
+    assert!(builder.contains("install-ratash.sh"));
+}
+
+#[test]
 fn package_builder_rejects_a_custom_manifest_for_installable_output() {
     let fixture = TempDirectory::new("package-build");
     let ratash = fixture.path.join("ratash");
@@ -594,6 +620,7 @@ fn package_scripts_are_valid_posix_shell() {
         "scripts/validate-pinned-mihomo-geodata.sh",
         "scripts/capture-release-benchmarks-macos.sh",
         "scripts/macos-release-resource-probe.sh",
+        "packaging/macos/install-local.sh",
         "packaging/macos/scripts/postinstall",
         "packaging/macos/uninstall.sh",
     ] {
