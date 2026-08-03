@@ -492,6 +492,47 @@ fn source_drop_without_a_new_record_preserves_broker_history_and_reports_the_gap
 }
 
 #[test]
+fn fresh_log_follower_accepts_a_gap_after_the_existing_horizon() {
+    let socket = TempSocket::new("fresh-follower-gap");
+    let streams = broker(8);
+    streams
+        .publish_log(log_record(1, "retained"))
+        .expect("the retained log should publish");
+    let mut server = start_server(&socket, Arc::clone(&streams));
+    let client = IpcClient::new(socket.path());
+    let mut follower = client
+        .follow_logs(None, 22)
+        .expect("the fresh follower should connect");
+    thread::sleep(Duration::from_millis(20));
+
+    streams
+        .synchronize_log_tail(LogTail {
+            records: Vec::new(),
+            dropped_total: 1,
+            gap: true,
+            earliest_sequence: Some(1),
+            latest_sequence: Some(1),
+            sequence_horizon: Some(2),
+        })
+        .expect("the source gap should synchronize");
+
+    assert_eq!(
+        follower
+            .next_item()
+            .expect("the gap frame should be valid")
+            .expect("the gap frame should exist")
+            .item,
+        LogStreamItem::Gap {
+            after_sequence: None,
+            latest_sequence: 2,
+        }
+    );
+
+    drop(follower);
+    server.shutdown().expect("server should stop cleanly");
+}
+
+#[test]
 fn fresh_empty_log_tail_synchronizes_and_round_trips_without_a_horizon() {
     let socket = TempSocket::new("fresh-empty-log-tail");
     let streams = broker(8);

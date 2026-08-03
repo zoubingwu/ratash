@@ -720,8 +720,7 @@ impl IpcStreamBroker {
         state
             .subscribers
             .retain(|subscriber| subscriber.strong_count() > 0);
-        let anchor = after_sequence.or(state.sequence_horizon);
-        let mut queue = LogSubscriber::new(LOG_SUBSCRIBER_CAPACITY, anchor)
+        let mut queue = LogSubscriber::new(LOG_SUBSCRIBER_CAPACITY, after_sequence)
             .map_err(|_| StreamBrokerError::InvalidCapacity)?;
         let requires_resync = after_sequence.is_some_and(|after| {
             sequence_has_gap(
