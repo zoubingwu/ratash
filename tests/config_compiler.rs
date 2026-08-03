@@ -264,7 +264,7 @@ sniffer:
 enable: true
 force-dns-mapping: true
 parse-pure-ip: true
-override-destination: false
+override-destination: true
 sniff:
   HTTP:
     ports: [80, 8080-8880]
@@ -809,6 +809,36 @@ rules: [MATCH,DIRECT]
 }
 
 #[test]
+fn persisted_configuration_validation_accepts_the_canonical_v5_sniffer_policy() {
+    let staging_root = temporary_root("persisted-v5-sniffer-policy");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
+    let base_snapshot = snapshot("rules: [MATCH,DIRECT]\n");
+    let rules = vec!["MATCH,DIRECT".to_owned()];
+    let configuration = compiler
+        .compile(
+            &base_snapshot,
+            &rules,
+            &AuthoritativeConfig::new("/tmp/old-core.sock", "old-session-secret"),
+            &staging_root,
+        )
+        .expect("the fixture configuration should compile");
+    let mut legacy: Value =
+        serde_yaml_ng::from_str(configuration.yaml()).expect("the configuration should parse");
+    legacy["sniffer"]
+        .as_mapping_mut()
+        .expect("sniffer should be a mapping")
+        .insert("override-destination".into(), false.into());
+    let legacy = serde_yaml_ng::to_string(&canonicalize_configuration(legacy))
+        .expect("the legacy config should serialize");
+
+    compiler
+        .validate_persisted(&base_snapshot, &rules, legacy.as_bytes(), &staging_root)
+        .expect("the canonical v5 configuration should remain authenticatable");
+
+    std::fs::remove_dir_all(staging_root).expect("the staging fixture should be removed");
+}
+
+#[test]
 fn persisted_configuration_validation_accepts_the_canonical_v3_geo_policy() {
     let staging_root = temporary_root("persisted-v3-geo-policy");
     let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
@@ -1283,6 +1313,13 @@ fn privileged_validation_rejects_forged_runtime_authority_and_provider_manifest(
         .expect("sniffer should be a mapping")
         .insert("enable".into(), false.into());
     forgeries.push(forged_sniffer);
+
+    let mut forged_sniffer_destination = original.clone();
+    forged_sniffer_destination["sniffer"]
+        .as_mapping_mut()
+        .expect("sniffer should be a mapping")
+        .insert("override-destination".into(), false.into());
+    forgeries.push(forged_sniffer_destination);
 
     let mut forged_listener = original;
     forged_listener

@@ -1482,6 +1482,79 @@ fn startup_migrates_the_committed_v4_domain_policy_through_a_new_runtime_generat
 }
 
 #[test]
+fn startup_migrates_the_committed_v5_sniffer_policy_through_a_new_runtime_generation() {
+    let harness = Harness::new("startup-v5-sniffer-policy");
+    harness.queue_profile("Primary", "node-a");
+    let supervisor = harness.open();
+    add_profile(&supervisor, "https://example.test/primary.yaml");
+    drop(supervisor);
+
+    let limits = ratash::profile::SnapshotLimits::new(
+        ratash::constants::PROFILE_RESPONSE_MAX_BYTES,
+        ratash::constants::YAML_MAX_DEPTH,
+    );
+    let hydrated = harness
+        .state_store
+        .load_committed(limits, ratash::rule::RuleSetLimits::product())
+        .expect("the current state should load")
+        .expect("the current state should be committed");
+    let mut legacy_configuration: Value =
+        serde_yaml_ng::from_slice(&hydrated.effective_configuration)
+            .expect("the Effective Configuration should parse");
+    legacy_configuration["sniffer"]
+        .as_mapping_mut()
+        .expect("sniffer should be a mapping")
+        .insert("override-destination".into(), false.into());
+    let legacy_configuration =
+        serde_yaml_ng::to_string(&canonicalize_configuration(legacy_configuration))
+            .expect("the legacy Effective Configuration should serialize");
+    let legacy = harness
+        .state_store
+        .stage_candidate(AuthoritativeState {
+            profiles: &hydrated.profiles,
+            local_rules: &hydrated.local_rules,
+            effective_configuration: legacy_configuration.as_bytes(),
+            runtime_generation: hydrated.runtime_generation,
+        })
+        .expect("the v5 state should stage");
+    let prepared = harness
+        .state_store
+        .persistence()
+        .prepare(&legacy)
+        .expect("the v5 state should prepare");
+    harness
+        .state_store
+        .persistence()
+        .commit_prepared(&prepared)
+        .expect("the v5 state should commit");
+    harness
+        .state_store
+        .persistence()
+        .clear_prepared(&prepared)
+        .expect("the v5 journal should clear");
+
+    let restarted = harness.open();
+    let migrated = harness
+        .state_store
+        .load_committed(limits, ratash::rule::RuleSetLimits::product())
+        .expect("the migrated state should load")
+        .expect("the migrated state should be committed");
+    let configuration: Value = serde_yaml_ng::from_slice(&migrated.effective_configuration)
+        .expect("the migrated Effective Configuration should parse");
+
+    assert_eq!(migrated.runtime_generation, RuntimeGeneration(2));
+    assert_eq!(
+        configuration["sniffer"]["override-destination"],
+        Value::Bool(true)
+    );
+    assert_eq!(harness.transactions.apply_count.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        get_status(&restarted).runtime_generation,
+        Some(RuntimeGeneration(2))
+    );
+}
+
+#[test]
 fn restart_recompiles_for_the_new_core_session_and_restores_runtime_state() {
     let harness = Harness::new("restart-session");
     harness.core.state.lock().expect("the Core lock").view = two_node_proxy_view();

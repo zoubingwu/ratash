@@ -11,7 +11,7 @@ use url::Url;
 
 const BUNDLED_POLICY: &str = include_str!("../fixtures/mihomo/v1.19.28/config-policy.yaml");
 pub const BUNDLED_CORE_VERSION: &str = "v1.19.28";
-const COMPILER_POLICY_REVISION: &str = "ratash-config-policy-v5";
+const COMPILER_POLICY_REVISION: &str = "ratash-config-policy-v6";
 const AUTHORITATIVE_DNS_MODE: &str = "fake-ip";
 const AUTHORITATIVE_FAKE_IP_RANGE: &str = "198.18.0.1/16";
 const AUTHORITATIVE_FAKE_IP_RANGE6: &str = "fdfe:dcba:9876::1/64";
@@ -513,9 +513,18 @@ impl ConfigCompiler {
 
         let legacy: Value = serde_yaml_ng::from_str(expected.yaml())
             .map_err(|_| ConfigError::PersistedConfigurationInvalid)?;
-        let Value::Mapping(mut legacy_v4) = legacy else {
+        let Value::Mapping(mut legacy_v5) = legacy else {
             return Err(ConfigError::PersistedConfigurationInvalid);
         };
+        restore_v5_sniffer_destination_policy(&mut legacy_v5)?;
+        let legacy_v5_yaml =
+            serde_yaml_ng::to_string(&canonicalize(Value::Mapping(legacy_v5.clone())))
+                .map_err(|_| ConfigError::SerializationFailed)?;
+        if legacy_v5_yaml.as_bytes() == persisted {
+            return Ok(());
+        }
+
+        let mut legacy_v4 = legacy_v5;
         restore_profile_domain_recovery_fields(&mut legacy_v4, snapshot.document())?;
         let legacy_v4_yaml =
             serde_yaml_ng::to_string(&canonicalize(Value::Mapping(legacy_v4.clone())))
@@ -1484,7 +1493,7 @@ fn authoritative_sniffer_baseline() -> Value {
         ("enable".into(), true.into()),
         ("force-dns-mapping".into(), true.into()),
         ("parse-pure-ip".into(), true.into()),
-        ("override-destination".into(), false.into()),
+        ("override-destination".into(), true.into()),
         ("sniff".into(), Value::Mapping(sniff)),
     ]))
 }
@@ -1523,6 +1532,15 @@ fn restore_profile_domain_recovery_fields(
     } else {
         document.remove("sniffer");
     }
+    Ok(())
+}
+
+fn restore_v5_sniffer_destination_policy(document: &mut Mapping) -> Result<(), ConfigError> {
+    document
+        .get_mut("sniffer")
+        .and_then(Value::as_mapping_mut)
+        .ok_or(ConfigError::PersistedConfigurationInvalid)?
+        .insert("override-destination".into(), false.into());
     Ok(())
 }
 

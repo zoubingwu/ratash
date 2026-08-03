@@ -113,7 +113,7 @@
 - Treat every Profile Snapshot as untrusted input. Apply the bundled configuration policy to security-sensitive, authoritative, and Ratash-consumed structural fields; preserve Core-owned fields and require the pinned `mihomo -t` validator to accept the Effective Configuration.
 - Ship immutable, digest-pinned Mihomo Geo data with the installer, link it into Profile validation workspaces, copy it into privileged Runtime Generation roots, and keep Core Geo-data auto-update disabled.
 - The Local Rule Set fully replaces the Profile Snapshot's top-level `rules` field.
-- Effective Configuration always uses Rule mode, TUN DNS hijacking, dual-stack Fake-IP ranges, and the fixed HTTP/TLS/QUIC domain sniffer. These domain-recovery settings are Wrapper-owned and have no user-facing configuration surface.
+- Effective Configuration always uses Rule mode, TUN DNS hijacking, dual-stack Fake-IP ranges, and the fixed HTTP/TLS/QUIC domain sniffer. Sniffed domains become the routing destination so Core Info logs and Routing Rules retain domain context. These domain-recovery settings are Wrapper-owned and have no user-facing configuration surface.
 - Rule mutations use complete, case-sensitive Rule Strings and the shared configuration transaction path.
 - Delay Probes cover the deduplicated Node set of the Active Profile only.
 - Expose Core proxies through a versioned projection with source-aware Node identities and explicit missing, ambiguous, and provider-unavailable states.
