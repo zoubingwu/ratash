@@ -10,7 +10,13 @@ top-level:
     additional-fields: core-passthrough
     fields:
       enable: { kind: managed-replace }
+      enhanced-mode: { kind: managed-replace }
       fallback: { kind: managed-replace }
+      fake-ip-filter: { kind: managed-replace }
+      fake-ip-filter-mode: { kind: managed-replace }
+      fake-ip-range: { kind: managed-replace }
+      fake-ip-range6: { kind: managed-replace }
+      ipv6: { kind: managed-replace }
       listen: { kind: managed-drop }
       listen-routing-mark: { kind: managed-drop }
   external-controller: { kind: managed-drop }
@@ -27,6 +33,7 @@ top-level:
   inbound-mptcp: { kind: managed-drop }
   inbound-tfo: { kind: managed-drop }
   interface-name: { kind: managed-drop }
+  ipv6: { kind: managed-replace }
   iptables: { kind: managed-drop }
   lan-allowed-ips: { kind: managed-drop }
   lan-disallowed-ips: { kind: managed-drop }
@@ -109,6 +116,7 @@ top-level:
   rules: { kind: managed-replace }
   secret: { kind: managed-replace }
   skip-auth-prefixes: { kind: managed-drop }
+  sniffer: { kind: managed-replace }
   socks-port: { kind: managed-drop }
   ss-config: { kind: managed-drop }
   sub-rules:

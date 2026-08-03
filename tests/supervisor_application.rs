@@ -23,6 +23,7 @@ use ratash::supervisor::{
 use ratash::transaction::{
     CandidateRevisions, ConfigTransactionSuccess, RecoveryOutcome as TransactionRecoveryOutcome,
 };
+use serde_yaml_ng::Value;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -30,6 +31,10 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
+
+#[path = "support/configuration.rs"]
+mod configuration_support;
+use configuration_support::{canonicalize_configuration, remove_v5_domain_recovery};
 
 #[derive(Debug)]
 struct FixedClock;
@@ -1347,9 +1352,17 @@ fn startup_migrates_the_committed_v3_geo_policy_through_a_new_runtime_generation
         .profiles
         .active_profile_id()
         .expect("the Active Profile should remain selected");
-    let legacy_configuration = String::from_utf8(hydrated.effective_configuration.clone())
-        .expect("the Effective Configuration should be UTF-8")
-        .replace("geo-auto-update: false\n", "");
+    let mut legacy_configuration: Value =
+        serde_yaml_ng::from_slice(&hydrated.effective_configuration)
+            .expect("the Effective Configuration should parse");
+    remove_v5_domain_recovery(&mut legacy_configuration);
+    let legacy_mapping = legacy_configuration
+        .as_mapping_mut()
+        .expect("the Effective Configuration should be a mapping");
+    legacy_mapping.remove("geo-auto-update");
+    let legacy_configuration =
+        serde_yaml_ng::to_string(&canonicalize_configuration(legacy_configuration))
+            .expect("the legacy Effective Configuration should serialize");
     let legacy = harness
         .state_store
         .stage_candidate(AuthoritativeState {
@@ -1393,6 +1406,74 @@ fn startup_migrates_the_committed_v3_geo_policy_through_a_new_runtime_generation
             .expect("the migrated Effective Configuration should be UTF-8")
             .contains("geo-auto-update: false")
     );
+    assert_eq!(harness.transactions.apply_count.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        get_status(&restarted).runtime_generation,
+        Some(RuntimeGeneration(2))
+    );
+}
+
+#[test]
+fn startup_migrates_the_committed_v4_domain_policy_through_a_new_runtime_generation() {
+    let harness = Harness::new("startup-v4-domain-policy");
+    harness.queue_profile("Primary", "node-a");
+    let supervisor = harness.open();
+    add_profile(&supervisor, "https://example.test/primary.yaml");
+    drop(supervisor);
+
+    let limits = ratash::profile::SnapshotLimits::new(
+        ratash::constants::PROFILE_RESPONSE_MAX_BYTES,
+        ratash::constants::YAML_MAX_DEPTH,
+    );
+    let hydrated = harness
+        .state_store
+        .load_committed(limits, ratash::rule::RuleSetLimits::product())
+        .expect("the current state should load")
+        .expect("the current state should be committed");
+    let mut legacy_configuration: Value =
+        serde_yaml_ng::from_slice(&hydrated.effective_configuration)
+            .expect("the Effective Configuration should parse");
+    remove_v5_domain_recovery(&mut legacy_configuration);
+    let legacy_configuration =
+        serde_yaml_ng::to_string(&canonicalize_configuration(legacy_configuration))
+            .expect("the legacy Effective Configuration should serialize");
+    let legacy = harness
+        .state_store
+        .stage_candidate(AuthoritativeState {
+            profiles: &hydrated.profiles,
+            local_rules: &hydrated.local_rules,
+            effective_configuration: legacy_configuration.as_bytes(),
+            runtime_generation: hydrated.runtime_generation,
+        })
+        .expect("the v4 state should stage");
+    let prepared = harness
+        .state_store
+        .persistence()
+        .prepare(&legacy)
+        .expect("the v4 state should prepare");
+    harness
+        .state_store
+        .persistence()
+        .commit_prepared(&prepared)
+        .expect("the v4 state should commit");
+    harness
+        .state_store
+        .persistence()
+        .clear_prepared(&prepared)
+        .expect("the v4 journal should clear");
+
+    let restarted = harness.open();
+    let migrated = harness
+        .state_store
+        .load_committed(limits, ratash::rule::RuleSetLimits::product())
+        .expect("the migrated state should load")
+        .expect("the migrated state should be committed");
+    let configuration = String::from_utf8(migrated.effective_configuration)
+        .expect("the migrated Effective Configuration should be UTF-8");
+
+    assert_eq!(migrated.runtime_generation, RuntimeGeneration(2));
+    assert!(configuration.contains("enhanced-mode: fake-ip"));
+    assert!(configuration.contains("sniffer:"));
     assert_eq!(harness.transactions.apply_count.load(Ordering::Relaxed), 2);
     assert_eq!(
         get_status(&restarted).runtime_generation,

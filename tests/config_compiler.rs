@@ -8,6 +8,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+#[path = "support/configuration.rs"]
+mod configuration_support;
+use configuration_support::{canonicalize_configuration, remove_v5_domain_recovery};
+
 fn snapshot(yaml: &str) -> ProfileSnapshot {
     ProfileSnapshot::parse(yaml.as_bytes(), SnapshotLimits::new(128 * 1024, 32))
         .expect("the fixture should be a valid profile snapshot")
@@ -164,6 +168,121 @@ rules:
 }
 
 #[test]
+fn compiler_owns_fake_ip_domain_recovery_fields() {
+    let staging_root = temporary_root("authoritative-fake-ip");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
+    let effective = compiler
+        .compile(
+            &snapshot(
+                r#"
+dns:
+  enable: false
+  ipv6: false
+  enhanced-mode: redir-host
+  fake-ip-range: 192.0.2.1/24
+  fake-ip-range6: 2001:db8::1/64
+  fake-ip-filter-mode: whitelist
+  fake-ip-filter: ['*']
+  nameserver: [1.1.1.1]
+ipv6: false
+"#,
+            ),
+            &[],
+            &AuthoritativeConfig::new("/tmp/core.sock", "secret"),
+            &staging_root,
+        )
+        .expect("the profile should compile");
+    let document: Value =
+        serde_yaml_ng::from_str(effective.yaml()).expect("the result should be valid YAML");
+
+    assert_eq!(
+        (
+            &document["ipv6"],
+            &document["dns"]["enable"],
+            &document["dns"]["ipv6"],
+            &document["dns"]["enhanced-mode"],
+            &document["dns"]["fake-ip-range"],
+            &document["dns"]["fake-ip-range6"],
+            &document["dns"]["fake-ip-filter-mode"],
+            &document["dns"]["fake-ip-filter"],
+            &document["dns"]["nameserver"],
+        ),
+        (
+            &Value::Bool(true),
+            &Value::Bool(true),
+            &Value::Bool(true),
+            &Value::String("fake-ip".to_owned()),
+            &Value::String("198.18.0.1/16".to_owned()),
+            &Value::String("fdfe:dcba:9876::1/64".to_owned()),
+            &Value::String("blacklist".to_owned()),
+            &Value::Sequence(
+                [
+                    "*.lan",
+                    "*.local",
+                    "*.arpa",
+                    "time.*.com",
+                    "ntp.*.com",
+                    "+.market.xiaomi.com",
+                    "localhost.ptlogin2.qq.com",
+                    "*.msftncsi.com",
+                    "www.msftconnecttest.com",
+                ]
+                .into_iter()
+                .map(Value::from)
+                .collect(),
+            ),
+            &Value::Sequence(vec!["1.1.1.1".into()]),
+        )
+    );
+
+    std::fs::remove_dir_all(staging_root).expect("the staging fixture should be removed");
+}
+
+#[test]
+fn compiler_owns_the_complete_domain_sniffer() {
+    let staging_root = temporary_root("authoritative-sniffer");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
+    let effective = compiler
+        .compile(
+            &snapshot(
+                r#"
+sniffer:
+  enable: false
+  parse-pure-ip: false
+  future-sniffer-option: ignored
+"#,
+            ),
+            &[],
+            &AuthoritativeConfig::new("/tmp/core.sock", "secret"),
+            &staging_root,
+        )
+        .expect("the profile should compile");
+    let document: Value =
+        serde_yaml_ng::from_str(effective.yaml()).expect("the result should be valid YAML");
+    let expected: Value = serde_yaml_ng::from_str(
+        r#"
+enable: true
+force-dns-mapping: true
+parse-pure-ip: true
+override-destination: false
+sniff:
+  HTTP:
+    ports: [80, 8080-8880]
+    override-destination: true
+  TLS:
+    ports: [443, 8443]
+  QUIC:
+    ports: [443, 8443]
+"#,
+    )
+    .expect("the expected sniffer should be valid YAML");
+
+    assert_eq!(document["sniffer"], expected);
+
+    std::fs::remove_dir_all(staging_root).expect("the staging fixture should be removed");
+}
+
+#[test]
 fn mihomo_owned_fields_reach_core_validation_unchanged() {
     let staging_root = temporary_root("mihomo-owned-fields");
     let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
@@ -176,8 +295,6 @@ fn mihomo_owned_fields_reach_core_validation_unchanged() {
 future-top-level-option: enabled
 dns:
   future-dns-option: enabled
-sniffer:
-  future-sniffer-option: enabled
 hosts:
   example.test: {address: 127.0.0.1}
 proxy-providers:
@@ -205,7 +322,6 @@ proxy-providers:
     .expect("the effective configuration should remain valid YAML");
     assert_eq!(validated["future-top-level-option"], "enabled");
     assert_eq!(validated["dns"]["future-dns-option"], "enabled");
-    assert_eq!(validated["sniffer"]["future-sniffer-option"], "enabled");
     assert_eq!(validated["hosts"]["example.test"]["address"], "127.0.0.1");
     assert_eq!(
         validated["proxy-providers"]["remote"]["age-secret-key"],
@@ -641,6 +757,58 @@ fn persisted_configuration_validation_recompiles_with_its_session_values() {
 }
 
 #[test]
+fn persisted_configuration_validation_accepts_the_canonical_v4_domain_policy() {
+    let staging_root = temporary_root("persisted-v4-domain-policy");
+    let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
+    let base_snapshot = snapshot(
+        r#"
+dns:
+  ipv6: false
+  enhanced-mode: redir-host
+  fake-ip-range: 192.0.2.1/24
+  fake-ip-filter-mode: whitelist
+  fake-ip-filter: ['*']
+  nameserver: [1.1.1.1]
+ipv6: false
+sniffer:
+  enable: false
+rules: [MATCH,DIRECT]
+"#,
+    );
+    let rules = vec!["MATCH,DIRECT".to_owned()];
+    let configuration = compiler
+        .compile(
+            &base_snapshot,
+            &rules,
+            &AuthoritativeConfig::new("/tmp/old-core.sock", "old-session-secret"),
+            &staging_root,
+        )
+        .expect("the fixture configuration should compile");
+    let mut legacy: Value =
+        serde_yaml_ng::from_str(configuration.yaml()).expect("the configuration should parse");
+    let dns = legacy["dns"]
+        .as_mapping_mut()
+        .expect("DNS should be a mapping");
+    dns.insert("ipv6".into(), false.into());
+    dns.insert("enhanced-mode".into(), "redir-host".into());
+    dns.insert("fake-ip-range".into(), "192.0.2.1/24".into());
+    dns.remove("fake-ip-range6");
+    dns.insert("fake-ip-filter-mode".into(), "whitelist".into());
+    dns.insert("fake-ip-filter".into(), Value::Sequence(vec!["*".into()]));
+    legacy["ipv6"] = false.into();
+    legacy["sniffer"] =
+        serde_yaml_ng::from_str("enable: false\n").expect("the legacy sniffer should parse");
+    let legacy = serde_yaml_ng::to_string(&canonicalize_configuration(legacy))
+        .expect("the legacy config should serialize");
+
+    compiler
+        .validate_persisted(&base_snapshot, &rules, legacy.as_bytes(), &staging_root)
+        .expect("the canonical v4 configuration should remain authenticatable");
+
+    std::fs::remove_dir_all(staging_root).expect("the staging fixture should be removed");
+}
+
+#[test]
 fn persisted_configuration_validation_accepts_the_canonical_v3_geo_policy() {
     let staging_root = temporary_root("persisted-v3-geo-policy");
     let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
@@ -654,8 +822,15 @@ fn persisted_configuration_validation_accepts_the_canonical_v3_geo_policy() {
             &staging_root,
         )
         .expect("the fixture configuration should compile");
-    let legacy = configuration.yaml().replace("geo-auto-update: false\n", "");
-    assert_ne!(legacy, configuration.yaml());
+    let mut legacy: Value =
+        serde_yaml_ng::from_str(configuration.yaml()).expect("the configuration should parse");
+    remove_v5_domain_recovery(&mut legacy);
+    legacy
+        .as_mapping_mut()
+        .expect("the configuration should be a mapping")
+        .remove("geo-auto-update");
+    let legacy = serde_yaml_ng::to_string(&canonicalize_configuration(legacy))
+        .expect("the legacy config should serialize");
 
     compiler
         .validate_persisted(&base_snapshot, &rules, legacy.as_bytes(), &staging_root)
@@ -683,9 +858,15 @@ fn persisted_configuration_validation_accepts_the_canonical_v3_geo_policy() {
             &staging_root,
         )
         .expect("the managed Geo-data update policy should compile");
-    let updating_legacy = updating_configuration
-        .yaml()
-        .replace("geo-auto-update: false", "geo-auto-update: true");
+    let mut updating_legacy: Value = serde_yaml_ng::from_str(updating_configuration.yaml())
+        .expect("the configuration should parse");
+    remove_v5_domain_recovery(&mut updating_legacy);
+    let updating_mapping = updating_legacy
+        .as_mapping_mut()
+        .expect("the configuration should be a mapping");
+    updating_mapping.insert("geo-auto-update".into(), true.into());
+    let updating_legacy = serde_yaml_ng::to_string(&canonicalize_configuration(updating_legacy))
+        .expect("the legacy configuration should serialize");
     compiler
         .validate_persisted(
             &updating_snapshot,
@@ -1081,6 +1262,27 @@ fn privileged_validation_rejects_forged_runtime_authority_and_provider_manifest(
         .expect("DNS should be a mapping")
         .insert("listen".into(), "0.0.0.0:53".into());
     forgeries.push(forged_dns_listener);
+
+    let mut forged_dns_mode = original.clone();
+    forged_dns_mode["dns"]
+        .as_mapping_mut()
+        .expect("DNS should be a mapping")
+        .insert("enhanced-mode".into(), "redir-host".into());
+    forgeries.push(forged_dns_mode);
+
+    let mut forged_ipv6 = original.clone();
+    forged_ipv6
+        .as_mapping_mut()
+        .expect("the candidate should be a mapping")
+        .insert("ipv6".into(), false.into());
+    forgeries.push(forged_ipv6);
+
+    let mut forged_sniffer = original.clone();
+    forged_sniffer["sniffer"]
+        .as_mapping_mut()
+        .expect("sniffer should be a mapping")
+        .insert("enable".into(), false.into());
+    forgeries.push(forged_sniffer);
 
     let mut forged_listener = original;
     forged_listener

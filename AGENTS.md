@@ -80,6 +80,7 @@
 - `src/runtime_bundle.rs` atomically stages private Runtime Generations and binds the Effective Configuration, bundled Mihomo executable, and local provider files to one verified manifest.
 - `src/runtime_adapters.rs` confirms pinned Mihomo readiness, classifies uncertain CoreRuntime outcomes, and resolves previously staged Runtime Generations for recovery.
 - `fixtures/mihomo/v1.19.28/*.json` are the pinned Core API contract fixtures for projection, readiness, probes, and telemetry.
+- `tests/support/configuration.rs` owns shared Effective Configuration canonicalization and legacy-policy fixture helpers used across integration-test crates.
 - `fixtures/release/product-contract-v1.json` freezes protocol versions, user-visible timing, capacities, size limits, and process exit codes for the first release contract; `benchmark-metadata-v1.json` freezes the release workload and measurement schema.
 - `src/rule.rs` owns Rule String parsing, ordered Local Rule Set mutations, revisions, and deterministic `rules.yaml` serialization.
 - `src/scheduler.rs` owns deterministic bounded Profile Refresh and Active Profile Delay Probe scheduling state.
@@ -112,6 +113,7 @@
 - Treat every Profile Snapshot as untrusted input. Apply the bundled configuration policy to security-sensitive, authoritative, and Ratash-consumed structural fields; preserve Core-owned fields and require the pinned `mihomo -t` validator to accept the Effective Configuration.
 - Ship immutable, digest-pinned Mihomo Geo data with the installer, link it into Profile validation workspaces, copy it into privileged Runtime Generation roots, and keep Core Geo-data auto-update disabled.
 - The Local Rule Set fully replaces the Profile Snapshot's top-level `rules` field.
+- Effective Configuration always uses Rule mode, TUN DNS hijacking, dual-stack Fake-IP ranges, and the fixed HTTP/TLS/QUIC domain sniffer. These domain-recovery settings are Wrapper-owned and have no user-facing configuration surface.
 - Rule mutations use complete, case-sensitive Rule Strings and the shared configuration transaction path.
 - Delay Probes cover the deduplicated Node set of the Active Profile only.
 - Expose Core proxies through a versioned projection with source-aware Node identities and explicit missing, ambiguous, and provider-unavailable states.

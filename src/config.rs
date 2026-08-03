@@ -11,7 +11,11 @@ use url::Url;
 
 const BUNDLED_POLICY: &str = include_str!("../fixtures/mihomo/v1.19.28/config-policy.yaml");
 pub const BUNDLED_CORE_VERSION: &str = "v1.19.28";
-const COMPILER_POLICY_REVISION: &str = "ratash-config-policy-v4";
+const COMPILER_POLICY_REVISION: &str = "ratash-config-policy-v5";
+const AUTHORITATIVE_DNS_MODE: &str = "fake-ip";
+const AUTHORITATIVE_FAKE_IP_RANGE: &str = "198.18.0.1/16";
+const AUTHORITATIVE_FAKE_IP_RANGE6: &str = "fdfe:dcba:9876::1/64";
+const AUTHORITATIVE_FAKE_IP_FILTER_MODE: &str = "blacklist";
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct AuthoritativeConfig {
@@ -409,6 +413,7 @@ impl ConfigCompiler {
         );
         document.insert("mode".into(), "rule".into());
         document.insert("allow-lan".into(), false.into());
+        document.insert("ipv6".into(), true.into());
         document.insert("geo-auto-update".into(), false.into());
         document.insert(
             "external-controller-unix".into(),
@@ -426,8 +431,10 @@ impl ConfigCompiler {
                 expected: "a mapping",
             });
         };
-        dns.insert("enable".into(), true.into());
-        dns.insert("fallback".into(), Value::Sequence(Vec::new()));
+        for (key, value) in authoritative_dns_fields() {
+            dns.insert(key, value);
+        }
+        document.insert("sniffer".into(), authoritative_sniffer_baseline());
 
         let mut providers = Vec::new();
         classify_provider_section(
@@ -506,22 +513,30 @@ impl ConfigCompiler {
 
         let legacy: Value = serde_yaml_ng::from_str(expected.yaml())
             .map_err(|_| ConfigError::PersistedConfigurationInvalid)?;
-        let Value::Mapping(mut legacy) = legacy else {
+        let Value::Mapping(mut legacy_v4) = legacy else {
             return Err(ConfigError::PersistedConfigurationInvalid);
         };
-        if legacy.remove("geo-auto-update") != Some(Value::Bool(false)) {
+        restore_profile_domain_recovery_fields(&mut legacy_v4, snapshot.document())?;
+        let legacy_v4_yaml =
+            serde_yaml_ng::to_string(&canonicalize(Value::Mapping(legacy_v4.clone())))
+                .map_err(|_| ConfigError::SerializationFailed)?;
+        if legacy_v4_yaml.as_bytes() == persisted {
+            return Ok(());
+        }
+
+        if legacy_v4.remove("geo-auto-update") != Some(Value::Bool(false)) {
             return Err(ConfigError::PersistedConfigurationInvalid);
         }
         match snapshot.document().get("geo-auto-update") {
             Some(value @ Value::Bool(_)) => {
-                legacy.insert("geo-auto-update".into(), value.clone());
+                legacy_v4.insert("geo-auto-update".into(), value.clone());
             }
             Some(_) => return Err(ConfigError::PersistedConfigurationInvalid),
             None => {}
         }
-        let legacy = serde_yaml_ng::to_string(&canonicalize(Value::Mapping(legacy)))
+        let legacy_v3 = serde_yaml_ng::to_string(&canonicalize(Value::Mapping(legacy_v4)))
             .map_err(|_| ConfigError::SerializationFailed)?;
-        if legacy.as_bytes() == persisted {
+        if legacy_v3.as_bytes() == persisted {
             Ok(())
         } else {
             Err(ConfigError::PersistedConfigurationInvalid)
@@ -545,6 +560,7 @@ impl ConfigCompiler {
 
         if document.get("mode").and_then(Value::as_str) != Some("rule")
             || document.get("allow-lan").and_then(Value::as_bool) != Some(false)
+            || document.get("ipv6").and_then(Value::as_bool) != Some(true)
             || document.get("geo-auto-update").and_then(Value::as_bool) != Some(false)
             || document
                 .get("external-controller-unix")
@@ -561,8 +577,10 @@ impl ConfigCompiler {
             .get("dns")
             .and_then(Value::as_mapping)
             .ok_or(ConfigError::PersistedConfigurationInvalid)?;
-        if dns.get("enable").and_then(Value::as_bool) != Some(true)
-            || !matches!(dns.get("fallback"), Some(Value::Sequence(values)) if values.is_empty())
+        if authoritative_dns_fields()
+            .iter()
+            .any(|(key, value)| dns.get(key) != Some(value))
+            || document.get("sniffer") != Some(&authoritative_sniffer_baseline())
         {
             return Err(ConfigError::PersistedConfigurationInvalid);
         }
@@ -1373,7 +1391,12 @@ fn invalid_shape(path: &str, expected: &'static str) -> ConfigError {
 }
 
 fn policy_sha256() -> String {
-    let managed = b"rules=local\nmode=rule\nallow-lan=false\ntun.enable=true\ntun.stack=gvisor\ntun.auto-route=true\ntun.strict-route=false\ntun.auto-detect-interface=true\ntun.dns-hijack=any:53\ndns.enable=true\ndns.fallback=[]";
+    let managed = format!(
+        "rules=local\nmode=rule\nallow-lan=false\nipv6=true\ngeo-auto-update=false\ntun={:?}\ndns={:?}\nsniffer={:?}",
+        authoritative_tun_baseline(),
+        canonicalize(Value::Mapping(authoritative_dns_fields())),
+        canonicalize(authoritative_sniffer_baseline()),
+    );
     let mut policy = Vec::with_capacity(
         COMPILER_POLICY_REVISION.len() + BUNDLED_POLICY.len() + managed.len() + 2,
     );
@@ -1381,7 +1404,7 @@ fn policy_sha256() -> String {
     policy.push(0);
     policy.extend_from_slice(BUNDLED_POLICY.as_bytes());
     policy.push(0);
-    policy.extend_from_slice(managed);
+    policy.extend_from_slice(managed.as_bytes());
     sha256_hex(&policy)
 }
 
@@ -1394,6 +1417,113 @@ fn authoritative_tun_baseline() -> Value {
         ("auto-detect-interface".into(), true.into()),
         ("dns-hijack".into(), Value::Sequence(vec!["any:53".into()])),
     ]))
+}
+
+fn authoritative_dns_fields() -> Mapping {
+    Mapping::from_iter([
+        ("enable".into(), true.into()),
+        ("ipv6".into(), true.into()),
+        ("fallback".into(), Value::Sequence(Vec::new())),
+        ("enhanced-mode".into(), AUTHORITATIVE_DNS_MODE.into()),
+        ("fake-ip-range".into(), AUTHORITATIVE_FAKE_IP_RANGE.into()),
+        ("fake-ip-range6".into(), AUTHORITATIVE_FAKE_IP_RANGE6.into()),
+        (
+            "fake-ip-filter-mode".into(),
+            AUTHORITATIVE_FAKE_IP_FILTER_MODE.into(),
+        ),
+        (
+            "fake-ip-filter".into(),
+            Value::Sequence(
+                [
+                    "*.lan",
+                    "*.local",
+                    "*.arpa",
+                    "time.*.com",
+                    "ntp.*.com",
+                    "+.market.xiaomi.com",
+                    "localhost.ptlogin2.qq.com",
+                    "*.msftncsi.com",
+                    "www.msftconnecttest.com",
+                ]
+                .into_iter()
+                .map(Value::from)
+                .collect(),
+            ),
+        ),
+    ])
+}
+
+fn authoritative_sniffer_baseline() -> Value {
+    let sniff = Mapping::from_iter([
+        (
+            "HTTP".into(),
+            Value::Mapping(Mapping::from_iter([
+                (
+                    "ports".into(),
+                    Value::Sequence(vec![80.into(), "8080-8880".into()]),
+                ),
+                ("override-destination".into(), true.into()),
+            ])),
+        ),
+        (
+            "TLS".into(),
+            Value::Mapping(Mapping::from_iter([(
+                "ports".into(),
+                Value::Sequence(vec![443.into(), 8_443.into()]),
+            )])),
+        ),
+        (
+            "QUIC".into(),
+            Value::Mapping(Mapping::from_iter([(
+                "ports".into(),
+                Value::Sequence(vec![443.into(), 8_443.into()]),
+            )])),
+        ),
+    ]);
+    Value::Mapping(Mapping::from_iter([
+        ("enable".into(), true.into()),
+        ("force-dns-mapping".into(), true.into()),
+        ("parse-pure-ip".into(), true.into()),
+        ("override-destination".into(), false.into()),
+        ("sniff".into(), Value::Mapping(sniff)),
+    ]))
+}
+
+fn restore_profile_domain_recovery_fields(
+    document: &mut Mapping,
+    profile: &Mapping,
+) -> Result<(), ConfigError> {
+    if let Some(ipv6) = profile.get("ipv6") {
+        document.insert("ipv6".into(), ipv6.clone());
+    } else {
+        document.remove("ipv6");
+    }
+    let profile_dns = profile.get("dns").and_then(Value::as_mapping);
+    let dns = document
+        .get_mut("dns")
+        .and_then(Value::as_mapping_mut)
+        .ok_or(ConfigError::PersistedConfigurationInvalid)?;
+    for field in [
+        "ipv6",
+        "enhanced-mode",
+        "fake-ip-range",
+        "fake-ip-range6",
+        "fake-ip-filter-mode",
+        "fake-ip-filter",
+    ] {
+        if let Some(value) = profile_dns.and_then(|mapping| mapping.get(field)) {
+            dns.insert(field.into(), value.clone());
+        } else {
+            dns.remove(field);
+        }
+    }
+
+    if let Some(sniffer) = profile.get("sniffer") {
+        document.insert("sniffer".into(), sniffer.clone());
+    } else {
+        document.remove("sniffer");
+    }
+    Ok(())
 }
 
 fn path_string(path: &Path) -> String {
