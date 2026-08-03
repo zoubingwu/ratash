@@ -1,22 +1,18 @@
-use std::borrow::Cow;
-
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
 use super::super::{AppState, Focus, ProxyRow};
-use super::layout::{LayoutRegions, proxy_group_offset, proxy_sort_areas};
+use super::layout::{LayoutRegions, proxy_group_offset};
 use super::{
     ACCENT, MUTED, WARN, fit_column, fit_node_name, render_vertical_separator, selected_style,
-    terminal_safe, title_line,
+    terminal_safe,
 };
 use crate::tui::visible_window_start;
 
 pub(super) fn render(state: &AppState, regions: &LayoutRegions, buffer: &mut Buffer) {
     let row_indices = regions.proxy_row_indices();
-    render_title(state, regions, row_indices.len(), buffer);
     if let Some(groups) = regions.proxy_groups {
         render_groups(state, groups, buffer);
         if let Some(list) = regions.list {
@@ -31,68 +27,14 @@ pub(super) fn render(state: &AppState, regions: &LayoutRegions, buffer: &mut Buf
     }
 }
 
-fn render_title(
-    state: &AppState,
-    regions: &LayoutRegions,
-    visible_count: usize,
-    buffer: &mut Buffer,
-) {
-    let Some(area) = regions.search else {
-        return;
-    };
-    let title = if regions.list.is_some() {
-        format!(
-            "Nodes ({}) · {}",
-            visible_count,
-            state
-                .proxies
-                .selected_group
-                .as_deref()
-                .map_or_else(|| Cow::Borrowed("unconfigured"), terminal_safe)
-        )
-    } else {
-        format!("PROXY GROUPS ({})", state.proxies.groups.len())
-    };
-    Paragraph::new(title_line(title)).render(area, buffer);
-
-    if regions.list.is_some() {
-        let sort_areas = proxy_sort_areas(area);
-        let sort_start = sort_areas.first().map_or(area.right(), |(_, rect)| rect.x);
-        let query_x = area.x.saturating_add(30).min(sort_start);
-        let query_area = Rect::new(query_x, area.y, sort_start.saturating_sub(query_x), 1);
-        Paragraph::new(format!("/{}", terminal_safe(&state.proxies.filter)))
-            .style(if state.focus == Focus::Search {
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            })
-            .render(query_area, buffer);
-        for (sort, sort_area) in sort_areas {
-            let style = if sort == state.proxies.sort {
-                Style::default().fg(Color::Black).bg(ACCENT)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            Paragraph::new(format!(" {} ", sort.title()))
-                .style(style)
-                .render(sort_area, buffer);
-        }
-    }
-}
-
 fn render_groups(state: &AppState, area: Rect, buffer: &mut Buffer) {
-    Paragraph::new(Line::from(vec![Span::styled(
-        "PROXY GROUPS",
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-    )]))
-    .render(Rect::new(area.x, area.y, area.width, 1), buffer);
-    let offset = proxy_group_offset(&state.proxies, area.height.saturating_sub(1) as usize);
+    let offset = proxy_group_offset(&state.proxies, area.height as usize);
     for (visible_index, group) in state
         .proxies
         .groups
         .iter()
         .skip(offset)
-        .take(area.height.saturating_sub(1) as usize)
+        .take(area.height as usize)
         .enumerate()
     {
         let index = offset + visible_index;
@@ -127,7 +69,7 @@ fn render_groups(state: &AppState, area: Rect, buffer: &mut Buffer) {
             .render(
                 Rect::new(
                     area.x,
-                    area.y.saturating_add(1 + visible_index as u16),
+                    area.y.saturating_add(visible_index as u16),
                     area.width,
                     1,
                 ),

@@ -8,8 +8,7 @@ use ratatui::layout::Rect;
 
 use super::reducer::{UiEvent, UiIntent, filtered_palette_actions};
 use super::state::{
-    AppState, Focus, LogLevelFilter, Modal, Page, filtered_profiles, filtered_proxies,
-    filtered_rules,
+    AppState, Focus, LogLevelFilter, Modal, Page, filtered_profiles, filtered_rules,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -212,15 +211,14 @@ pub fn input_to_intent(state: &AppState, input: TerminalInput) -> Option<UiInten
         KeyInput::Character('l') | KeyInput::Right => Some(UiIntent::FocusRight),
         KeyInput::Tab => Some(UiIntent::FocusNext),
         KeyInput::BackTab => Some(UiIntent::FocusPrevious),
-        KeyInput::Character('/') => Some(UiIntent::FocusSearch),
+        KeyInput::Character('/') if matches!(state.page, Page::Rules | Page::Logs) => {
+            Some(UiIntent::FocusSearch)
+        }
         KeyInput::Character(':') => Some(UiIntent::OpenCommandPalette),
         KeyInput::Character('p') if state.page != Page::Logs => Some(UiIntent::OpenProfiles),
         KeyInput::Character('?') => Some(UiIntent::ToggleHelp),
         KeyInput::Character('q') => Some(UiIntent::Quit),
         KeyInput::Escape => Some(UiIntent::Escape),
-        KeyInput::Character('s') if state.page == Page::Proxies => {
-            Some(UiIntent::SetProxySort(state.proxies.sort.next()))
-        }
         KeyInput::Character('z') if state.page == Page::Proxies => Some(UiIntent::ToggleZoom),
         KeyInput::Character('r') if state.page == Page::Rules => Some(UiIntent::LoadRules),
         KeyInput::Character('a') if state.page == Page::Rules && state.rules_projection_ready() => {
@@ -293,7 +291,9 @@ fn selected_intent(state: &AppState) -> Option<UiIntent> {
     }
     match state.page {
         Page::Proxies if state.proxies.group_load_pending.is_some() => None,
-        Page::Proxies => filtered_proxies(&state.proxies)
+        Page::Proxies => state
+            .proxies
+            .rows
             .get(state.proxies.selected)
             .filter(|row| {
                 state

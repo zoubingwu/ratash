@@ -39,7 +39,9 @@ fn proxy_layout_switches_at_the_compact_breakpoints() {
 
     let (wide, _) = compute_layout(&state, Rect::new(0, 0, 130, 30), 1);
     assert!(wide.proxy_groups.is_some());
+    assert!(wide.search.is_none());
     assert!(wide.list.is_some());
+    assert_eq!(wide.list.expect("wide Node pane").y, wide.content.y);
     assert!(wide.detail.is_none());
 
     let (medium, _) = compute_layout(&state, Rect::new(0, 0, 129, 30), 1);
@@ -49,7 +51,12 @@ fn proxy_layout_switches_at_the_compact_breakpoints() {
 
     let (compact_nodes, _) = compute_layout(&state, Rect::new(0, 0, 89, 30), 1);
     assert!(compact_nodes.proxy_groups.is_none());
+    assert!(compact_nodes.search.is_none());
     assert!(compact_nodes.list.is_some());
+    assert_eq!(
+        compact_nodes.list.expect("compact Node pane").y,
+        compact_nodes.content.y
+    );
 
     state.focus = Focus::ProxyGroups;
     let (compact_groups, _) = compute_layout(&state, Rect::new(0, 0, 89, 30), 1);
@@ -58,7 +65,7 @@ fn proxy_layout_switches_at_the_compact_breakpoints() {
 }
 
 #[test]
-fn narrow_proxy_groups_use_one_title_row() {
+fn narrow_proxy_groups_use_every_row_for_groups() {
     let area = Rect::new(0, 0, 80, 24);
     let mut state = AppState::new();
     state.page = Page::Proxies;
@@ -68,7 +75,7 @@ fn narrow_proxy_groups_use_one_title_row() {
     render_buffer(&state, area, &mut buffer);
     let text = buffer_text(&buffer);
 
-    assert_eq!(text.matches("PROXY GROUPS").count(), 1, "{text}");
+    assert!(!text.contains("PROXY GROUPS"), "{text}");
 }
 
 #[test]

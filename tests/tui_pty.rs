@@ -88,8 +88,8 @@ fn real_pty_interaction_covers_resize_keyboard_mouse_and_restoration() {
     interactive.wait_for_text("RATASH_PTY_COMMAND profile_use");
     interactive.wait_for_text("Success: done");
     interactive.write_input(b"1");
-    interactive.wait_for_text("Nodes (2)");
-    interactive.write_input(b"\x1b[<0;25;8M\x1b[<0;25;8m");
+    interactive.wait_for_text("LATENCY");
+    interactive.write_input(b"\x1b[<0;25;7M\x1b[<0;25;7m");
     interactive.wait_for_text("RATASH_PTY_COMMAND proxy_select");
     interactive.write_input(b"4");
     interactive.wait_for_text("LOGS");

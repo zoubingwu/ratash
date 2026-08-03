@@ -20,7 +20,7 @@ pub use state::{
     ConnectionsState, Focus, FullViewSnapshot, LogLevelFilter, LogsState, Modal, MutationSuccess,
     Page, PendingOperation, PendingOperationKind, PendingProxyGroupLoad, PendingRuleLoad,
     ProfileRow, ProfilesState, ProxiesState, ProxyGroupRow, ProxyGroupSnapshot, ProxyRow,
-    ProxySort, RuleListSnapshot, RuleRow, RulesState, ViewLogRecord,
+    RuleListSnapshot, RuleRow, RulesState, ViewLogRecord,
 };
 pub use terminal::{
     CrosstermControl, TerminalAction, TerminalControl, TerminalSession, TerminalSessionError,
@@ -28,8 +28,8 @@ pub use terminal::{
 
 use reducer::filtered_palette_actions;
 use state::{
-    filtered_log_indices, filtered_profiles, filtered_proxy_indices, filtered_rule_indices,
-    selected_log_position, visible_log_start, visible_window_start,
+    filtered_log_indices, filtered_profiles, filtered_rule_indices, selected_log_position,
+    visible_log_start, visible_window_start,
 };
 
 pub const PROFILE_VIEW_CAPACITY: usize = 100;

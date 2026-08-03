@@ -107,7 +107,6 @@ pub enum UiIntent {
     },
     ScrollUp,
     ScrollDown,
-    SetProxySort(ProxySort),
     SetLogLevel(LogLevelFilter),
     ToggleLogPause,
     FollowLogs,
@@ -654,12 +653,6 @@ fn apply_intent(state: &mut AppState, intent: UiIntent) -> Vec<Command> {
         UiIntent::SelectNode { group_id, node_id } => {
             issue_node_selection(state, group_id, node_id)
         }
-        UiIntent::SetProxySort(sort) => {
-            state.proxies.sort = sort;
-            state.proxies.selected = 0;
-            state.proxies.scroll = 0;
-            Vec::new()
-        }
         UiIntent::SetLogLevel(level) => {
             state.logs.level_filter = level;
             state.logs.scroll = 0;
@@ -797,7 +790,6 @@ fn available_focuses(state: &AppState) -> &'static [Focus] {
         Focus::Tabs,
         Focus::ProxyGroups,
         Focus::Content,
-        Focus::Search,
         Focus::FooterHelp,
         Focus::FooterQuit,
     ];
@@ -848,9 +840,7 @@ fn move_focus(state: &mut AppState, delta: isize) -> Vec<Command> {
 fn move_horizontal_focus(state: &mut AppState, delta: isize) -> Vec<Command> {
     if state.modal.is_none() && state.page == Page::Proxies {
         match (state.focus, delta < 0) {
-            (Focus::Content, true) | (Focus::Search, true) => {
-                state.focus = Focus::ProxyGroups;
-            }
+            (Focus::Content, true) => state.focus = Focus::ProxyGroups,
             (Focus::ProxyGroups, false) => state.focus = Focus::Content,
             _ => {}
         }
@@ -867,7 +857,7 @@ fn normalize_focus(state: &mut AppState) {
 
 fn search_available(state: &AppState) -> bool {
     state.modal == Some(Modal::Profiles)
-        || state.modal.is_none() && matches!(state.page, Page::Proxies | Page::Rules | Page::Logs)
+        || state.modal.is_none() && matches!(state.page, Page::Rules | Page::Logs)
 }
 
 fn escape(state: &mut AppState) -> Vec<Command> {
@@ -1164,8 +1154,7 @@ fn current_search_mut(state: &mut AppState) -> Option<&mut String> {
         return Some(&mut state.profiles.filter);
     }
     match state.page {
-        Page::Proxies => Some(&mut state.proxies.filter),
-        Page::Connections => None,
+        Page::Proxies | Page::Connections => None,
         Page::Rules => Some(&mut state.rules.filter),
         Page::Logs => Some(&mut state.logs.search),
     }
@@ -1192,7 +1181,7 @@ fn move_selection(state: &mut AppState, delta: isize) {
     match state.page {
         Page::Proxies => {
             state.proxies.selected =
-                moved_index(state.proxies.selected, state.filtered_proxy_count(), delta);
+                moved_index(state.proxies.selected, state.proxies.rows.len(), delta);
             keep_selection_visible(state, ListSelection::Proxies);
         }
         Page::Connections => {
@@ -1274,7 +1263,9 @@ fn activate_selected(state: &mut AppState) -> Vec<Command> {
     }
     match state.page {
         Page::Proxies if state.proxies.group_load_pending.is_some() => Vec::new(),
-        Page::Proxies => filtered_proxies(&state.proxies)
+        Page::Proxies => state
+            .proxies
+            .rows
             .get(state.proxies.selected)
             .and_then(|row| {
                 row.node_id
@@ -1315,7 +1306,7 @@ fn keep_selection_visible(state: &mut AppState, selection: ListSelection) {
             );
         }
         ListSelection::Proxies => {
-            let total = state.filtered_proxy_count();
+            let total = state.proxies.rows.len();
             state.proxies.scroll =
                 visible_window_start(state.proxies.scroll, state.proxies.selected, visible, total);
         }

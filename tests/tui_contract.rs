@@ -1062,25 +1062,14 @@ fn healthy_header_dot_is_the_only_green_cell_on_standard_pages() {
 }
 
 #[test]
-fn proxy_search_and_current_node_use_the_cyan_gray_selection_palette() {
+fn current_proxy_node_uses_the_cyan_gray_selection_palette() {
     let area = Rect::new(0, 0, 130, 30);
     let mut state = connected_state();
     state.page = Page::Proxies;
-    state.focus = Focus::Search;
-    state.proxies.filter = "Tokyo".to_owned();
-    let (regions, _) = ratash::tui::compute_layout(&state, area, 1);
-    let mut search_buffer = Buffer::empty(area);
-    render_buffer(&state, area, &mut search_buffer);
-    let search = regions.search.expect("Proxy search row should render");
-    let slash = (search.x..search.right())
-        .find(|column| search_buffer[(*column, search.y)].symbol() == "/")
-        .expect("focused Proxy query should render a slash");
-    assert_eq!(search_buffer[(slash, search.y)].fg, Color::Cyan);
-
     state.focus = Focus::Content;
-    state.proxies.filter.clear();
     state.proxies.selected = 1;
-    let (regions, _) = ratash::tui::compute_layout(&state, area, 2);
+    let (regions, _) = ratash::tui::compute_layout(&state, area, 1);
+    assert!(regions.search.is_none());
     let mut node_buffer = Buffer::empty(area);
     render_buffer(&state, area, &mut node_buffer);
     let list = regions.list.expect("Proxy node list should render");
@@ -1472,7 +1461,7 @@ fn proxy_group_last_page_mouse_hits_match_the_rendered_rows() {
     state.proxies.group_cursor = 19;
 
     let (text, map) = render_with_backend(&state, 140, 24);
-    let first_visible = ProxyGroupId::for_name("Group 05");
+    let first_visible = ProxyGroupId::for_name("Group 02");
     let hit = hit_for(&map, |intent| {
         *intent == UiIntent::ShowProxyGroup(first_visible.clone())
     });
@@ -1493,38 +1482,29 @@ fn proxy_group_last_page_mouse_hits_match_the_rendered_rows() {
 }
 
 #[test]
-fn keyboard_and_mouse_sort_controls_share_the_same_intent() {
+fn proxy_header_controls_are_removed_and_original_order_is_stable() {
     let mut state = connected_state();
     state.page = Page::Proxies;
-    let (_, map) = render_with_backend(&state, 100, 30);
-    let name_sort = hit_for(&map, |intent| {
-        *intent == UiIntent::SetProxySort(ratash::tui::ProxySort::Name)
-    });
-    state.publish_interaction_map(map);
+    let (text, map) = render_with_backend(&state, 100, 30);
 
-    let keyboard = input_to_intent(&state, TerminalInput::Key(KeyInput::Character('s')));
-    let mouse = input_to_intent(
-        &state,
-        TerminalInput::Mouse(MouseInput {
-            kind: MouseInputKind::LeftClick,
-            column: name_sort.0,
-            row: name_sort.1,
-        }),
-    );
-
-    assert_eq!(keyboard, mouse);
-    update(
-        &mut state,
-        UiEvent::Intent(keyboard.expect("sort intent should exist")),
-    );
-    let (text, _) = render_with_backend(&state, 100, 30);
-    let nodes = text
-        .split_once("Nodes (")
-        .map(|(_, nodes)| nodes)
-        .expect("Node list should render");
+    assert!(!text.contains("Nodes ("));
+    assert!(!text.contains("PROXY GROUPS"));
     assert!(
-        nodes.find("Berlin").expect("Berlin should render")
-            < nodes.find("Tokyo").expect("Tokyo should render")
+        map.interactions
+            .iter()
+            .all(|interaction| interaction.intent != UiIntent::FocusSearch)
+    );
+    assert_eq!(
+        input_to_intent(&state, TerminalInput::Key(KeyInput::Character('/'))),
+        None
+    );
+    assert_eq!(
+        input_to_intent(&state, TerminalInput::Key(KeyInput::Character('s'))),
+        None
+    );
+    assert!(
+        text.find("Tokyo").expect("Tokyo should render")
+            < text.find("Berlin").expect("Berlin should render")
     );
 }
 
@@ -1602,7 +1582,7 @@ fn interaction_map_covers_tabs_search_footer_log_controls_and_scroll() {
 #[test]
 fn focused_search_receives_q_and_slash_as_text() {
     let mut state = connected_state();
-    state.page = Page::Proxies;
+    state.page = Page::Rules;
     state.focus = Focus::Search;
 
     for character in ['q', '/'] {
@@ -1611,13 +1591,13 @@ fn focused_search_receives_q_and_slash_as_text() {
         update(&mut state, UiEvent::Intent(intent));
     }
 
-    assert_eq!(state.proxies.filter, "q/");
+    assert_eq!(state.rules.filter, "q/");
     assert!(!state.should_quit);
 }
 
 #[test]
 fn every_search_field_enforces_character_and_utf8_byte_limits() {
-    for page in [Page::Proxies, Page::Rules, Page::Logs] {
+    for page in [Page::Rules, Page::Logs] {
         let mut ascii = connected_state();
         ascii.page = page;
         ascii.focus = Focus::Search;
@@ -2970,7 +2950,7 @@ fn rule_list_snapshot(rule_string: &str, revision: u64) -> RuleListSnapshot {
 
 fn search_for_page(state: &AppState, page: Page) -> &str {
     match page {
-        Page::Proxies => &state.proxies.filter,
+        Page::Proxies => "",
         Page::Rules => &state.rules.filter,
         Page::Logs => &state.logs.search,
         Page::Connections => "",

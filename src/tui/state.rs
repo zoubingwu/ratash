@@ -104,34 +104,6 @@ pub struct ProxyGroupRow {
     pub selected_node: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ProxySort {
-    #[default]
-    Original,
-    Name,
-    Delay,
-}
-
-impl ProxySort {
-    pub(in crate::tui) const ALL: [Self; 3] = [Self::Original, Self::Name, Self::Delay];
-
-    pub(in crate::tui) fn title(self) -> &'static str {
-        match self {
-            Self::Original => "Original",
-            Self::Name => "Name",
-            Self::Delay => "Delay",
-        }
-    }
-
-    pub(in crate::tui) fn next(self) -> Self {
-        match self {
-            Self::Original => Self::Name,
-            Self::Name => Self::Delay,
-            Self::Delay => Self::Original,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProfileRow {
     pub id: ProfileId,
@@ -223,8 +195,6 @@ pub struct ProxiesState {
     pub selection_pending: Option<(ProxyGroupId, NodeRecordId)>,
     pub selected: usize,
     pub scroll: usize,
-    pub filter: String,
-    pub sort: ProxySort,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -639,7 +609,9 @@ impl AppState {
         {
             return;
         }
-        let selected_proxy = filtered_proxies(&self.proxies)
+        let selected_proxy = self
+            .proxies
+            .rows
             .get(self.proxies.selected)
             .and_then(|row| row.node_id.clone());
         let selected_profile = filtered_profiles(&self.profiles)
@@ -657,7 +629,9 @@ impl AppState {
         self.profiles.rows = profiles;
         if replace_proxies
             && let Some(selected) = selected_proxy
-            && let Some(index) = filtered_proxies(&self.proxies)
+            && let Some(index) = self
+                .proxies
+                .rows
                 .iter()
                 .position(|row| row.node_id.as_ref() == Some(&selected))
         {
@@ -727,7 +701,7 @@ impl AppState {
     pub(in crate::tui) fn clamp_selections(&mut self) {
         self.proxies.group_cursor =
             clamp_index(self.proxies.group_cursor, self.proxies.groups.len());
-        self.proxies.selected = clamp_index(self.proxies.selected, self.filtered_proxy_count());
+        self.proxies.selected = clamp_index(self.proxies.selected, self.proxies.rows.len());
         self.profiles.selected = clamp_index(self.profiles.selected, self.filtered_profile_count());
         self.rules.selected = clamp_index(self.rules.selected, self.filtered_rule_count());
         self.connections.selected =
@@ -742,10 +716,6 @@ impl AppState {
             .logs
             .viewport_start
             .min(self.filtered_log_count().saturating_sub(1));
-    }
-
-    pub(in crate::tui) fn filtered_proxy_count(&self) -> usize {
-        filtered_proxies(&self.proxies).len()
     }
 
     pub(in crate::tui) fn filtered_profile_count(&self) -> usize {
@@ -808,35 +778,6 @@ impl AppState {
             )
         )
     }
-}
-
-pub(in crate::tui) fn filtered_proxies(state: &ProxiesState) -> Vec<&ProxyRow> {
-    filtered_proxy_indices(state)
-        .into_iter()
-        .map(|index| &state.rows[index])
-        .collect()
-}
-
-pub(in crate::tui) fn filtered_proxy_indices(state: &ProxiesState) -> Vec<usize> {
-    let needle = state.filter.to_lowercase();
-    let mut rows = state
-        .rows
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| needle.is_empty() || row.name.to_lowercase().contains(&needle))
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    match state.sort {
-        ProxySort::Original => {}
-        ProxySort::Name => {
-            rows.sort_by_cached_key(|index| state.rows[*index].name.to_lowercase());
-        }
-        ProxySort::Delay => rows.sort_by_key(|index| {
-            let row = &state.rows[*index];
-            (row.delay_ms.is_none(), row.delay_ms)
-        }),
-    }
-    rows
 }
 
 pub(in crate::tui) fn filtered_profiles(state: &ProfilesState) -> Vec<&ProfileRow> {

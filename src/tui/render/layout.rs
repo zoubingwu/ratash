@@ -4,9 +4,8 @@ use crate::constants::{MINIMUM_TERMINAL_HEIGHT, MINIMUM_TERMINAL_WIDTH};
 
 use super::super::{
     AppState, Focus, Interaction, InteractionMap, LogLevelFilter, Modal, Page, ProxiesState,
-    ProxySort, ScrollInteraction, UiIntent, filtered_log_indices, filtered_palette_actions,
-    filtered_profiles, filtered_proxy_indices, filtered_rule_indices, selected_log_position,
-    visible_log_start, visible_window_start,
+    ScrollInteraction, UiIntent, filtered_log_indices, filtered_palette_actions, filtered_profiles,
+    filtered_rule_indices, selected_log_position, visible_log_start, visible_window_start,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,7 +74,7 @@ pub fn compute_layout(
         .split(area);
     let content = rows[3];
     let proxy_row_indices = if state.page == Page::Proxies {
-        filtered_proxy_indices(&state.proxies)
+        (0..state.proxies.rows.len()).collect()
     } else {
         Vec::new()
     };
@@ -177,19 +176,18 @@ fn proxy_regions(
     state: &AppState,
     content: Rect,
 ) -> (Option<Rect>, Option<Rect>, Option<Rect>, Option<Rect>) {
-    let (title, body) = title_and_list(content, 1);
     if state.zoomed_focus {
         return if state.focus == Focus::ProxyGroups {
             (Some(content), None, None, None)
         } else {
-            (None, Some(title), Some(body), None)
+            (None, None, Some(content), None)
         };
     }
     if content.width < 90 {
         return if state.focus == Focus::ProxyGroups {
             (Some(content), None, None, None)
         } else {
-            (None, Some(title), Some(body), None)
+            (None, None, Some(content), None)
         };
     }
 
@@ -200,8 +198,8 @@ fn proxy_regions(
             Constraint::Length(1),
             Constraint::Min(30),
         ])
-        .split(body);
-    (Some(columns[0]), Some(title), Some(columns[2]), None)
+        .split(content);
+    (Some(columns[0]), None, Some(columns[2]), None)
 }
 
 fn title_and_list(content: Rect, title_height: u16) -> (Rect, Rect) {
@@ -279,22 +277,6 @@ pub(super) fn sheet_action_area(area: Rect) -> Rect {
         width,
         1,
     )
-}
-
-pub(super) fn proxy_sort_areas(area: Rect) -> Vec<(ProxySort, Rect)> {
-    let widths = [10_u16, 6, 7];
-    let total = widths.iter().sum::<u16>();
-    let mut x = area.right().saturating_sub(total);
-    ProxySort::ALL
-        .iter()
-        .copied()
-        .zip(widths)
-        .map(|(sort, width)| {
-            let rect = Rect::new(x, area.y, width.min(area.right().saturating_sub(x)), 1);
-            x = x.saturating_add(width);
-            (sort, rect)
-        })
-        .collect()
 }
 
 pub(super) fn proxy_group_offset(state: &ProxiesState, visible: usize) -> usize {
@@ -544,24 +526,8 @@ fn proxy_interactions(
     interactions: &mut Vec<Interaction>,
     scroll_regions: &mut Vec<ScrollInteraction>,
 ) {
-    if regions.list.is_some()
-        && let Some(search) = regions.search
-    {
-        interactions.push(Interaction {
-            area: search,
-            intent: UiIntent::FocusSearch,
-        });
-        interactions.extend(
-            proxy_sort_areas(search)
-                .into_iter()
-                .map(|(sort, area)| Interaction {
-                    area,
-                    intent: UiIntent::SetProxySort(sort),
-                }),
-        );
-    }
     if let Some(groups) = regions.proxy_groups {
-        let visible = groups.height.saturating_sub(1) as usize;
+        let visible = groups.height as usize;
         let offset = proxy_group_offset(&state.proxies, visible);
         for (visible_index, group) in state
             .proxies
@@ -574,7 +540,7 @@ fn proxy_interactions(
             interactions.push(Interaction {
                 area: Rect::new(
                     groups.x,
-                    groups.y.saturating_add(1 + visible_index as u16),
+                    groups.y.saturating_add(visible_index as u16),
                     groups.width,
                     1,
                 ),

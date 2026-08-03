@@ -448,9 +448,9 @@ fn footer_context(state: &AppState) -> &'static str {
                         })
                         .is_some_and(|group| !group.selectable) =>
                 {
-                    "j/k Move  Automatic Group  / Search  p Profiles"
+                    "j/k Move  Automatic Group  p Profiles"
                 }
-                Page::Proxies => "j/k Move  Enter Select  / Search  p Profiles",
+                Page::Proxies => "j/k Move  Enter Select  p Profiles",
                 Page::Connections => "j/k Move  p Profiles  : Commands",
                 Page::Rules if state.rules_projection_ready() => {
                     "j/k Move  Enter Edit  a Add  x Remove"
@@ -491,9 +491,9 @@ pub(super) fn render_modal(
         Modal::Help => render_message_sheet(
             "Keyboard and mouse help",
             "1–4 pages · Tab/Shift+Tab focus · arrows or j/k move\n\
-             Enter activates · / searches · z zooms Proxy focus · p opens Profiles\n\
-             s sorts Nodes · a adds, Enter edits, x removes Rules\n\
-             p pauses Logs · f follows Logs\n\
+             Enter activates · z zooms Proxy focus · p opens Profiles\n\
+             Rules: / searches · a adds · Enter edits · x removes\n\
+             Logs: / searches · p pauses · f follows\n\
              Logs: a/d/i/w/e selects All/Debug/Info/Warn/Error\n\
              : opens commands · Esc closes · q quits from the main interface\n\n\
              Mouse: click tabs, commands, controls, search, Profile, Rule, or Node; wheel scrolls.",
