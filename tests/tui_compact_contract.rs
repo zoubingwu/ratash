@@ -1,4 +1,4 @@
-use hopash::tui::{
+use ratash::tui::{
     AppState, Focus, KeyInput, Modal, Page, TerminalInput, UiEvent, UiIntent, compute_layout,
     input_to_intent, render_buffer, update,
 };
@@ -193,8 +193,8 @@ fn medium_logs_use_compact_controls_and_prioritize_loss_status() {
                 < controls.find("paused").expect("pause state should render")
         );
         for intent in [
-            UiIntent::SetLogLevel(hopash::tui::LogLevelFilter::All),
-            UiIntent::SetLogLevel(hopash::tui::LogLevelFilter::Error),
+            UiIntent::SetLogLevel(ratash::tui::LogLevelFilter::All),
+            UiIntent::SetLogLevel(ratash::tui::LogLevelFilter::Error),
             UiIntent::ToggleLogPause,
             UiIntent::FollowLogs,
         ] {

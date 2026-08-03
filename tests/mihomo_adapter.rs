@@ -10,13 +10,13 @@ use std::sync::mpsc::sync_channel;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use hopash::core::{
+use ratash::core::{
     ConnectionSummary, CoreControlEndpoint, DelayProbeRequest, DelayTarget, MihomoAdapter,
     MihomoErrorKind, MihomoLogFrame, MihomoLogLevel, MihomoReadiness, MihomoVersion, NodeSelection,
     ProviderState, TrafficFrame,
 };
-use hopash::domain::{CoreInstanceGeneration, NodeRecordId};
-use hopash::mihomo::{MihomoAdapterConfig, UnixMihomoAdapter};
+use ratash::domain::{CoreInstanceGeneration, NodeRecordId};
+use ratash::mihomo::{MihomoAdapterConfig, UnixMihomoAdapter};
 use tungstenite::handshake::derive_accept_key;
 
 const PROXIES: &[u8] = include_bytes!("../fixtures/mihomo/v1.19.28/proxies.json");
@@ -41,7 +41,7 @@ impl UnixFixture {
     fn new(label: &str, handlers: Vec<Handler>) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let root = std::env::temp_dir().join(format!(
-            "hopash-mihomo-{label}-{}-{}",
+            "ratash-mihomo-{label}-{}-{}",
             std::process::id(),
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
         ));
@@ -242,7 +242,7 @@ fn adapter() -> UnixMihomoAdapter {
 
 #[test]
 fn configuration_reload_uses_the_pinned_force_endpoint_and_strict_statuses() {
-    let configuration_path = "/tmp/hopash-runtime/config.yaml";
+    let configuration_path = "/tmp/ratash-runtime/config.yaml";
     let success: Handler = Box::new(move |mut stream| {
         let request = read_request(&stream);
         assert_request(&request, "PUT", "/configs?force=true", SECRET);
@@ -1089,7 +1089,7 @@ fn diagnostics_redact_bearer_socket_path_and_response_body() {
 fn unique_missing_socket(label: &str) -> PathBuf {
     static NEXT_ID: AtomicU64 = AtomicU64::new(10_000);
     std::env::temp_dir().join(format!(
-        "hopash-{label}-{}-{}.sock",
+        "ratash-{label}-{}-{}.sock",
         std::process::id(),
         NEXT_ID.fetch_add(1, Ordering::Relaxed)
     ))

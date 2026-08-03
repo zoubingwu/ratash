@@ -54,7 +54,7 @@ case "$mode" in
         pid_list="$pid_list,$pid"
       fi
     done
-    output=$(mktemp "${TMPDIR:-/tmp}/hopash-powermetrics.XXXXXX")
+    output=$(mktemp "${TMPDIR:-/tmp}/ratash-powermetrics.XXXXXX")
     trap 'rm -f "$output"' EXIT HUP INT TERM
     /usr/bin/sudo -n /usr/bin/powermetrics \
       --samplers tasks \

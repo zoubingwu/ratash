@@ -1,9 +1,9 @@
-use hopash::constants::{
+use ratash::constants::{
     CORE_LOG_LINE_MAX_BYTES, LOG_CAPACITY, LOG_RETENTION_MAX_BYTES, LOG_TAIL_MAX_BYTES,
     LOG_TAIL_MAX_RECORDS,
 };
-use hopash::domain::{CoreInstanceGeneration, SampleState, TrafficSample};
-use hopash::telemetry::{CoreLogRecord, LogBuffer, LogFilter, LogLevel, LogSource, TelemetryStore};
+use ratash::domain::{CoreInstanceGeneration, SampleState, TrafficSample};
+use ratash::telemetry::{CoreLogRecord, LogBuffer, LogFilter, LogLevel, LogSource, TelemetryStore};
 
 #[test]
 fn log_buffer_evicts_oldest_records_and_reports_resync_gaps() {

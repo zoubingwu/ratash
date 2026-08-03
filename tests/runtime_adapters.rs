@@ -3,21 +3,21 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use hopash::config::{AuthoritativeConfig, ConfigCompiler};
-use hopash::core::{
+use ratash::config::{AuthoritativeConfig, ConfigCompiler};
+use ratash::core::{
     ConnectionSummary, CoreControlEndpoint, CoreEventStream, CoreRuntimeError,
     CoreRuntimeErrorKind, DelayProbeRequest, DelayProbeResult, ManagedCoreHandle, MihomoAdapter,
     MihomoError, MihomoLogFrame, MihomoReadiness, MihomoVersion, NodeSelection, ProxyView,
     TrafficFrame,
 };
-use hopash::domain::{CoreInstanceGeneration, RuntimeGeneration};
-use hopash::persistence::{ObjectId, TransactionBundle};
-use hopash::profile::{ProfileSnapshot, SnapshotLimits};
-use hopash::runtime_adapters::{
+use ratash::domain::{CoreInstanceGeneration, RuntimeGeneration};
+use ratash::persistence::{ObjectId, TransactionBundle};
+use ratash::profile::{ProfileSnapshot, SnapshotLimits};
+use ratash::runtime_adapters::{
     MihomoRuntimeHealthProbe, StagedRuntimeBundleResolver, classify_runtime_apply_error,
 };
-use hopash::runtime_bundle::RuntimeBundleStager;
-use hopash::transaction::{RuntimeApplyFailure, RuntimeBundleResolver, RuntimeHealthProbe};
+use ratash::runtime_bundle::RuntimeBundleStager;
+use ratash::transaction::{RuntimeApplyFailure, RuntimeBundleResolver, RuntimeHealthProbe};
 
 struct FixtureMihomo {
     readiness: Mutex<VecDeque<Result<MihomoReadiness, MihomoError>>>,
@@ -144,7 +144,7 @@ fn resolver_reconstructs_only_the_matching_staged_generation() {
         .compile(
             &snapshot,
             &[],
-            &AuthoritativeConfig::new("/tmp/hopash-core.sock", "secret"),
+            &AuthoritativeConfig::new("/tmp/ratash-core.sock", "secret"),
             &workspace,
         )
         .unwrap();
@@ -166,7 +166,7 @@ fn resolver_reconstructs_only_the_matching_staged_generation() {
     );
     let manifest_path = staged.generation_root.join("manifest.json");
     let manifest = fs::read_to_string(&manifest_path).unwrap();
-    let legacy_policy = sha256_hex(b"hopash-config-policy-v3");
+    let legacy_policy = sha256_hex(b"ratash-config-policy-v3");
     let legacy_manifest = manifest.replace(compiler.compiler_policy_sha256(), &legacy_policy);
     assert_ne!(legacy_manifest, manifest);
     let mut manifest_permissions = fs::metadata(&manifest_path).unwrap().permissions();
@@ -213,7 +213,7 @@ fn managed_core() -> ManagedCoreHandle {
     ManagedCoreHandle {
         pid: 42,
         process_start_identity: "fixture".to_owned(),
-        endpoint: CoreControlEndpoint::new("/tmp/hopash-core.sock", "secret"),
+        endpoint: CoreControlEndpoint::new("/tmp/ratash-core.sock", "secret"),
         instance_generation: CoreInstanceGeneration(3),
         runtime_generation: RuntimeGeneration(7),
     }
@@ -226,16 +226,16 @@ fn transaction(generation: RuntimeGeneration) -> TransactionBundle {
         profile_snapshot: id.clone(),
         local_rule_set: id.clone(),
         effective_configuration: id,
-        profile_revision: hopash::profile::ProfileRevision(1),
-        local_rule_set_revision: hopash::domain::LocalRuleSetRevision(1),
-        active_profile_id: hopash::domain::ProfileId::new(),
+        profile_revision: ratash::profile::ProfileRevision(1),
+        local_rule_set_revision: ratash::domain::LocalRuleSetRevision(1),
+        active_profile_id: ratash::domain::ProfileId::new(),
         runtime_generation: generation,
     }
 }
 
 fn temporary_root(label: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "hopash-runtime-adapter-{label}-{}-{}",
+        "ratash-runtime-adapter-{label}-{}-{}",
         std::process::id(),
         uuid::Uuid::new_v4()
     ));

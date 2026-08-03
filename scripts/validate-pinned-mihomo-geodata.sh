@@ -24,7 +24,7 @@ mihomo="$mihomo_directory/$(basename -- "$mihomo")"
 geodata_directory=$(CDPATH= cd -- "$geodata_directory" && pwd)
 
 umask 077
-validation_home=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/hopash-geodata-validation.XXXXXX")
+validation_home=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/ratash-geodata-validation.XXXXXX")
 cleanup() {
     /bin/rm -rf -- "$validation_home"
 }

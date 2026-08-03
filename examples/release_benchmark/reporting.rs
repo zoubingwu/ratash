@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-use hopash::tui_runtime::ShutdownSignal;
+use ratash::tui_runtime::ShutdownSignal;
 
 use super::process_support::ProcessChildGuard;
 use super::support::invalid;
@@ -151,7 +151,7 @@ pub(super) fn validate_manifest_scale(
 ) -> Result<(), Box<dyn Error>> {
     require_u64(manifest, "schema_version", 1)?;
     let generator = require_object(manifest, "generator")?;
-    require_string_object(generator, "name", "hopash-release-workload")?;
+    require_string_object(generator, "name", "ratash-release-workload")?;
     require_u64_object(generator, "version", WORKLOAD_GENERATOR_VERSION)?;
     require_u64_object(generator, "seed", WORKLOAD_SEED)?;
     let scale = require_object(manifest, "scale")?;
@@ -219,7 +219,7 @@ pub(super) fn validate_sample_collector(
     expected_smoke: bool,
 ) -> Result<(), Box<dyn Error>> {
     let collector = require_object(sample, "collector")?;
-    require_string_object(collector, "name", "hopash-release-benchmark")?;
+    require_string_object(collector, "name", "ratash-release-benchmark")?;
     require_u64_object(collector, "version", CAPTURE_TOOL_VERSION)?;
     require_bool_object(collector, "smoke", expected_smoke)
 }

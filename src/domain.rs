@@ -305,7 +305,7 @@ impl fmt::Display for InvalidNodeRecordId {
 impl std::error::Error for InvalidNodeRecordId {}
 
 fn source_aware_node_id(source: &str, components: &[&str]) -> String {
-    let mut canonical = b"hopash-node-v1\0".to_vec();
+    let mut canonical = b"ratash-node-v1\0".to_vec();
     canonical.extend_from_slice(source.as_bytes());
     canonical.push(0);
     for component in components {
@@ -330,7 +330,7 @@ impl ProxyGroupId {
 
     #[must_use]
     pub fn for_name(name: &str) -> Self {
-        let mut canonical = b"hopash-proxy-group-v1\0".to_vec();
+        let mut canonical = b"ratash-proxy-group-v1\0".to_vec();
         canonical.extend_from_slice(name.as_bytes());
         Self(format!(
             "group_v1_{}",

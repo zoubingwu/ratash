@@ -6,12 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
-use hopash::application::{ApplicationOperation, RulePlacement as ApplicationRulePlacement};
-use hopash::constants::{
+use ratash::application::{ApplicationOperation, RulePlacement as ApplicationRulePlacement};
+use ratash::constants::{
     CORE_LOG_LINE_MAX_BYTES, IPC_FRAME_MAX_BYTES, LOG_SUBSCRIBER_CAPACITY, LOG_SUBSCRIBER_MAX_BYTES,
 };
-use hopash::domain::SubscriptionUrl;
-use hopash::ipc::{
+use ratash::domain::SubscriptionUrl;
+use ratash::ipc::{
     AcceptError, CorrelationError, EmptyPayload, FrameError, IPC_PROTOCOL_VERSION, IpcError,
     IpcRequest, IpcResponse, LogStreamItem, LogSubscriber, LogSubscriptionPayload, LogTailPayload,
     LogTailV1, NodeSelectorPayload, PeerAuthorizationError, PeerAuthorizer, ProfileAddPayload,
@@ -21,7 +21,7 @@ use hopash::ipc::{
     StatusSubscriptionPayload, SubscriberPublishStatus, accept_authorized, bind_private_listener,
     read_frame, write_frame,
 };
-use hopash::telemetry::{CoreLogRecord, LogBuffer, LogLevel, LogSource};
+use ratash::telemetry::{CoreLogRecord, LogBuffer, LogLevel, LogSource};
 
 #[test]
 fn request_dtos_round_trip_every_remote_cli_operation() {
@@ -221,7 +221,7 @@ fn success_and_error_response_envelopes_round_trip() {
 #[test]
 fn error_debug_output_omits_message_and_details() {
     let error = IpcError::new(
-        hopash::error::ErrorCode::ExternalOperationFailed,
+        ratash::error::ErrorCode::ExternalOperationFailed,
         "credential=message-secret",
         true,
     )
@@ -305,7 +305,7 @@ fn frame_reader_reports_truncated_payloads() {
 #[test]
 fn socket_binding_sets_private_parent_and_endpoint_permissions() {
     let fixture = TempFixture::new("permissions");
-    let socket_path = fixture.path().join("ipc/hopash.sock");
+    let socket_path = fixture.path().join("ipc/ratash.sock");
 
     let listener = bind_private_listener(&socket_path).expect("private listener should bind");
 
@@ -320,7 +320,7 @@ fn socket_binding_sets_private_parent_and_endpoint_permissions() {
 #[test]
 fn peer_authorization_is_an_object_safe_accept_boundary() {
     let fixture = TempFixture::new("peer-auth");
-    let socket_path = fixture.path().join("ipc/hopash.sock");
+    let socket_path = fixture.path().join("ipc/ratash.sock");
     let listener = bind_private_listener(&socket_path).expect("private listener should bind");
     let client_path = socket_path;
     let client = thread::spawn(move || {
@@ -516,7 +516,7 @@ fn log_gap_recovers_through_the_retained_tail() {
 
 #[test]
 fn log_record_debug_output_omits_message_content() {
-    let record = LogTailV1::from(hopash::telemetry::LogTail {
+    let record = LogTailV1::from(ratash::telemetry::LogTail {
         records: vec![log_record(1, "credential=secret")],
         dropped_total: 0,
         gap: false,
@@ -620,7 +620,7 @@ impl TempFixture {
     fn new(label: &str) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let path = std::env::temp_dir().join(format!(
-            "hopash-ipc-{label}-{}-{}",
+            "ratash-ipc-{label}-{}-{}",
             std::process::id(),
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
         ));

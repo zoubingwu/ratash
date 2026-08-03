@@ -61,7 +61,7 @@ impl ControlMonitor {
         events: SyncSender<SupervisionEvent>,
     ) -> io::Result<Self> {
         let handle = thread::Builder::new()
-            .name("hopash-core-guardian-control".to_owned())
+            .name("ratash-core-guardian-control".to_owned())
             .spawn(move || {
                 let _ = events.send(SupervisionEvent::Control(monitor_control_pipe(cancel)));
             })
@@ -389,7 +389,7 @@ fn run_core_guardian_with_handshake_writer(
     let stdout_forwarder = thread::spawn(move || forward(child_stdout, io::stdout()));
     let stderr_forwarder = thread::spawn(move || forward(child_stderr, io::stderr()));
     let child_waiter = thread::Builder::new()
-        .name("hopash-core-guardian-child".to_owned())
+        .name("ratash-core-guardian-child".to_owned())
         .spawn(move || {
             let result = child.wait().map(|_| ());
             let _ = event_sender.send(SupervisionEvent::Child(result));
@@ -630,7 +630,7 @@ mod tests {
     #[test]
     fn parser_requires_the_exact_absolute_hidden_invocation() {
         let invocation = CoreGuardianInvocation::parse_process_arguments(&arguments(&[
-            "hopash",
+            "ratash",
             INTERNAL_CORE_GUARDIAN_MODE,
             "--mihomo",
             "/private/tmp/g1/mihomo",
@@ -654,12 +654,12 @@ mod tests {
     #[test]
     fn parser_ignores_public_arguments_and_rejects_escaped_runtime_paths() {
         assert_eq!(
-            CoreGuardianInvocation::parse_process_arguments(&arguments(&["hopash", "status"]))
+            CoreGuardianInvocation::parse_process_arguments(&arguments(&["ratash", "status"]))
                 .expect("public arguments should be valid"),
             None
         );
         let error = CoreGuardianInvocation::parse_process_arguments(&arguments(&[
-            "hopash",
+            "ratash",
             INTERNAL_CORE_GUARDIAN_MODE,
             "--mihomo",
             "/private/tmp/other/mihomo",
@@ -699,7 +699,7 @@ mod tests {
     #[test]
     fn handshake_write_failure_reaps_the_exact_core_and_preserves_unrelated_processes() {
         let root = PathBuf::from("/private/tmp").join(format!(
-            "hopash-guardian-write-failure-{}-{}",
+            "ratash-guardian-write-failure-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()
         ));

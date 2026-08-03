@@ -8,7 +8,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hopash::application::{
+use ratash::application::{
     ApplicationClient, ApplicationError, ApplicationErrorDetails, ApplicationOperation,
     ApplicationOutput, ApplicationService, LatencyFreshness, LatencyListOutcome,
     LatencyProbeStatus, LatencyShowOutcome, LatencySummary, LifecycleAction, LifecycleOutcome,
@@ -20,24 +20,24 @@ use hopash::application::{
     RuleSummary, RuntimeApplyFailureStage, RuntimeApplyOutcome, RuntimeApplyStatus,
     SelectorCandidate, SelectorIdentity, SelectorKind,
 };
-use hopash::cancellation::CancellationToken;
-use hopash::constants::{
+use ratash::cancellation::CancellationToken;
+use ratash::constants::{
     IPC_LIST_PAGE_SIZE, IPC_REQUEST_FRAME_MAX_BYTES, LOCAL_RULE_COUNT_MAX, MAX_ACTIVE_NODES,
     PROFILE_COUNT_MAX,
 };
-use hopash::domain::{
+use ratash::domain::{
     CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus, LocalRuleSetRevision, NodeRecordId,
     ProbeGeneration, ProfileId, ProxyGroupId, RuntimeApplyPhase, RuntimeApplySnapshot,
     RuntimeGeneration, RuntimeRecoverySnapshot, RuntimeRecoveryStatus, SubscriptionUrl,
     SupervisorHealthReason, SupervisorLifecycle,
 };
-use hopash::error::ErrorCode;
-use hopash::ipc::{
+use ratash::error::ErrorCode;
+use ratash::ipc::{
     EmptyPayload, FrameError, IPC_PROTOCOL_VERSION, IpcRequest, IpcResponse,
     LogSubscriptionPayload, PeerAuthorizationError, PeerAuthorizer, RequestId, RequestOperation,
     bind_private_listener, read_frame, write_frame,
 };
-use hopash::ipc_runtime::{IpcClient, IpcServer, IpcServerConfig, SameUserPeerAuthorizer};
+use ratash::ipc_runtime::{IpcClient, IpcServer, IpcServerConfig, SameUserPeerAuthorizer};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -50,7 +50,7 @@ impl TempSocket {
     fn new(label: &str) -> Self {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let directory =
-            PathBuf::from("/tmp").join(format!("hopash-ipc-{label}-{}-{id}", std::process::id()));
+            PathBuf::from("/tmp").join(format!("ratash-ipc-{label}-{}-{id}", std::process::id()));
         let path = directory.join("supervisor.sock");
         Self { directory, path }
     }
@@ -374,7 +374,7 @@ fn one_shot_client_executes_through_the_authenticated_server() {
     };
     assert_eq!(
         status.core.lifecycle,
-        hopash::domain::CoreLifecycle::Unconfigured
+        ratash::domain::CoreLifecycle::Unconfigured
     );
 
     server.shutdown().expect("server should stop cleanly");
@@ -396,7 +396,7 @@ fn runtime_apply_and_core_health_round_trip_through_typed_ipc() {
         SupervisorHealthReason::RuntimeRecovery,
         SupervisorHealthReason::ProbeScheduler,
     ];
-    expected.apply_state = hopash::domain::ApplyState::Recovering;
+    expected.apply_state = ratash::domain::ApplyState::Recovering;
     expected.runtime_apply = RuntimeApplySnapshot {
         candidate_generation: Some(RuntimeGeneration(9)),
         committed_generation: Some(RuntimeGeneration(8)),
@@ -970,7 +970,7 @@ fn runtime_apply_failure_details_round_trip_over_ipc() {
         false,
     )
     .with_details(ApplicationErrorDetails::RuntimeApplyFailure(Box::new(
-        hopash::application::RuntimeApplyFailureDetails {
+        ratash::application::RuntimeApplyFailureDetails {
             candidate_generation: Some(RuntimeGeneration(9)),
             committed_generation: Some(RuntimeGeneration(8)),
             stage: RuntimeApplyFailureStage::Health,

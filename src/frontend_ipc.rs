@@ -562,7 +562,7 @@ fn spawn_status_reader(
     resume: Arc<Mutex<ResumeState>>,
 ) -> Result<JoinHandle<()>, StatusInterfaceError> {
     thread::Builder::new()
-        .name(format!("hopash-status-ipc-{generation}"))
+        .name(format!("ratash-status-ipc-{generation}"))
         .spawn(move || {
             while control.active.load(Ordering::Acquire) {
                 let item = match stream.next_item() {
@@ -609,7 +609,7 @@ fn spawn_log_reader(
     buffer: Arc<ConnectionBuffer>,
 ) -> Result<JoinHandle<()>, StatusInterfaceError> {
     thread::Builder::new()
-        .name(format!("hopash-log-ipc-{generation}"))
+        .name(format!("ratash-log-ipc-{generation}"))
         .spawn(move || run_log_reader(generation, stream, &client, &control, &buffer))
         .map_err(|_| thread_spawn_error())
 }

@@ -36,7 +36,7 @@
     "tui_duration_seconds": 1800
   },
   "workload_generator": {
-    "name": "hopash-release-workload",
+    "name": "ratash-release-workload",
     "version": 2,
     "seed": 5210471535391298131
   },

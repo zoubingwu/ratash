@@ -1,5 +1,5 @@
 [package]
-name = "hopash"
+name = "ratash"
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
@@ -9,7 +9,7 @@ publish = false
 path = "src/lib.rs"
 
 [[bin]]
-name = "hopash"
+name = "ratash"
 path = "src/main.rs"
 
 [features]

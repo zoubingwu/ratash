@@ -1,4 +1,4 @@
-Hopash RS includes Geo data published by MetaCubeX/meta-rules-dat. The
+Ratash includes Geo data published by MetaCubeX/meta-rules-dat. The
 generator source is distributed under GPL-3.0-only.
 
 The packaged assets were generated at this immutable commit:

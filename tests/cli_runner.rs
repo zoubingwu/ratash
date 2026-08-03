@@ -1,16 +1,16 @@
-use hopash::application::{
+use ratash::application::{
     ApplicationClient, ApplicationError, ApplicationErrorDetails, ApplicationOperation,
     ApplicationOutput, ApplicationService, LifecycleFailureDetails, ProfileListOutcome,
     ProfileRefreshState, ProfileSummary, SelectorCandidate, SelectorKind,
 };
-use hopash::cli::{
+use ratash::cli::{
     ForegroundRunner, Invocation, OutputMode, run_invocation, run_invocation_with_frontend,
 };
-use hopash::contract::ProcessExitCode;
-use hopash::domain::{
+use ratash::contract::ProcessExitCode;
+use ratash::domain::{
     CoreLifecycle, ProfileId, SubscriptionUrl, SupervisorHealthReason, SupervisorLifecycle,
 };
-use hopash::error::ErrorCode;
+use ratash::error::ErrorCode;
 use std::cell::RefCell;
 use std::io::Write;
 
@@ -252,13 +252,13 @@ fn runtime_apply_failures_expose_stage_generations_and_recovery() {
         false,
     )
     .with_details(ApplicationErrorDetails::RuntimeApplyFailure(Box::new(
-        hopash::application::RuntimeApplyFailureDetails {
-            candidate_generation: Some(hopash::domain::RuntimeGeneration(12)),
-            committed_generation: Some(hopash::domain::RuntimeGeneration(11)),
-            stage: hopash::application::RuntimeApplyFailureStage::IndeterminateApply,
-            recovery: hopash::application::RecoveryOutcome {
-                status: hopash::application::RecoveryStatus::Pending,
-                restored_generation: Some(hopash::domain::RuntimeGeneration(11)),
+        ratash::application::RuntimeApplyFailureDetails {
+            candidate_generation: Some(ratash::domain::RuntimeGeneration(12)),
+            committed_generation: Some(ratash::domain::RuntimeGeneration(11)),
+            stage: ratash::application::RuntimeApplyFailureStage::IndeterminateApply,
+            recovery: ratash::application::RecoveryOutcome {
+                status: ratash::application::RecoveryStatus::Pending,
+                restored_generation: Some(ratash::domain::RuntimeGeneration(11)),
                 message: Some("Committed Runtime Generation cleanup is pending".to_owned()),
             },
         },

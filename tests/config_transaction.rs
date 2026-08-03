@@ -1,21 +1,21 @@
-use hopash::config::{
+use ratash::config::{
     AuthoritativeConfig, ConfigCompiler, CoreConfigValidator, CoreValidationError,
     EffectiveConfiguration,
 };
-use hopash::core::{
+use ratash::core::{
     ApplyCandidateResult, ApplyDisposition, CoreControlEndpoint, CoreRuntimeError,
     CoreRuntimeStatus, ManagedCoreHandle, OwnerSessionProof, RuntimeBundle,
 };
-use hopash::domain::{CoreInstanceGeneration, LocalRuleSetRevision, ProfileId, RuntimeGeneration};
-use hopash::persistence::{
+use ratash::domain::{CoreInstanceGeneration, LocalRuleSetRevision, ProfileId, RuntimeGeneration};
+use ratash::persistence::{
     ObjectId, PersistenceStore, PreparedTransaction, RecoveryState, TransactionBundle,
     TransactionId,
 };
-use hopash::profile::{ActiveProfileRevision, ProfileRevision, ProfileSnapshot, SnapshotLimits};
-use hopash::runtime_bundle::{
+use ratash::profile::{ActiveProfileRevision, ProfileRevision, ProfileSnapshot, SnapshotLimits};
+use ratash::runtime_bundle::{
     RuntimeGenerationPruneResult, RuntimeGenerationRetention, prune_runtime_generations,
 };
-use hopash::transaction::{
+use ratash::transaction::{
     ApplyPath, CandidateRevisionSource, CandidateRevisions, ConfigTransactionCandidate,
     ConfigTransactionCoordinator, ConfigTransactionDependencies, ConfigTransactionErrorKind,
     RecoveryOutcome, RuntimeApplyFailure, RuntimeApplyPort, RuntimeBundleResolveError,
@@ -40,7 +40,7 @@ impl TestDirectory {
     fn new() -> Self {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "hopash-config-transaction-{}-{sequence}",
+            "ratash-config-transaction-{}-{sequence}",
             std::process::id()
         ));
         fs::create_dir(&path).expect("the test directory should be created");

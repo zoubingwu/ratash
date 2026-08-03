@@ -1,14 +1,14 @@
-use hopash::constants::{
+use ratash::constants::{
     CORE_LOG_FORWARD_BATCH_MAX_BYTES, CORE_LOG_FORWARD_MAX_BYTES, CORE_LOG_LINE_MAX_BYTES,
     CORE_RESTART_INITIAL_BACKOFF, CORE_RESTART_MAX_BACKOFF,
 };
-use hopash::core::{
+use ratash::core::{
     ApplyDisposition, CoreControlEndpoint, CoreRuntime, CoreRuntimeDiagnosticCategory,
     CoreRuntimeError, CoreRuntimeErrorKind, CoreRuntimeLifecycle, CoreRuntimeTunReason,
     OwnerSessionProof, OwnerSessionRequest, ProcessOutputSource, RuntimeBundle,
 };
-use hopash::domain::{CoreInstanceGeneration, RuntimeGeneration};
-use hopash::service::{
+use ratash::domain::{CoreInstanceGeneration, RuntimeGeneration};
+use ratash::service::{
     CORE_RUNTIME_PROTOCOL_VERSION, CallerCredentialValidator, CoreExitIdentity,
     CoreProcessController, CoreProcessLog, CoreProcessLogBatch, OwnedProcessIdentity,
     PrivilegedCoreRuntimeService, PrivilegedServiceConfig, PrivilegedServiceDependencies,
@@ -40,7 +40,7 @@ impl TestDirectory {
     fn new() -> Self {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let path = PathBuf::from("/tmp").join(format!(
-            "hopash-service-contract-{}-{sequence}",
+            "ratash-service-contract-{}-{sequence}",
             std::process::id()
         ));
         fs::create_dir(&path).expect("the fixture root should be created");
@@ -619,7 +619,7 @@ impl Harness {
         }
     }
 
-    fn open(&self) -> hopash::core::OwnerSession {
+    fn open(&self) -> ratash::core::OwnerSession {
         self.service
             .open_owner_session(&self.request(100, "supervisor-100", "instance-100"))
             .expect("the fixture owner should open")
@@ -1632,9 +1632,9 @@ fn maintenance_restarts_an_unexpected_core_exit_with_the_bounded_policy() {
             .service
             .maintenance_step(second_deadline)
             .expect("the restarted Core should remain healthy"),
-        hopash::service::ServiceMaintenanceStep {
+        ratash::service::ServiceMaintenanceStep {
             outcome: ServiceMaintenanceOutcome::Unchanged(PrivilegedServiceLifecycle::Running),
-            next_deadline: second_deadline + hopash::constants::CORE_SERVICE_LIVENESS_INTERVAL,
+            next_deadline: second_deadline + ratash::constants::CORE_SERVICE_LIVENESS_INTERVAL,
         }
     );
 }
@@ -1712,9 +1712,9 @@ fn maintenance_preserves_the_degraded_restart_bound() {
             .service
             .maintenance_step(second_deadline)
             .expect("degraded maintenance should remain bounded"),
-        hopash::service::ServiceMaintenanceStep {
+        ratash::service::ServiceMaintenanceStep {
             outcome: ServiceMaintenanceOutcome::Unchanged(PrivilegedServiceLifecycle::Degraded),
-            next_deadline: hopash::constants::CORE_SERVICE_LIVENESS_INTERVAL,
+            next_deadline: ratash::constants::CORE_SERVICE_LIVENESS_INTERVAL,
         }
     );
     assert_eq!(harness.processes.spawn_count.load(Ordering::Relaxed), 3);
@@ -2933,7 +2933,7 @@ fn process_log(timestamp_unix_ms: u64, message: &str) -> CoreProcessLog {
     }
 }
 
-fn exit_identity(handle: &hopash::core::ManagedCoreHandle) -> CoreExitIdentity {
+fn exit_identity(handle: &ratash::core::ManagedCoreHandle) -> CoreExitIdentity {
     CoreExitIdentity {
         pid: handle.pid,
         process_start_identity: handle.process_start_identity.clone(),

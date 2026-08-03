@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 
-use hopash::core::{
+use ratash::core::{
     ApplyCandidateResult, ApplyDisposition, ConnectionSummary, CoreControlEndpoint, CoreEvent,
     CoreEventStream, CoreRuntime, CoreRuntimeError, CoreRuntimeErrorKind, CoreRuntimeStatus,
     DelayProbeRequest, DelayProbeResult, ForwardedCoreLog, ForwardedCoreLogBatch, LatencyFreshness,
@@ -12,7 +12,7 @@ use hopash::core::{
     RuntimeBundle, SelectionError, StopCoreResult, TrafficFrame, UnresolvedMemberReason,
     project_proxy_view,
 };
-use hopash::domain::{
+use ratash::domain::{
     CoreInstanceGeneration, LatencySample, NodeRecordId, ProbeGeneration, ProxyGroupId,
     RuntimeGeneration, SampleState,
 };
@@ -315,7 +315,7 @@ fn log_and_error_formatting_omit_untrusted_diagnostics() {
     let process_log = ForwardedCoreLog {
         sequence: 1,
         timestamp_unix_ms: 2,
-        source: hopash::core::ProcessOutputSource::Stderr,
+        source: ratash::core::ProcessOutputSource::Stderr,
         message: "process-log-secret".to_owned(),
         instance_generation: CoreInstanceGeneration(3),
     };

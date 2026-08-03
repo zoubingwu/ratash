@@ -1,5 +1,5 @@
-use hopash::domain::{ProfileId, SubscriptionUrl};
-use hopash::profile::{
+use ratash::domain::{ProfileId, SubscriptionUrl};
+use ratash::profile::{
     ActiveProfileRevision, Profile, ProfileCatalog, ProfileInsertError, ProfileRevision,
     ProfileSelectorError, ProfileSnapshot, RefreshCommitError, SnapshotLimits, derive_profile_name,
 };
@@ -103,7 +103,7 @@ fn refresh_commit_rechecks_revision_and_preserves_the_latest_valid_snapshot() {
     assert_eq!(
         catalog.commit_refresh(
             id,
-            hopash::profile::RefreshContext {
+            ratash::profile::RefreshContext {
                 profile_revision: expected,
                 active_revision: None,
             },

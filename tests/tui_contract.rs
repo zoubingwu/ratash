@@ -11,13 +11,13 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 
-use hopash::application::{LatencyFreshness, LatencyProbeStatus, PolicyTargetValidation};
-use hopash::constants::{
+use ratash::application::{LatencyFreshness, LatencyProbeStatus, PolicyTargetValidation};
+use ratash::constants::{
     CORE_LOG_LINE_MAX_BYTES, LOCAL_RULE_COUNT_MAX, LOG_CAPACITY, LOG_RETENTION_MAX_BYTES,
     MAX_ACTIVE_NODES, MINIMUM_TERMINAL_HEIGHT, MINIMUM_TERMINAL_WIDTH, TRAFFIC_SERIES_CAPACITY,
     TUI_SEARCH_MAX_BYTES, TUI_SEARCH_MAX_CHARACTERS,
 };
-use hopash::domain::{
+use ratash::domain::{
     ActiveProfileSummary, ApplyState, CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus,
     CoreStatus, LocalRuleSetRevision, NodeRecordId, ProbeQueueStatus, ProfileId, ProxyGroupId,
     RuntimeApplyPhase, RuntimeApplySnapshot, RuntimeGeneration, RuntimeRecoverySnapshot,
@@ -25,9 +25,9 @@ use hopash::domain::{
     StreamState, SupervisorHealthReason, SupervisorLifecycle, SupervisorStatus, TrafficSample,
     TunReason, TunStatus,
 };
-use hopash::ipc::RequestId;
-use hopash::telemetry::{LogLevel, LogSource};
-use hopash::tui::{
+use ratash::ipc::RequestId;
+use ratash::telemetry::{LogLevel, LogSource};
+use ratash::tui::{
     AppState, Command, CommandPaletteAction, ConnectionStatus, EventBudgets, EventSource,
     FairEventInbox, Focus, FullViewSnapshot, InteractionMap, KeyInput, LogLevelFilter, Modal,
     MouseInput, MouseInputKind, MutationSuccess, Page, ProfileRow, ProxyGroupRow,
@@ -810,7 +810,7 @@ fn footer_hints_reflect_rule_availability_and_log_pause_state() {
     let mut state = connected_state();
     state.page = Page::Rules;
     state.rules.loaded_runtime_generation = None;
-    state.rules.load_pending = Some(hopash::tui::PendingRuleLoad {
+    state.rules.load_pending = Some(ratash::tui::PendingRuleLoad {
         request_id: RequestId(99),
         connection_generation: 1,
         runtime_generation: Some(RuntimeGeneration(1)),
@@ -859,7 +859,7 @@ fn proxy_search_and_current_node_use_the_cyan_gray_selection_palette() {
     state.page = Page::Proxies;
     state.focus = Focus::Search;
     state.proxies.filter = "Tokyo".to_owned();
-    let (regions, _) = hopash::tui::compute_layout(&state, area, 1);
+    let (regions, _) = ratash::tui::compute_layout(&state, area, 1);
     let mut search_buffer = Buffer::empty(area);
     render_buffer(&state, area, &mut search_buffer);
     let search = regions.search.expect("Proxy search row should render");
@@ -871,7 +871,7 @@ fn proxy_search_and_current_node_use_the_cyan_gray_selection_palette() {
     state.focus = Focus::Content;
     state.proxies.filter.clear();
     state.proxies.selected = 1;
-    let (regions, _) = hopash::tui::compute_layout(&state, area, 2);
+    let (regions, _) = ratash::tui::compute_layout(&state, area, 2);
     let mut node_buffer = Buffer::empty(area);
     render_buffer(&state, area, &mut node_buffer);
     let list = regions.list.expect("Proxy node list should render");
@@ -909,7 +909,7 @@ fn selected_log_renders_a_sanitized_detail_and_full_row_muted_cyan_highlight() {
         &mut state,
         UiEvent::Intent(UiIntent::SelectLog { tail_offset: 1 }),
     );
-    let (regions, _) = hopash::tui::compute_layout(&state, area, 1);
+    let (regions, _) = ratash::tui::compute_layout(&state, area, 1);
     let list = regions.list.expect("selected Logs should keep a list");
     let detail = regions
         .detail
@@ -1334,7 +1334,7 @@ fn keyboard_and_mouse_sort_controls_share_the_same_intent() {
     state.page = Page::Proxies;
     let (_, map) = render_with_backend(&state, 100, 30);
     let name_sort = hit_for(&map, |intent| {
-        *intent == UiIntent::SetProxySort(hopash::tui::ProxySort::Name)
+        *intent == UiIntent::SetProxySort(ratash::tui::ProxySort::Name)
     });
     state.publish_interaction_map(map);
 
@@ -2029,7 +2029,7 @@ fn view_caches_remain_bounded_at_release_scale() {
     let proxies = (0..=MAX_ACTIVE_NODES)
         .map(|index| proxy(&format!("node-{index}"), false))
         .collect::<Vec<_>>();
-    let profiles = (0..=hopash::tui::PROFILE_VIEW_CAPACITY)
+    let profiles = (0..=ratash::tui::PROFILE_VIEW_CAPACITY)
         .map(|index| profile(&format!("profile-{index}"), index == 0))
         .collect::<Vec<_>>();
     let logs = (0..=LOG_CAPACITY)
@@ -2055,7 +2055,7 @@ fn view_caches_remain_bounded_at_release_scale() {
     assert_eq!(state.proxies.rows.len(), MAX_ACTIVE_NODES);
     assert_eq!(
         state.profiles.rows.len(),
-        hopash::tui::PROFILE_VIEW_CAPACITY
+        ratash::tui::PROFILE_VIEW_CAPACITY
     );
     assert_eq!(state.logs.records.len(), LOG_CAPACITY);
 
@@ -2200,7 +2200,7 @@ fn keyboard_log_selection_pins_a_record_until_escape_resumes_follow() {
     assert!(state.logs.follow);
     assert_eq!(state.logs.scroll, 0);
     assert!(
-        hopash::tui::compute_layout(&state, Rect::new(0, 0, 100, 30), 1)
+        ratash::tui::compute_layout(&state, Rect::new(0, 0, 100, 30), 1)
             .0
             .detail
             .is_none()
@@ -2660,8 +2660,8 @@ fn status_snapshot() -> StatusSnapshot {
         core: CoreStatus {
             lifecycle: CoreLifecycle::Ready,
             pid: Some(42),
-            instance_generation: Some(hopash::domain::CoreInstanceGeneration(1)),
-            restart: hopash::domain::CoreRestartStatus::default(),
+            instance_generation: Some(ratash::domain::CoreInstanceGeneration(1)),
+            restart: ratash::domain::CoreRestartStatus::default(),
         },
         tun: TunStatus {
             requested: true,
@@ -2678,12 +2678,12 @@ fn status_snapshot() -> StatusSnapshot {
             id: node_id.clone(),
             name: "Tokyo".to_owned(),
         }),
-        latency: Some(hopash::domain::LatencySample {
+        latency: Some(ratash::domain::LatencySample {
             node_id,
             delay_ms: Some(42),
             sampled_at_unix_ms: Some(1_000),
             state: SampleState::Fresh,
-            probe_generation: hopash::domain::ProbeGeneration(1),
+            probe_generation: ratash::domain::ProbeGeneration(1),
         }),
         traffic: TrafficSample {
             upload_bytes_per_second: 100,

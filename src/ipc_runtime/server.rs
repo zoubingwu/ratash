@@ -296,7 +296,7 @@ impl IpcServer {
         let observed_accept_metrics = accept_metrics.clone();
         let thread_accept_metrics = accept_metrics;
         let thread = match thread::Builder::new()
-            .name("hopash-ipc-accept".to_owned())
+            .name("ratash-ipc-accept".to_owned())
             .spawn(move || {
                 run_server(
                     listener,
@@ -494,7 +494,7 @@ fn spawn_workers(
             let receiver = Arc::clone(&receiver);
             let context = context.clone();
             thread::Builder::new()
-                .name(format!("hopash-ipc-worker-{index}"))
+                .name(format!("ratash-ipc-worker-{index}"))
                 .spawn(move || worker_loop(receiver, context))
         })
         .collect()

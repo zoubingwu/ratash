@@ -1,26 +1,26 @@
-use hopash::application::{ApplicationClient, ApplicationOperation, ApplicationOutput, Clock};
-use hopash::config::{
+use ratash::application::{ApplicationClient, ApplicationOperation, ApplicationOutput, Clock};
+use ratash::config::{
     AuthoritativeConfig, ConfigCompiler, CoreConfigValidator, CoreValidationError,
 };
-use hopash::constants::LATENCY_FRESHNESS;
-use hopash::core::{
+use ratash::constants::LATENCY_FRESHNESS;
+use ratash::core::{
     Availability, CoreControlEndpoint, CoreRuntimeDiagnosticCategory, CoreRuntimeLifecycle,
     CoreRuntimeRestartStatus, CoreRuntimeStatus, CoreRuntimeTunReason, CoreRuntimeTunStatus,
     ManagedCoreHandle, MihomoError, NodeSelection, NodeSource, ProviderState, ProxyGroup,
     ProxyMember, ProxyNode, ProxyView, ProxyViewOrderSource,
 };
-use hopash::diagnostics::{WrapperDiagnosticCategory, WrapperDiagnosticState};
-use hopash::domain::{
+use ratash::diagnostics::{WrapperDiagnosticCategory, WrapperDiagnosticState};
+use ratash::domain::{
     ApplyState, CoreInstanceGeneration, NodeRecordId, ProxyGroupId, RuntimeApplyPhase,
     RuntimeGeneration, RuntimeRecoveryStatus, StreamState, SubscriptionUrl, SupervisorHealthReason,
 };
-use hopash::state::{AuthoritativeState, AuthoritativeStateStore};
-use hopash::supervisor::{
+use ratash::state::{AuthoritativeState, AuthoritativeStateStore};
+use ratash::supervisor::{
     FetchedProfile, ProfileFetchError, ProfileFetchPort, Supervisor, SupervisorCorePort,
     SupervisorDependencies, SupervisorRuleTransactionReservation, SupervisorTransactionFailure,
     SupervisorTransactionPort, SupervisorTransactionRequest, TelemetryStream,
 };
-use hopash::transaction::{
+use ratash::transaction::{
     CandidateRevisions, ConfigTransactionSuccess, RecoveryOutcome as TransactionRecoveryOutcome,
 };
 use std::collections::{BTreeMap, VecDeque};
@@ -108,7 +108,7 @@ struct UnusedProfileSource;
 impl ProfileFetchPort for UnusedProfileSource {
     fn fetch(
         &self,
-        _url: &hopash::domain::SubscriptionUrl,
+        _url: &ratash::domain::SubscriptionUrl,
     ) -> Result<FetchedProfile, ProfileFetchError> {
         panic!("the zero-Profile status path must not download a Profile")
     }
@@ -119,7 +119,7 @@ struct AcceptingValidator;
 impl CoreConfigValidator for AcceptingValidator {
     fn validate(
         &self,
-        _configuration: &hopash::config::EffectiveConfiguration,
+        _configuration: &ratash::config::EffectiveConfiguration,
         _staging_root: &std::path::Path,
     ) -> Result<(), CoreValidationError> {
         Ok(())
@@ -133,7 +133,7 @@ struct ToggleValidator {
 impl CoreConfigValidator for ToggleValidator {
     fn validate(
         &self,
-        _configuration: &hopash::config::EffectiveConfiguration,
+        _configuration: &ratash::config::EffectiveConfiguration,
         _staging_root: &std::path::Path,
     ) -> Result<(), CoreValidationError> {
         if self.fail_next.swap(false, Ordering::Relaxed) {
@@ -329,7 +329,7 @@ impl SupervisorCorePort for FakeCore {
             .expect("the Core lock should be available");
         if state.fail_status {
             return Err(MihomoError::new(
-                hopash::core::MihomoErrorKind::Unavailable,
+                ratash::core::MihomoErrorKind::Unavailable,
                 "injected runtime status failure",
             ));
         }
@@ -351,7 +351,7 @@ impl SupervisorCorePort for FakeCore {
         if state.fail_proxy_view_attempts > 0 {
             state.fail_proxy_view_attempts -= 1;
             return Err(MihomoError::new(
-                hopash::core::MihomoErrorKind::Unavailable,
+                ratash::core::MihomoErrorKind::Unavailable,
                 "the fixture provider is warming up",
             ));
         }
@@ -373,7 +373,7 @@ impl SupervisorCorePort for FakeCore {
             state.fail_next_selection = false;
             state.fail_selection_call = None;
             return Err(MihomoError::new(
-                hopash::core::MihomoErrorKind::SelectionRejected,
+                ratash::core::MihomoErrorKind::SelectionRejected,
                 "injected selection failure",
             ));
         }
@@ -432,12 +432,12 @@ impl PersistingTransactions {
             })
             .map_err(|_| {
                 SupervisorTransactionFailure::new(
-                    hopash::supervisor::SupervisorTransactionFailureKind::State,
+                    ratash::supervisor::SupervisorTransactionFailureKind::State,
                 )
             })?;
         let prepared = self.store.persistence().prepare(&bundle).map_err(|_| {
             SupervisorTransactionFailure::new(
-                hopash::supervisor::SupervisorTransactionFailureKind::State,
+                ratash::supervisor::SupervisorTransactionFailureKind::State,
             )
         })?;
         self.store
@@ -445,7 +445,7 @@ impl PersistingTransactions {
             .commit_prepared(&prepared)
             .map_err(|_| {
                 SupervisorTransactionFailure::new(
-                    hopash::supervisor::SupervisorTransactionFailureKind::State,
+                    ratash::supervisor::SupervisorTransactionFailureKind::State,
                 )
             })?;
         self.store
@@ -453,7 +453,7 @@ impl PersistingTransactions {
             .clear_prepared(&prepared)
             .map_err(|_| {
                 SupervisorTransactionFailure::new(
-                    hopash::supervisor::SupervisorTransactionFailureKind::State,
+                    ratash::supervisor::SupervisorTransactionFailureKind::State,
                 )
             })
     }
@@ -479,7 +479,7 @@ impl SupervisorTransactionPort for PersistingTransactions {
     {
         if self.busy_next_rule.swap(false, Ordering::Relaxed) {
             return Err(SupervisorTransactionFailure::new(
-                hopash::supervisor::SupervisorTransactionFailureKind::Busy,
+                ratash::supervisor::SupervisorTransactionFailureKind::Busy,
             ));
         }
         Ok(Box::new(PersistingRuleTransactionReservation {
@@ -495,13 +495,13 @@ impl SupervisorTransactionPort for PersistingTransactions {
         self.apply_count.fetch_add(1, Ordering::Relaxed);
         if fail_fast && self.busy_next_rule.swap(false, Ordering::Relaxed) {
             return Err(SupervisorTransactionFailure::new(
-                hopash::supervisor::SupervisorTransactionFailureKind::Busy,
+                ratash::supervisor::SupervisorTransactionFailureKind::Busy,
             ));
         }
         if self.fail_next_apply.swap(false, Ordering::Relaxed) {
             let mut failure = SupervisorTransactionFailure::new(
-                hopash::supervisor::SupervisorTransactionFailureKind::Coordinator(
-                    hopash::transaction::ConfigTransactionErrorKind::Apply,
+                ratash::supervisor::SupervisorTransactionFailureKind::Coordinator(
+                    ratash::transaction::ConfigTransactionErrorKind::Apply,
                 ),
             );
             failure.candidate_generation = Some(request.generation);
@@ -521,8 +521,8 @@ impl SupervisorTransactionPort for PersistingTransactions {
         }
         if self.fail_next_validation.swap(false, Ordering::Relaxed) {
             return Err(SupervisorTransactionFailure::new(
-                hopash::supervisor::SupervisorTransactionFailureKind::Coordinator(
-                    hopash::transaction::ConfigTransactionErrorKind::Validation,
+                ratash::supervisor::SupervisorTransactionFailureKind::Coordinator(
+                    ratash::transaction::ConfigTransactionErrorKind::Validation,
                 ),
             ));
         }
@@ -541,7 +541,7 @@ impl SupervisorTransactionPort for PersistingTransactions {
         Ok(ConfigTransactionSuccess {
             candidate_generation: generation,
             committed_generation: generation,
-            apply_path: hopash::transaction::ApplyPath::Direct,
+            apply_path: ratash::transaction::ApplyPath::Direct,
             recovery,
         })
     }
@@ -553,7 +553,7 @@ impl SupervisorTransactionPort for PersistingTransactions {
         self.metadata_count.fetch_add(1, Ordering::Relaxed);
         if self.fail_next_metadata.swap(false, Ordering::Relaxed) {
             return Err(SupervisorTransactionFailure::new(
-                hopash::supervisor::SupervisorTransactionFailureKind::State,
+                ratash::supervisor::SupervisorTransactionFailureKind::State,
             ));
         }
         self.commit(request)
@@ -786,7 +786,7 @@ fn two_node_proxy_view() -> ProxyView {
 }
 
 fn oversized_proxy_view() -> ProxyView {
-    let nodes = (0..=hopash::constants::MAX_ACTIVE_NODES)
+    let nodes = (0..=ratash::constants::MAX_ACTIVE_NODES)
         .map(|index| {
             let name = format!("node-{index}");
             let record_id = NodeRecordId::for_core(&name);
@@ -876,7 +876,7 @@ struct TestDirectory {
 impl TestDirectory {
     fn new(label: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
-            "hopash-supervisor-{label}-{}-{}",
+            "ratash-supervisor-{label}-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
@@ -951,15 +951,15 @@ fn zero_profile_supervisor_is_ready_without_contacting_the_core() {
 
     assert_eq!(
         status.supervisor.lifecycle,
-        hopash::domain::SupervisorLifecycle::Ready
+        ratash::domain::SupervisorLifecycle::Ready
     );
     assert_eq!(
         status.core.lifecycle,
-        hopash::domain::CoreLifecycle::Unconfigured
+        ratash::domain::CoreLifecycle::Unconfigured
     );
     assert_eq!(
         status.tun.reason,
-        Some(hopash::domain::TunReason::NoActiveProfile)
+        Some(ratash::domain::TunReason::NoActiveProfile)
     );
     assert!(status.active_profile.is_none());
     assert!(status.runtime_generation.is_none());
@@ -994,15 +994,15 @@ fn status_projects_core_restart_degradation_and_tun_capability() {
     let pending = get_status(&supervisor);
     assert_eq!(
         pending.supervisor.lifecycle,
-        hopash::domain::SupervisorLifecycle::Ready
+        ratash::domain::SupervisorLifecycle::Ready
     );
     assert_eq!(
         pending.core.lifecycle,
-        hopash::domain::CoreLifecycle::Starting
+        ratash::domain::CoreLifecycle::Starting
     );
     assert_eq!(
         pending.core.restart,
-        hopash::domain::CoreRestartStatus {
+        ratash::domain::CoreRestartStatus {
             pending: true,
             attempts: 1,
             backoff_ms: Some(2_000),
@@ -1013,7 +1013,7 @@ fn status_projects_core_restart_degradation_and_tun_capability() {
     assert!(!pending.tun.effective);
     assert_eq!(
         pending.tun.reason,
-        Some(hopash::domain::TunReason::CoreUnavailable)
+        Some(ratash::domain::TunReason::CoreUnavailable)
     );
 
     harness.core.set_runtime_status(CoreRuntimeStatus {
@@ -1030,16 +1030,16 @@ fn status_projects_core_restart_degradation_and_tun_capability() {
     let degraded = get_status(&supervisor);
     assert_eq!(
         degraded.supervisor.lifecycle,
-        hopash::domain::SupervisorLifecycle::Degraded
+        ratash::domain::SupervisorLifecycle::Degraded
     );
     assert!(degraded.supervisor.health_reasons.is_empty());
     assert_eq!(
         degraded.core.lifecycle,
-        hopash::domain::CoreLifecycle::Degraded
+        ratash::domain::CoreLifecycle::Degraded
     );
     assert_eq!(
         degraded.core.restart.diagnostic,
-        Some(hopash::domain::CoreDiagnosticCategory::RestartLimitReached)
+        Some(ratash::domain::CoreDiagnosticCategory::RestartLimitReached)
     );
 
     let managed_core = harness
@@ -1053,11 +1053,11 @@ fn status_projects_core_restart_degradation_and_tun_capability() {
     for (reason, expected) in [
         (
             CoreRuntimeTunReason::PermissionDenied,
-            hopash::domain::TunReason::PermissionDenied,
+            ratash::domain::TunReason::PermissionDenied,
         ),
         (
             CoreRuntimeTunReason::Unsupported,
-            hopash::domain::TunReason::Unsupported,
+            ratash::domain::TunReason::Unsupported,
         ),
     ] {
         harness.core.set_runtime_status(CoreRuntimeStatus {
@@ -1070,7 +1070,7 @@ fn status_projects_core_restart_degradation_and_tun_capability() {
             },
         });
         let status = get_status(&supervisor);
-        assert_eq!(status.core.lifecycle, hopash::domain::CoreLifecycle::Ready);
+        assert_eq!(status.core.lifecycle, ratash::domain::CoreLifecycle::Ready);
         assert!(!status.tun.capable);
         assert!(!status.tun.effective);
         assert_eq!(status.tun.reason, Some(expected));
@@ -1089,22 +1089,22 @@ fn runtime_status_failure_is_publicly_degraded() {
 
     assert_eq!(
         status.supervisor.lifecycle,
-        hopash::domain::SupervisorLifecycle::Degraded
+        ratash::domain::SupervisorLifecycle::Degraded
     );
     assert!(status.supervisor.health_reasons.is_empty());
     assert_eq!(
         status.core.lifecycle,
-        hopash::domain::CoreLifecycle::Degraded
+        ratash::domain::CoreLifecycle::Degraded
     );
     assert_eq!(
         status.core.restart,
-        hopash::domain::CoreRestartStatus::default()
+        ratash::domain::CoreRestartStatus::default()
     );
     assert!(!status.tun.capable);
     assert!(!status.tun.effective);
     assert_eq!(
         status.tun.reason,
-        Some(hopash::domain::TunReason::CoreUnavailable)
+        Some(ratash::domain::TunReason::CoreUnavailable)
     );
 }
 
@@ -1126,7 +1126,7 @@ fn first_profile_add_commits_rules_runtime_probes_and_reopens_from_persistence()
 
     assert_eq!(
         added.action,
-        hopash::application::ProfileMutationAction::Added
+        ratash::application::ProfileMutationAction::Added
     );
     assert!(added.profile.active);
     assert_eq!(
@@ -1147,7 +1147,7 @@ fn first_profile_add_commits_rules_runtime_probes_and_reopens_from_persistence()
     assert!(rules.initialized);
     assert_eq!(
         rules.revision,
-        Some(hopash::domain::LocalRuleSetRevision(1))
+        Some(ratash::domain::LocalRuleSetRevision(1))
     );
     assert_eq!(rules.rules[0].rule_string, "MATCH,Main");
 
@@ -1179,11 +1179,11 @@ fn first_profile_add_commits_rules_runtime_probes_and_reopens_from_persistence()
     assert_eq!(latencies.samples[0].node_name, "node-a");
     assert_eq!(
         latencies.samples[0].probe_generation,
-        hopash::domain::ProbeGeneration(1)
+        ratash::domain::ProbeGeneration(1)
     );
     assert_eq!(
         latencies.samples[0].probe_status,
-        hopash::application::LatencyProbeStatus::Queued
+        ratash::application::LatencyProbeStatus::Queued
     );
 
     drop(supervisor);
@@ -1237,7 +1237,7 @@ fn startup_apply_exposes_pending_runtime_recovery_health() {
 
     assert_eq!(
         status.supervisor.lifecycle,
-        hopash::domain::SupervisorLifecycle::Degraded
+        ratash::domain::SupervisorLifecycle::Degraded
     );
     assert_eq!(
         status.supervisor.health_reasons,
@@ -1281,7 +1281,7 @@ fn profile_add_accepts_core_owned_fields_for_runtime_apply() {
 
     assert_eq!(
         added.action,
-        hopash::application::ProfileMutationAction::Added
+        ratash::application::ProfileMutationAction::Added
     );
     assert!(added.profile.active);
     assert_eq!(
@@ -1334,13 +1334,13 @@ fn startup_migrates_the_committed_v3_geo_policy_through_a_new_runtime_generation
     add_profile(&supervisor, "https://example.test/primary.yaml");
     drop(supervisor);
 
-    let limits = hopash::profile::SnapshotLimits::new(
-        hopash::constants::PROFILE_RESPONSE_MAX_BYTES,
-        hopash::constants::YAML_MAX_DEPTH,
+    let limits = ratash::profile::SnapshotLimits::new(
+        ratash::constants::PROFILE_RESPONSE_MAX_BYTES,
+        ratash::constants::YAML_MAX_DEPTH,
     );
     let hydrated = harness
         .state_store
-        .load_committed(limits, hopash::rule::RuleSetLimits::product())
+        .load_committed(limits, ratash::rule::RuleSetLimits::product())
         .expect("the current state should load")
         .expect("the current state should be committed");
     let active_profile_id = hydrated
@@ -1378,7 +1378,7 @@ fn startup_migrates_the_committed_v3_geo_policy_through_a_new_runtime_generation
     let restarted = harness.open();
     let migrated = harness
         .state_store
-        .load_committed(limits, hopash::rule::RuleSetLimits::product())
+        .load_committed(limits, ratash::rule::RuleSetLimits::product())
         .expect("the migrated state should load")
         .expect("the migrated state should be committed");
 
@@ -1429,11 +1429,11 @@ fn restart_recompiles_for_the_new_core_session_and_restores_runtime_state() {
     let hydrated = harness
         .state_store
         .load_committed(
-            hopash::profile::SnapshotLimits::new(
-                hopash::constants::PROFILE_RESPONSE_MAX_BYTES,
-                hopash::constants::YAML_MAX_DEPTH,
+            ratash::profile::SnapshotLimits::new(
+                ratash::constants::PROFILE_RESPONSE_MAX_BYTES,
+                ratash::constants::YAML_MAX_DEPTH,
             ),
-            hopash::rule::RuleSetLimits::product(),
+            ratash::rule::RuleSetLimits::product(),
         )
         .expect("the restarted state should load")
         .expect("the restarted state should remain committed");
@@ -1482,18 +1482,18 @@ fn failed_first_profile_apply_preserves_the_zero_profile_state() {
         .expect_err("the injected Runtime Apply should fail");
     assert_eq!(
         error.code,
-        hopash::error::ErrorCode::ExternalOperationFailed
+        ratash::error::ErrorCode::ExternalOperationFailed
     );
     assert_eq!(
         error.details,
         Some(
-            hopash::application::ApplicationErrorDetails::RuntimeApplyFailure(Box::new(
-                hopash::application::RuntimeApplyFailureDetails {
+            ratash::application::ApplicationErrorDetails::RuntimeApplyFailure(Box::new(
+                ratash::application::RuntimeApplyFailureDetails {
                     candidate_generation: Some(RuntimeGeneration(1)),
                     committed_generation: None,
-                    stage: hopash::application::RuntimeApplyFailureStage::Apply,
-                    recovery: hopash::application::RecoveryOutcome {
-                        status: hopash::application::RecoveryStatus::NotRequired,
+                    stage: ratash::application::RuntimeApplyFailureStage::Apply,
+                    recovery: ratash::application::RecoveryOutcome {
+                        status: ratash::application::RecoveryStatus::NotRequired,
                         restored_generation: None,
                         message: None,
                     },
@@ -1526,7 +1526,7 @@ fn failed_first_profile_apply_preserves_the_zero_profile_state() {
     };
     assert_eq!(
         status.core.lifecycle,
-        hopash::domain::CoreLifecycle::Unconfigured
+        ratash::domain::CoreLifecycle::Unconfigured
     );
     assert!(status.runtime_generation.is_none());
     assert_eq!(status.apply_state, ApplyState::Failed);
@@ -1569,11 +1569,11 @@ fn committed_apply_with_pending_cleanup_swaps_state_and_reports_degraded_recover
         .expect("the first Profile should report Runtime Apply");
     assert_eq!(
         apply.status,
-        hopash::application::RuntimeApplyStatus::Applied
+        ratash::application::RuntimeApplyStatus::Applied
     );
     assert_eq!(
         apply.recovery.status,
-        hopash::application::RecoveryStatus::Pending
+        ratash::application::RecoveryStatus::Pending
     );
     assert_eq!(
         apply.recovery.restored_generation,
@@ -1588,7 +1588,7 @@ fn committed_apply_with_pending_cleanup_swaps_state_and_reports_degraded_recover
     };
     assert_eq!(
         status.supervisor.lifecycle,
-        hopash::domain::SupervisorLifecycle::Degraded
+        ratash::domain::SupervisorLifecycle::Degraded
     );
     assert_eq!(
         status.supervisor.health_reasons,
@@ -1641,7 +1641,7 @@ fn failed_runtime_recovery_marks_the_supervisor_degraded_and_retains_rules() {
     supervisor
         .execute(ApplicationOperation::RuleAdd {
             rule: "DOMAIN,example.com,DIRECT".to_owned(),
-            placement: hopash::application::RulePlacement::Prepend,
+            placement: ratash::application::RulePlacement::Prepend,
         })
         .expect_err("the injected recovery failure should fail the mutation");
     assert_eq!(rule_strings_from_application(&supervisor), ["MATCH,Main"]);
@@ -1654,13 +1654,13 @@ fn failed_runtime_recovery_marks_the_supervisor_degraded_and_retains_rules() {
     };
     assert_eq!(
         status.supervisor.lifecycle,
-        hopash::domain::SupervisorLifecycle::Degraded
+        ratash::domain::SupervisorLifecycle::Degraded
     );
     assert_eq!(
         status.supervisor.health_reasons,
         [SupervisorHealthReason::RuntimeRecovery]
     );
-    assert_eq!(status.core.lifecycle, hopash::domain::CoreLifecycle::Ready);
+    assert_eq!(status.core.lifecycle, ratash::domain::CoreLifecycle::Ready);
     assert!(status.tun.effective);
     assert_eq!(status.runtime_generation, Some(RuntimeGeneration(1)));
     assert_eq!(status.apply_state, ApplyState::Failed);
@@ -1685,7 +1685,7 @@ fn failed_runtime_recovery_marks_the_supervisor_degraded_and_retains_rules() {
     supervisor
         .execute(ApplicationOperation::RuleAdd {
             rule: "DOMAIN,example.org,DIRECT".to_owned(),
-            placement: hopash::application::RulePlacement::Prepend,
+            placement: ratash::application::RulePlacement::Prepend,
         })
         .expect("a later Runtime Apply should succeed");
     let recovered_status = get_status(&supervisor);
@@ -1708,7 +1708,7 @@ fn failed_runtime_recovery_marks_the_supervisor_degraded_and_retains_rules() {
     );
     assert_eq!(
         recovered_status.supervisor.lifecycle,
-        hopash::domain::SupervisorLifecycle::Ready
+        ratash::domain::SupervisorLifecycle::Ready
     );
     assert!(recovered_status.supervisor.health_reasons.is_empty());
 }
@@ -1741,7 +1741,7 @@ fn wrapper_diagnostics_record_health_transitions_once_without_untrusted_strings(
         supervisor
             .execute(ApplicationOperation::RuleAdd {
                 rule: format!("DOMAIN,failed-{timestamp}.example,DIRECT"),
-                placement: hopash::application::RulePlacement::Prepend,
+                placement: ratash::application::RulePlacement::Prepend,
             })
             .expect_err("the injected Runtime Recovery failure should fail the mutation");
     }
@@ -1750,14 +1750,14 @@ fn wrapper_diagnostics_record_health_transitions_once_without_untrusted_strings(
     supervisor
         .execute(ApplicationOperation::RuleAdd {
             rule: "DOMAIN,recovered.example,DIRECT".to_owned(),
-            placement: hopash::application::RulePlacement::Prepend,
+            placement: ratash::application::RulePlacement::Prepend,
         })
         .expect("the later Runtime Apply should clear recovery health");
     harness.clock.set(14_000);
     supervisor
         .execute(ApplicationOperation::RuleAdd {
             rule: "DOMAIN,still-healthy.example,DIRECT".to_owned(),
-            placement: hopash::application::RulePlacement::Prepend,
+            placement: ratash::application::RulePlacement::Prepend,
         })
         .expect("the healthy Runtime Apply should remain healthy");
 
@@ -1794,7 +1794,7 @@ fn supervisor_wrapper_diagnostics_retain_the_bounded_latest_tail_and_report_a_ga
     let supervisor = harness.open();
     add_profile(&supervisor, "https://example.test/primary.yaml");
 
-    let transitions = hopash::constants::WRAPPER_DIAGNOSTIC_CAPACITY + 2;
+    let transitions = ratash::constants::WRAPPER_DIAGNOSTIC_CAPACITY + 2;
     for index in 0..(transitions / 2) {
         harness
             .transactions
@@ -1811,13 +1811,13 @@ fn supervisor_wrapper_diagnostics_retain_the_bounded_latest_tail_and_report_a_ga
         supervisor
             .execute(ApplicationOperation::RuleAdd {
                 rule: rule.clone(),
-                placement: hopash::application::RulePlacement::Prepend,
+                placement: ratash::application::RulePlacement::Prepend,
             })
             .expect_err("the injected Runtime Recovery failure should raise health");
         supervisor
             .execute(ApplicationOperation::RuleAdd {
                 rule,
-                placement: hopash::application::RulePlacement::Prepend,
+                placement: ratash::application::RulePlacement::Prepend,
             })
             .expect("the succeeding Runtime Apply should clear health");
     }
@@ -1827,7 +1827,7 @@ fn supervisor_wrapper_diagnostics_retain_the_bounded_latest_tail_and_report_a_ga
         .expect("the bounded diagnostic tail should remain available");
     assert_eq!(
         diagnostics.records.len(),
-        hopash::constants::WRAPPER_DIAGNOSTIC_CAPACITY
+        ratash::constants::WRAPPER_DIAGNOSTIC_CAPACITY
     );
     assert_eq!(diagnostics.evicted_total, 2);
     assert!(diagnostics.gap);
@@ -1850,7 +1850,7 @@ fn status_reports_applying_while_a_transaction_owns_authoritative_state() {
     let mutation = thread::spawn(move || {
         mutation_supervisor.execute(ApplicationOperation::RuleAdd {
             rule: "DOMAIN,example.com,DIRECT".to_owned(),
-            placement: hopash::application::RulePlacement::Prepend,
+            placement: ratash::application::RulePlacement::Prepend,
         })
     });
     harness.transactions.wait_for_blocked_apply();
@@ -1910,7 +1910,7 @@ fn oversized_active_node_set_deactivates_probes_and_marks_degraded_state() {
     };
     assert_eq!(
         status.supervisor.lifecycle,
-        hopash::domain::SupervisorLifecycle::Degraded
+        ratash::domain::SupervisorLifecycle::Degraded
     );
     assert_eq!(
         status.supervisor.health_reasons,
@@ -1924,7 +1924,7 @@ fn oversized_active_node_set_deactivates_probes_and_marks_degraded_state() {
     let recovered = get_status(&supervisor);
     assert_eq!(
         recovered.supervisor.lifecycle,
-        hopash::domain::SupervisorLifecycle::Ready
+        ratash::domain::SupervisorLifecycle::Ready
     );
     assert!(recovered.supervisor.health_reasons.is_empty());
     assert_eq!(recovered.probe_queue.active_node_count, 1);
@@ -2000,7 +2000,7 @@ fn profile_activation_and_removal_swap_authority_only_after_commit() {
         .expect_err("the Active Profile should be protected");
     assert_eq!(
         active_remove_error.code,
-        hopash::error::ErrorCode::ProfileActive
+        ratash::error::ErrorCode::ProfileActive
     );
 
     harness
@@ -2180,7 +2180,7 @@ fn core_replacement_retries_provider_warmup_then_restores_selections_and_probes(
     assert_eq!(probes.len(), 2);
     assert_eq!(
         probes[0].task.generation,
-        hopash::domain::ProbeGeneration(2)
+        ratash::domain::ProbeGeneration(2)
     );
     assert!(
         supervisor
@@ -2219,7 +2219,7 @@ fn unresolved_selection_restoration_has_a_fixed_retry_limit() {
     assert!(pending_status.selection_restore_pending);
 
     let mut complete = false;
-    for _ in 1..hopash::constants::SELECTION_RESTORE_ATTEMPT_LIMIT {
+    for _ in 1..ratash::constants::SELECTION_RESTORE_ATTEMPT_LIMIT {
         complete = supervisor
             .retry_selection_restore()
             .expect("a bounded restore attempt should complete");
@@ -2234,7 +2234,7 @@ fn unresolved_selection_restoration_has_a_fixed_retry_limit() {
     };
     assert_eq!(
         status.supervisor.lifecycle,
-        hopash::domain::SupervisorLifecycle::Degraded
+        ratash::domain::SupervisorLifecycle::Degraded
     );
     assert_eq!(
         status.supervisor.health_reasons,
@@ -2251,7 +2251,7 @@ fn unresolved_selection_restoration_has_a_fixed_retry_limit() {
     let recovered = get_status(&supervisor);
     assert_eq!(
         recovered.supervisor.lifecycle,
-        hopash::domain::SupervisorLifecycle::Ready
+        ratash::domain::SupervisorLifecycle::Ready
     );
     assert!(recovered.supervisor.health_reasons.is_empty());
 }
@@ -2270,13 +2270,13 @@ fn duplicate_profile_names_return_typed_candidates() {
             profile: "Shared".to_owned(),
         })
         .expect_err("the duplicate display name should be ambiguous");
-    assert_eq!(error.code, hopash::error::ErrorCode::ProfileAmbiguous);
+    assert_eq!(error.code, ratash::error::ErrorCode::ProfileAmbiguous);
     let candidates = error
         .selector_candidates
         .expect("ambiguity should include typed candidates");
     assert_eq!(
         candidates.selector,
-        hopash::application::SelectorKind::Profile
+        ratash::application::SelectorKind::Profile
     );
     assert_eq!(
         candidates
@@ -2344,7 +2344,7 @@ fn proxy_selection_persists_after_core_success_and_compensates_on_failure() {
         .expect_err("the injected metadata commit should fail");
     assert_eq!(
         error.code,
-        hopash::error::ErrorCode::ExternalOperationFailed
+        ratash::error::ErrorCode::ExternalOperationFailed
     );
     assert!(error.message.contains("restored"));
     let core = harness.core.state.lock().expect("the Core lock");
@@ -2378,7 +2378,7 @@ fn proxy_selection_persists_after_core_success_and_compensates_on_failure() {
     let degraded = get_status(&supervisor);
     assert_eq!(
         degraded.supervisor.lifecycle,
-        hopash::domain::SupervisorLifecycle::Degraded
+        ratash::domain::SupervisorLifecycle::Degraded
     );
     assert_eq!(
         degraded.supervisor.health_reasons,
@@ -2413,7 +2413,7 @@ fn latency_show_prefers_opaque_id_and_reports_name_ambiguity() {
         latencies
             .samples
             .iter()
-            .all(|sample| sample.probe_status == hopash::application::LatencyProbeStatus::Queued)
+            .all(|sample| sample.probe_status == ratash::application::LatencyProbeStatus::Queued)
     );
 
     let target = latencies.samples[0].node_id.clone();
@@ -2432,11 +2432,11 @@ fn latency_show_prefers_opaque_id_and_reports_name_ambiguity() {
             node: "shared".to_owned(),
         })
         .expect_err("the duplicate Node name should be ambiguous");
-    assert_eq!(error.code, hopash::error::ErrorCode::NodeAmbiguous);
+    assert_eq!(error.code, ratash::error::ErrorCode::NodeAmbiguous);
     let candidates = error
         .selector_candidates
         .expect("Node ambiguity should include candidates");
-    assert_eq!(candidates.selector, hopash::application::SelectorKind::Node);
+    assert_eq!(candidates.selector, ratash::application::SelectorKind::Node);
     assert_eq!(candidates.candidates.len(), 2);
 }
 
@@ -2492,7 +2492,7 @@ fn probe_surfaces_share_the_active_profile_node_boundary() {
         let error = supervisor
             .execute(ApplicationOperation::LatencyShow { node: selector })
             .expect_err("Core-internal targets should stay outside Delay Probe surfaces");
-        assert_eq!(error.code, hopash::error::ErrorCode::NodeNotFound);
+        assert_eq!(error.code, ratash::error::ErrorCode::NodeNotFound);
     }
 }
 
@@ -2513,7 +2513,7 @@ fn proxy_and_rule_ambiguity_use_their_stable_error_codes() {
             node: "shared".to_owned(),
         })
         .expect_err("an ambiguous Node selector should fail");
-    assert_eq!(proxy_error.code, hopash::error::ErrorCode::NodeAmbiguous);
+    assert_eq!(proxy_error.code, ratash::error::ErrorCode::NodeAmbiguous);
 
     let rule_harness = Harness::new("rule-ambiguity-code");
     let duplicated_rules = String::from_utf8(fixture_profile("node-a"))
@@ -2531,7 +2531,7 @@ fn proxy_and_rule_ambiguity_use_their_stable_error_codes() {
             rule: "MATCH,Main".to_owned(),
         })
         .expect_err("an ambiguous Rule String should fail");
-    assert_eq!(rule_error.code, hopash::error::ErrorCode::RuleAmbiguous);
+    assert_eq!(rule_error.code, ratash::error::ErrorCode::RuleAmbiguous);
 }
 
 #[test]
@@ -2548,7 +2548,7 @@ fn proxy_group_and_node_misses_have_selector_specific_codes() {
         .expect_err("the missing Proxy Group should fail");
     assert_eq!(
         group_error.code,
-        hopash::error::ErrorCode::ProxyGroupNotFound
+        ratash::error::ErrorCode::ProxyGroupNotFound
     );
 
     let node_error = supervisor
@@ -2556,7 +2556,7 @@ fn proxy_group_and_node_misses_have_selector_specific_codes() {
             node: "missing-node".to_owned(),
         })
         .expect_err("the missing Node should fail");
-    assert_eq!(node_error.code, hopash::error::ErrorCode::NodeNotFound);
+    assert_eq!(node_error.code, ratash::error::ErrorCode::NodeNotFound);
 }
 
 #[test]
@@ -2573,17 +2573,17 @@ fn proxy_rows_preserve_group_and_unresolved_member_states() {
         },
         ProxyMember::Unresolved {
             name: "missing".to_owned(),
-            reason: hopash::core::UnresolvedMemberReason::Missing,
+            reason: ratash::core::UnresolvedMemberReason::Missing,
             candidate_ids: Vec::new(),
         },
         ProxyMember::Unresolved {
             name: "shared".to_owned(),
-            reason: hopash::core::UnresolvedMemberReason::Ambiguous,
+            reason: ratash::core::UnresolvedMemberReason::Ambiguous,
             candidate_ids: candidates.clone(),
         },
         ProxyMember::Unresolved {
             name: "warming".to_owned(),
-            reason: hopash::core::UnresolvedMemberReason::ProviderUnavailable,
+            reason: ratash::core::UnresolvedMemberReason::ProviderUnavailable,
             candidate_ids: Vec::new(),
         },
     ]);
@@ -2649,18 +2649,18 @@ fn proxy_rows_preserve_group_and_unresolved_member_states() {
             .collect::<Vec<_>>(),
         vec!["Main", "Nested", "GLOBAL", "Fallback"]
     );
-    assert_eq!(kinds["Nested"], hopash::application::ProxyMemberKind::Group);
+    assert_eq!(kinds["Nested"], ratash::application::ProxyMemberKind::Group);
     assert_eq!(
         kinds["missing"],
-        hopash::application::ProxyMemberKind::Missing
+        ratash::application::ProxyMemberKind::Missing
     );
     assert_eq!(
         kinds["shared"],
-        hopash::application::ProxyMemberKind::Ambiguous
+        ratash::application::ProxyMemberKind::Ambiguous
     );
     assert_eq!(
         kinds["warming"],
-        hopash::application::ProxyMemberKind::ProviderUnavailable
+        ratash::application::ProxyMemberKind::ProviderUnavailable
     );
     let ambiguous = proxies
         .nodes
@@ -2697,7 +2697,7 @@ fn proxy_rows_preserve_group_and_unresolved_member_states() {
             node: NodeRecordId::for_core("node-a").as_str().to_owned(),
         })
         .expect_err("a non-selectable Proxy Group should reject selection");
-    assert_eq!(error.code, hopash::error::ErrorCode::CoreUnavailable);
+    assert_eq!(error.code, ratash::error::ErrorCode::CoreUnavailable);
     assert_eq!(
         harness
             .core
@@ -2725,13 +2725,13 @@ fn rule_mutations_use_exact_strings_and_keep_authority_on_busy_or_apply_failure(
     let ApplicationOutput::RuleMutation(added) = supervisor
         .execute(ApplicationOperation::RuleAdd {
             rule: added_rule.to_owned(),
-            placement: hopash::application::RulePlacement::Prepend,
+            placement: ratash::application::RulePlacement::Prepend,
         })
         .expect("Rule add should succeed")
     else {
         panic!("Rule add should return RuleMutation")
     };
-    assert_eq!(added.action, hopash::application::RuleMutationAction::Added);
+    assert_eq!(added.action, ratash::application::RuleMutationAction::Added);
     assert_eq!(added.resulting_position, Some(0));
     assert_eq!(
         added.runtime_apply.committed_generation,
@@ -2761,10 +2761,10 @@ fn rule_mutations_use_exact_strings_and_keep_authority_on_busy_or_apply_failure(
     let busy = supervisor
         .execute(ApplicationOperation::RuleAdd {
             rule: "invalid".to_owned(),
-            placement: hopash::application::RulePlacement::Prepend,
+            placement: ratash::application::RulePlacement::Prepend,
         })
         .expect_err("reservation should report busy before validating the Rule String");
-    assert_eq!(busy.code, hopash::error::ErrorCode::RuleBusy);
+    assert_eq!(busy.code, ratash::error::ErrorCode::RuleBusy);
     assert_eq!(
         harness.transactions.apply_count.load(Ordering::Relaxed),
         apply_count_before
@@ -2794,7 +2794,7 @@ fn rule_mutations_use_exact_strings_and_keep_authority_on_busy_or_apply_failure(
     };
     assert_eq!(
         removed.action,
-        hopash::application::RuleMutationAction::Removed
+        ratash::application::RuleMutationAction::Removed
     );
     assert_eq!(removed.resulting_position, None);
     assert_eq!(
@@ -2805,12 +2805,12 @@ fn rule_mutations_use_exact_strings_and_keep_authority_on_busy_or_apply_failure(
     let policy_error = supervisor
         .execute(ApplicationOperation::RuleAdd {
             rule: "DOMAIN,invalid.example,MissingPolicy".to_owned(),
-            placement: hopash::application::RulePlacement::Append,
+            placement: ratash::application::RulePlacement::Append,
         })
         .expect_err("an unavailable Policy Target should fail validation");
     assert_eq!(
         policy_error.code,
-        hopash::error::ErrorCode::PolicyTargetNotFound
+        ratash::error::ErrorCode::PolicyTargetNotFound
     );
     assert_eq!(
         rule_strings_from_application(&supervisor),
@@ -2833,7 +2833,7 @@ fn inactive_and_active_refreshes_follow_distinct_commit_paths_and_record_apply_f
         supervisor
             .refresh_profile(secondary.id)
             .expect("the inactive refresh should succeed"),
-        hopash::supervisor::ProfileRefreshDisposition::InactiveStored
+        ratash::supervisor::ProfileRefreshDisposition::InactiveStored
     );
     assert_eq!(harness.transactions.apply_count.load(Ordering::Relaxed), 1);
     let refreshed_secondary = profile_list(&supervisor)
@@ -2843,7 +2843,7 @@ fn inactive_and_active_refreshes_follow_distinct_commit_paths_and_record_apply_f
     assert_eq!(refreshed_secondary.last_success_at_unix_ms, 20_000);
     assert_eq!(
         refreshed_secondary.refresh_state,
-        hopash::application::ProfileRefreshState::Fresh
+        ratash::application::ProfileRefreshState::Fresh
     );
 
     harness.clock.now.store(25_000, Ordering::Relaxed);
@@ -2862,7 +2862,7 @@ fn inactive_and_active_refreshes_follow_distinct_commit_paths_and_record_apply_f
             .last_error
             .expect("the validation stage should be retained")
             .stage,
-        hopash::application::ProfileRefreshStage::Validate
+        ratash::application::ProfileRefreshStage::Validate
     );
 
     harness.clock.now.store(30_000, Ordering::Relaxed);
@@ -2871,7 +2871,7 @@ fn inactive_and_active_refreshes_follow_distinct_commit_paths_and_record_apply_f
         supervisor
             .refresh_profile(primary.id)
             .expect("the active refresh should succeed"),
-        hopash::supervisor::ProfileRefreshDisposition::ActiveApplied
+        ratash::supervisor::ProfileRefreshDisposition::ActiveApplied
     );
     assert_eq!(harness.transactions.apply_count.load(Ordering::Relaxed), 2);
     let ApplicationOutput::Status(status) = supervisor
@@ -2910,7 +2910,7 @@ fn inactive_and_active_refreshes_follow_distinct_commit_paths_and_record_apply_f
             .last_error
             .expect("the validation stage should be retained")
             .stage,
-        hopash::application::ProfileRefreshStage::Validate
+        ratash::application::ProfileRefreshStage::Validate
     );
 
     harness.clock.now.store(40_000, Ordering::Relaxed);
@@ -2932,7 +2932,7 @@ fn inactive_and_active_refreshes_follow_distinct_commit_paths_and_record_apply_f
             .last_error
             .expect("the failure stage should be retained")
             .stage,
-        hopash::application::ProfileRefreshStage::Apply
+        ratash::application::ProfileRefreshStage::Apply
     );
     let ApplicationOutput::Status(status) = supervisor
         .execute(ApplicationOperation::GetStatus)
@@ -2984,7 +2984,7 @@ fn refresh_completion_discards_a_profile_removed_during_download() {
             .join()
             .expect("the refresh thread should finish")
             .expect("stale completion should be handled"),
-        hopash::supervisor::ProfileRefreshDisposition::Discarded
+        ratash::supervisor::ProfileRefreshDisposition::Discarded
     );
     assert_eq!(profile_list(&supervisor).len(), 1);
 }
@@ -3004,13 +3004,13 @@ fn bounded_background_seams_drive_due_refresh_probe_completion_and_core_logs() {
     assert!(probe.request.is_some());
     assert_eq!(
         supervisor
-            .complete_probe(hopash::scheduler::ProbeCompletion {
+            .complete_probe(ratash::scheduler::ProbeCompletion {
                 task: probe.task.clone(),
-                outcome: hopash::scheduler::ProbeOutcome::Success { delay_ms: 37 },
+                outcome: ratash::scheduler::ProbeOutcome::Success { delay_ms: 37 },
                 completed_at_unix_ms: 11_000,
             })
             .expect("probe completion should be accepted"),
-        hopash::scheduler::ProbeCompletionStatus::Rescheduled {
+        ratash::scheduler::ProbeCompletionStatus::Rescheduled {
             next_probe_at_unix_ms: 311_000,
         }
     );
@@ -3025,7 +3025,7 @@ fn bounded_background_seams_drive_due_refresh_probe_completion_and_core_logs() {
     assert_eq!(latency.sample.delay_ms, Some(37));
 
     let refresh_due_at = 10_000
-        + u64::try_from(hopash::constants::PROFILE_REFRESH_INTERVAL.as_millis())
+        + u64::try_from(ratash::constants::PROFILE_REFRESH_INTERVAL.as_millis())
             .expect("the interval should fit");
     harness.clock.now.store(refresh_due_at, Ordering::Relaxed);
     let refresh_tasks = supervisor
@@ -3038,7 +3038,7 @@ fn bounded_background_seams_drive_due_refresh_probe_completion_and_core_logs() {
         supervisor
             .execute_refresh_task(refresh_tasks[0])
             .expect("the due refresh should complete"),
-        hopash::supervisor::ProfileRefreshDisposition::ActiveApplied
+        ratash::supervisor::ProfileRefreshDisposition::ActiveApplied
     );
     assert!(
         supervisor
@@ -3064,8 +3064,8 @@ fn bounded_background_seams_drive_due_refresh_probe_completion_and_core_logs() {
             .publish_core_log(
                 core_generation,
                 refresh_due_at,
-                hopash::telemetry::LogLevel::Info,
-                hopash::telemetry::LogSource::CoreApi,
+                ratash::telemetry::LogLevel::Info,
+                ratash::telemetry::LogSource::CoreApi,
                 "fixture log",
             )
             .expect("Core Log publication should succeed")
@@ -3099,11 +3099,11 @@ fn core_instance_generation_change_clears_latest_telemetry() {
         supervisor
             .publish_traffic(
                 first_generation,
-                hopash::domain::TrafficSample {
+                ratash::domain::TrafficSample {
                     upload_bytes_per_second: 5,
                     download_bytes_per_second: 8,
                     sampled_at_unix_ms: Some(11_000),
-                    state: hopash::domain::SampleState::Fresh,
+                    state: ratash::domain::SampleState::Fresh,
                 },
             )
             .expect("traffic publication should succeed")
@@ -3118,7 +3118,7 @@ fn core_instance_generation_change_clears_latest_telemetry() {
     };
     assert_eq!(
         status.traffic.state,
-        hopash::domain::SampleState::Unavailable
+        ratash::domain::SampleState::Unavailable
     );
     assert_eq!(status.traffic.upload_bytes_per_second, 0);
     assert!(
@@ -3126,8 +3126,8 @@ fn core_instance_generation_change_clears_latest_telemetry() {
             .publish_core_log(
                 first_generation,
                 12_000,
-                hopash::telemetry::LogLevel::Info,
-                hopash::telemetry::LogSource::CoreApi,
+                ratash::telemetry::LogLevel::Info,
+                ratash::telemetry::LogSource::CoreApi,
                 "late log",
             )
             .expect("late generation should be rejected")
@@ -3210,7 +3210,7 @@ fn stream_health_is_projected_and_scoped_to_the_core_instance_generation() {
     };
     assert_eq!(
         status.stream_health,
-        hopash::domain::StreamHealthSet {
+        ratash::domain::StreamHealthSet {
             traffic: StreamState::Disconnected,
             connections: StreamState::Disconnected,
             logs: StreamState::Disconnected,
@@ -3232,7 +3232,7 @@ fn rule_strings_from_application(supervisor: &Supervisor) -> Vec<String> {
         .collect()
 }
 
-fn get_status(supervisor: &Supervisor) -> hopash::domain::StatusSnapshot {
+fn get_status(supervisor: &Supervisor) -> ratash::domain::StatusSnapshot {
     let ApplicationOutput::Status(status) = supervisor
         .execute(ApplicationOperation::GetStatus)
         .expect("status should succeed")
@@ -3242,7 +3242,7 @@ fn get_status(supervisor: &Supervisor) -> hopash::domain::StatusSnapshot {
     status
 }
 
-fn add_profile(supervisor: &Supervisor, url: &str) -> hopash::application::ProfileSummary {
+fn add_profile(supervisor: &Supervisor, url: &str) -> ratash::application::ProfileSummary {
     let ApplicationOutput::ProfileMutation(outcome) = supervisor
         .execute(ApplicationOperation::ProfileAdd {
             subscription_url: SubscriptionUrl::parse(url).expect("the URL should be valid"),
@@ -3254,7 +3254,7 @@ fn add_profile(supervisor: &Supervisor, url: &str) -> hopash::application::Profi
     outcome.profile
 }
 
-fn profile_list(supervisor: &Supervisor) -> Vec<hopash::application::ProfileSummary> {
+fn profile_list(supervisor: &Supervisor) -> Vec<ratash::application::ProfileSummary> {
     let ApplicationOutput::Profiles(outcome) = supervisor
         .execute(ApplicationOperation::ProfileList)
         .expect("Profile list should succeed")

@@ -49,7 +49,7 @@ impl BlockingProfileFetchPort {
     pub fn new(source: Arc<dyn ProfileSource>) -> io::Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(crate::constants::PROFILE_REFRESH_CONCURRENCY)
-            .thread_name("hopash-profile-download")
+            .thread_name("ratash-profile-download")
             .enable_all()
             .build()?;
         Ok(Self { runtime, source })

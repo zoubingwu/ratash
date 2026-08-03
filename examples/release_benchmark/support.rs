@@ -4,7 +4,7 @@ use std::error::Error;
 use std::io;
 use std::time::Instant;
 
-use hopash::tui_runtime::ShutdownSignal;
+use ratash::tui_runtime::ShutdownSignal;
 
 pub(super) fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1_000.0

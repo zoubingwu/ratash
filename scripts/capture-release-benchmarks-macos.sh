@@ -24,7 +24,7 @@ esac
 test ! -e "$output" || fail "The benchmark output directory already exists."
 /bin/mkdir -p "$output/samples"
 
-temporary=$(mktemp -d "${TMPDIR:-/tmp}/hopash-release-capture.XXXXXX")
+temporary=$(mktemp -d "${TMPDIR:-/tmp}/ratash-release-capture.XXXXXX")
 active_collector=
 
 stop_active_collector() {
@@ -68,15 +68,15 @@ trap 'interrupt_and_exit 129' HUP
 trap 'interrupt_and_exit 130' INT
 trap 'interrupt_and_exit 143' TERM
 
-cargo build --locked --release --bin hopash --example release-benchmark
-release_binary="$project_root/target/release/hopash"
+cargo build --locked --release --bin ratash --example release-benchmark
+release_binary="$project_root/target/release/ratash"
 collector="$project_root/target/release/examples/release-benchmark"
 resource_probe="$project_root/scripts/macos-release-resource-probe.sh"
 
 CARGO_TARGET_DIR="$temporary/fixture-target" \
 RUSTFLAGS='-C debug-assertions=yes' \
-  cargo build --locked --release --bin hopash
-fixture_binary="$temporary/fixture-target/release/hopash"
+  cargo build --locked --release --bin ratash
+fixture_binary="$temporary/fixture-target/release/ratash"
 
 run_collector generate "$output/workload"
 

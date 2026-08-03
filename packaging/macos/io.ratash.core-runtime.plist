@@ -3,19 +3,19 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>io.hopash.core-runtime</string>
+  <string>io.ratash.core-runtime</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Library/PrivilegedHelperTools/io.hopash.core-runtime</string>
+    <string>/Library/PrivilegedHelperTools/io.ratash.core-runtime</string>
     <string>__core-service</string>
     <string>--owner-uid</string>
     <string>@OWNER_UID@</string>
     <string>--socket</string>
-    <string>/var/run/hopash-rs/core-service.sock</string>
+    <string>/var/run/ratash/core-service.sock</string>
     <string>--runtime-root</string>
-    <string>/Library/Application Support/Hopash RS/runtime</string>
+    <string>/Library/Application Support/ratash/runtime</string>
     <string>--mihomo</string>
-    <string>/Library/Application Support/Hopash RS/bin/mihomo</string>
+    <string>/Library/Application Support/ratash/bin/mihomo</string>
   </array>
   <key>RunAtLoad</key>
   <true/>

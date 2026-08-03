@@ -14,20 +14,20 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use serde_json::{Map, Value, json};
 
-use hopash::application::PolicyTargetValidation;
-use hopash::constants::{
+use ratash::application::PolicyTargetValidation;
+use ratash::constants::{
     CORE_LOG_LINE_MAX_BYTES, LOG_CAPACITY, PROBE_WORKER_COUNT, TRAFFIC_SERIES_CAPACITY,
 };
-use hopash::domain::{
+use ratash::domain::{
     CoreInstanceGeneration, LocalRuleSetRevision, NodeRecordId, ProbeGeneration, ProfileId,
     SampleState, TrafficSample,
 };
-use hopash::lifecycle::{InstanceRecord, StatePaths};
-use hopash::rule::{LocalRuleSet, RuleSetLimits};
-use hopash::scheduler::{ProbeCompletion, ProbeOutcome, ProbeScheduler};
-use hopash::telemetry::{LogSource, TelemetryStore};
-use hopash::tui::{AppState, ProfileRow, RuleRow, ViewLogRecord, render_buffer};
-use hopash::tui_runtime::ProcessSignalSource;
+use ratash::lifecycle::{InstanceRecord, StatePaths};
+use ratash::rule::{LocalRuleSet, RuleSetLimits};
+use ratash::scheduler::{ProbeCompletion, ProbeOutcome, ProbeScheduler};
+use ratash::telemetry::{LogSource, TelemetryStore};
+use ratash::tui::{AppState, ProfileRow, RuleRow, ViewLogRecord, render_buffer};
+use ratash::tui_runtime::ProcessSignalSource;
 
 use super::metadata::{validate_metadata, validate_metadata_file};
 use super::process_metrics::{collect_background_process_metrics, collect_tui_process_metrics};
@@ -156,7 +156,7 @@ pub(super) fn collect_sample(
             "schema_version": 1,
             "workload_manifest_sha256": sha256_file(manifest_path)?,
             "collector": {
-                "name": "hopash-release-benchmark",
+                "name": "ratash-release-benchmark",
                 "version": CAPTURE_TOOL_VERSION,
                 "smoke": smoke
             },
@@ -755,7 +755,7 @@ pub(super) fn capture_results_with_environment(
         "schema_version": 1,
         "status": "review_required",
         "capture_tool": {
-            "name": "hopash-release-benchmark",
+            "name": "ratash-release-benchmark",
             "version": CAPTURE_TOOL_VERSION
         },
         "environment": report_environment

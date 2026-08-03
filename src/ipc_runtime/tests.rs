@@ -60,7 +60,7 @@ mod timeout_tests {
 
     #[test]
     fn product_client_covers_the_complete_bounded_mutation_path() {
-        let client = IpcClient::new("/tmp/hopash-timeout-contract.sock");
+        let client = IpcClient::new("/tmp/ratash-timeout-contract.sock");
         let profile_add = ApplicationOperation::ProfileAdd {
             subscription_url: SubscriptionUrl::parse("https://example.test/profile.yaml")
                 .expect("the fixture URL should be valid"),
@@ -89,7 +89,7 @@ mod timeout_tests {
     fn explicit_test_timeouts_remain_exact_for_every_operation() {
         let timeout = Duration::from_millis(7);
         let client = IpcClient::with_timeouts(
-            "/tmp/hopash-fixed-timeout.sock",
+            "/tmp/ratash-fixed-timeout.sock",
             Duration::from_millis(5),
             timeout,
         );
@@ -137,7 +137,7 @@ mod timeout_tests {
     #[test]
     fn idle_server_blocks_without_periodic_wakes_and_shutdown_bypasses_handlers() {
         let root = PathBuf::from("/tmp").join(format!(
-            "hopash-idle-ipc-{}-{}",
+            "ratash-idle-ipc-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()
         ));

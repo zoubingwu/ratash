@@ -8,12 +8,12 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hopash::daemon::{
+use ratash::daemon::{
     DaemonAction, DaemonClock, DaemonErrorKind, DaemonLifecycle, DaemonProcessControl,
     DaemonTimeouts, DetachedSupervisorLaunch, ReadinessFailure, ShutdownAcknowledgement,
     ShutdownIntent, ShutdownPort, StartupFailureCategory, StartupStage, SupervisorOwnership,
 };
-use hopash::lifecycle::{
+use ratash::lifecycle::{
     DirectoryLease, LeaseAcquisition, ProcessIdentity, ProcessInspector, StatePaths,
 };
 
@@ -68,7 +68,7 @@ impl FakeProcessControl {
         let mut identities = BTreeMap::new();
         identities.insert(std::process::id(), "launcher-start".to_owned());
         Self {
-            executable: PathBuf::from("/fixture/hopash"),
+            executable: PathBuf::from("/fixture/ratash"),
             identities: Mutex::new(identities),
             runtimes: Mutex::new(BTreeMap::new()),
             behaviors: Mutex::new(VecDeque::new()),

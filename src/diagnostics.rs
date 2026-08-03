@@ -201,7 +201,7 @@ fn emit_structured_event(
     let core_generation = context.core_generation.map(|generation| generation.0);
     match state {
         WrapperDiagnosticState::Raised => tracing::warn!(
-            target: "hopash::wrapper",
+            target: "ratash::wrapper",
             sequence,
             timestamp_unix_ms,
             category = ?category,
@@ -212,7 +212,7 @@ fn emit_structured_event(
             "Wrapper diagnostic state changed"
         ),
         WrapperDiagnosticState::Cleared => tracing::info!(
-            target: "hopash::wrapper",
+            target: "ratash::wrapper",
             sequence,
             timestamp_unix_ms,
             category = ?category,

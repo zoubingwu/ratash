@@ -20,10 +20,10 @@
 
 ## Product and Platform
 
-- The product name is Hopash RS, the repository is `hopash-rs`, and the executable is `hopash`.
-- Hopash RS is a Rust control-plane wrapper around Mihomo. Mihomo remains the data plane for proxy traffic, rule matching, connections, logs, traffic telemetry, and network delay measurement.
+- The product name is Ratash, the repository is `ratash`, and the executable is `ratash`.
+- Ratash is a Rust control-plane wrapper around Mihomo. Mihomo remains the data plane for proxy traffic, rule matching, connections, logs, traffic telemetry, and network delay measurement.
 - The MVP targets macOS and uses TUN Capture with Rule Routing Mode.
-- Start with one Cargo package and one `hopash` executable. Internal modes may run the Supervisor and the macOS privileged service.
+- Start with one Cargo package and one `ratash` executable. Internal modes may run the Supervisor and the macOS privileged service.
 - Use stable Rust, Tokio, Clap, Ratatui, and Crossterm. Keep the dependency set small.
 - Keep the first package organized around `cli`, `ipc`, `application`, `domain`, `persistence`, `profile`, `config`, `core`, `scheduler`, `telemetry`, and `tui` modules. Split crates only after a concrete boundary appears.
 - Keep Tauri, WebView, and browser frontend dependencies outside the CLI and TUI implementation.
@@ -34,7 +34,7 @@
 - The Supervisor is the sole authoritative owner and writer of Profiles, the Local Rule Set, Effective Configuration, Runtime Apply state, Probe Queue state, and telemetry buffers.
 - A zero-Profile Supervisor is ready while the Core state is `unconfigured`. The first valid Profile creates the initial Local Rule Set, Active Profile, Runtime Generation, and Managed Core through one recoverable transaction.
 - The macOS privileged service implements the narrow `CoreRuntime` boundary. It authenticates owner sessions, stages verified runtime bundles, performs Core process operations, and forwards process logs. It owns no product or domain state.
-- Production Core-service connections bind the owner session to the kernel-reported UID, PID, and audit token. Signed releases validate the root-owned canonical `/usr/local/bin/hopash` dynamic guest against the packaged Developer ID requirement without network access. Explicit `local-unsigned` builds validate an ad-hoc code identity plus the same canonical path and kernel identity boundary.
+- Production Core-service connections bind the owner session to the kernel-reported UID, PID, and audit token. Signed releases validate the root-owned canonical `/usr/local/bin/ratash` dynamic guest against the packaged Developer ID requirement without network access. Explicit `local-unsigned` builds validate an ad-hoc code identity plus the same canonical path and kernel identity boundary.
 - The privileged service independently revalidates application-authoritative controller, secret, TUN, DNS, listener, and provider-path policy before any Core spawn or recovery. Each Runtime Generation transition uses a controlled Core stop and spawn so the generation root remains the Core home. Its macOS TUN capability preflight only opens and closes a `PF_SYSTEM` control socket.
 - Route every Core configuration change through `CoreRuntime.apply_candidate`. Keep readiness, proxy queries, node selection, delay checks, connection summaries, traffic, and logs behind the Mihomo adapter.
 - Use separate operating-system locks for Supervisor singleton ownership and cross-process lifecycle operations. Verify the PID, process-start identity, instance token, and Core Instance Generation before controlling a process.
@@ -63,11 +63,11 @@
 - `src/persistence.rs` owns private content-addressed objects, recoverable transaction journals, the committed manifest pointer, and bounded reachability pruning after durable journal cleanup.
 - `src/state.rs` stages and hydrates the complete authoritative Supervisor state through immutable objects and the committed transaction pointer.
 - `src/transaction.rs` serializes every Runtime Generation producer, revalidates revisions, confirms Core identity and health, and converges failures to the committed pointer.
-- `src/config.rs` compiles Profile Snapshots through the bundled configuration policy, owns security-sensitive and authoritative fields including disabled Geo-data auto-update, validates structural fields consumed by Hopash, and exposes both user-side Core validation and privileged authoritative-policy validation seams.
+- `src/config.rs` compiles Profile Snapshots through the bundled configuration policy, owns security-sensitive and authoritative fields including disabled Geo-data auto-update, validates structural fields consumed by Ratash, and exposes both user-side Core validation and privileged authoritative-policy validation seams.
 - `src/validator.rs` verifies the pinned Mihomo binary, stages verified bundled Geo data, and runs bounded `-t` validation inside the private staging root without starting the Core.
 - `src/geodata.rs` validates the versioned Geo-data manifest and stages verified links to its pinned `ASN.mmdb`, `Country.mmdb`, `GeoIP.dat`, and `GeoSite.dat` assets for Core parsing. Privileged Runtime Generations receive verified regular-file copies.
 - `src/mihomo_command.rs` removes Mihomo configuration, lifecycle-hook, controller, secret, and path-safety override environment variables from validation and runtime processes.
-- `fixtures/mihomo/v1.19.28/config-policy.yaml` is the compact configuration policy bound to the bundled Core version. It records security-sensitive and authoritative field ownership plus the structural fields Hopash consumes; native Mihomo fields pass through to the pinned `mihomo -t` parser and semantic validator.
+- `fixtures/mihomo/v1.19.28/config-policy.yaml` is the compact configuration policy bound to the bundled Core version. It records security-sensitive and authoritative field ownership plus the structural fields Ratash consumes; native Mihomo fields pass through to the pinned `mihomo -t` parser and semantic validator.
 - `src/core.rs` defines the authenticated CoreRuntime boundary, Mihomo adapter contract, versioned Proxy View, selection resolution, and fixed API codecs.
 - `src/core_service_ipc.rs` implements the versioned privileged CoreRuntime Unix socket protocol, kernel-identity-bound owner sessions, injectable dynamic-peer authorization, and secure Runtime Bundle ingress.
 - `src/core_service_ipc/authorization.rs` owns peer identity and authorization; `client.rs` owns the CoreRuntime client; `error.rs` owns shared transport, authorization, and protocol error translation; `ingress.rs` owns secure Runtime Bundle and pinned Geo-data staging; `server.rs` owns dispatch and bounded lifecycle; `socket.rs` owns private socket setup and cleanup; `wire.rs` owns private protocol DTOs.
@@ -94,8 +94,8 @@
 - `src/cli/process.rs` owns process argument errors, JSON usage envelopes, and sensitive argument redaction.
 - `src/cli/help.rs` generates Agent Help from the Clap command tree plus the fixed recovery workflow.
 - `src/cli/runner.rs` executes typed invocations against an injected application client and owns stdout/stderr formatting.
-- `skills/hopash/` is the packaged AI Skill and treats `hopash help agent` as the live command authority.
-- `examples/generate-release-assets.rs` derives Bash, Zsh, Fish, and `hopash(1)` assets from the public Clap command tree and verifies committed copies.
+- `skills/ratash/` is the packaged AI Skill and treats `ratash help agent` as the live command authority.
+- `examples/generate-release-assets.rs` derives Bash, Zsh, Fish, and `ratash(1)` assets from the public Clap command tree and verifies committed copies.
 - `examples/release-benchmark.rs` is the command facade for the deterministic fixture-backed release workload; `examples/release_benchmark/` separates fixture generation, workload execution, collection orchestration, process sampling, profile serving, reporting, runtime support, and tests. `support.rs` owns leaf helpers, `process_support.rs` owns child-process and PTY guards, and sibling dependencies remain acyclic. The collector digest covers every collector source file.
 - `scripts/capture-release-benchmarks-macos.sh`, `scripts/macos-release-resource-probe.sh`, and `packaging/release/benchmark-capture.md` define fixed-runner capture, resource sampling, provenance approval, and the release gate without exercising live network capture.
 - `scripts/test-profile-connectivity-docker.sh` runs an explicit local Profile and Mihomo data-plane acceptance test through digest-pinned Alpine containers and disposable Docker networks.
@@ -109,7 +109,7 @@
 - Profiles originate from remote HTTP(S) Subscription URLs. A Profile Snapshot is read-only and retains the latest validated content.
 - Exactly one Active Profile participates in Effective Configuration composition, Runtime Apply, proxy selection, and Delay Probes.
 - An Inactive Profile refresh updates stored state only. An Active Profile refresh commits after a successful Runtime Apply.
-- Treat every Profile Snapshot as untrusted input. Apply the bundled configuration policy to security-sensitive, authoritative, and Hopash-consumed structural fields; preserve Core-owned fields and require the pinned `mihomo -t` validator to accept the Effective Configuration.
+- Treat every Profile Snapshot as untrusted input. Apply the bundled configuration policy to security-sensitive, authoritative, and Ratash-consumed structural fields; preserve Core-owned fields and require the pinned `mihomo -t` validator to accept the Effective Configuration.
 - Ship immutable, digest-pinned Mihomo Geo data with the installer, link it into Profile validation workspaces, copy it into privileged Runtime Generation roots, and keep Core Geo-data auto-update disabled.
 - The Local Rule Set fully replaces the Profile Snapshot's top-level `rules` field.
 - Rule mutations use complete, case-sensitive Rule Strings and the shared configuration transaction path.
@@ -131,7 +131,7 @@
 Use these terms with their exact meanings and capitalization:
 
 - **Core**: the Mihomo process that handles proxy traffic and runtime telemetry.
-- **Wrapper**: all Hopash RS functionality around the Core.
+- **Wrapper**: all Ratash functionality around the Core.
 - **Supervisor**: the background Wrapper process that manages Profiles, the Managed Core, and background work.
 - **Managed Core**: the Core instance logically owned by the Supervisor.
 - **Profile**: one remote subscription and its latest validated Profile Snapshot.
@@ -150,8 +150,8 @@ Use these terms with their exact meanings and capitalization:
 - **Local Rule Set**: the authoritative ordered rules stored locally.
 - **Rule Mutation**: one atomic add, replace, or remove operation.
 - **Policy Target**: the Proxy Group, Node, or built-in action selected by a rule.
-- **One-shot CLI**: one `hopash` command that performs an operation and exits.
-- **Status Interface**: the foreground Ratatui interface launched by `hopash status`.
+- **One-shot CLI**: one `ratash` command that performs an operation and exits.
+- **Status Interface**: the foreground Ratatui interface launched by `ratash status`.
 - **Core Log** and **Traffic Sample**: runtime data emitted by the Core.
 
 Keep Core, Wrapper, Supervisor, Profile selection, Node selection, Profile Refresh, Runtime Apply, and Delay Probe separate in code and documentation.
@@ -177,7 +177,7 @@ Keep Core, Wrapper, Supervisor, Profile selection, Node selection, Profile Refre
 - Inject failures around validation, atomic commit, Runtime Apply, and rollback.
 - Test scheduler generations, cancellation, bounded concurrency, stale results, and deterministic deadlines with a fake clock.
 - Include regression coverage for 100 Profiles, 10,000 Active Nodes, 20,000 Local Rules, sustained Core Log and Traffic Sample input, and long-running TUI resource bounds.
-- Run `scripts/test-profile-connectivity-docker.sh <profile.yaml>` explicitly when validating a real Profile against the pinned Mihomo data plane. Keep this credential-bearing network acceptance outside deterministic CI and treat it as separate from Hopash control-plane, privileged-service, and TUN end-to-end coverage.
+- Run `scripts/test-profile-connectivity-docker.sh <profile.yaml>` explicitly when validating a real Profile against the pinned Mihomo data plane. Keep this credential-bearing network acceptance outside deterministic CI and treat it as separate from Ratash control-plane, privileged-service, and TUN end-to-end coverage.
 - Run formatting, Clippy, unit tests, integration tests, and relevant benchmarks before publication.
 
 ## Git and GitHub

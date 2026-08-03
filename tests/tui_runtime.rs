@@ -5,27 +5,27 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use hopash::application::{
+use ratash::application::{
     ApplicationClient, ApplicationError, ApplicationOperation, ApplicationOutput, LatencyFreshness,
     LatencyProbeStatus, LifecycleAction, LifecycleOutcome, PolicyTargetValidation,
     ProfileListOutcome, ProxyAvailability, ProxyGroupSummary, ProxyListOutcome, ProxyMemberKind,
     ProxyNodeRow, RecoveryOutcome, RecoveryStatus, RuleListOutcome, RuleMutationAction,
     RuleMutationOutcome, RulePlacement, RuleSummary, RuntimeApplyOutcome, RuntimeApplyStatus,
 };
-use hopash::constants::LOG_CAPACITY;
-use hopash::domain::{
+use ratash::constants::LOG_CAPACITY;
+use ratash::domain::{
     ActiveProfileSummary, ApplyState, CoreLifecycle, CoreStatus, LocalRuleSetRevision,
     NodeRecordId, ProbeQueueStatus, ProfileId, ProxyGroupId, RuntimeApplySnapshot, SampleState,
     StatusSnapshot, StreamHealthSet, StreamState, SupervisorLifecycle, SupervisorStatus,
     TrafficSample, TunStatus,
 };
-use hopash::ipc::RequestId;
-use hopash::tui::{
+use ratash::ipc::RequestId;
+use ratash::tui::{
     Command, FullViewSnapshot, KeyInput, MutationSuccess, ProfileRow, ProxyGroupRow,
     ProxyGroupSnapshot, ProxyRow, RuleListSnapshot, RuleRow, TerminalAction, TerminalControl,
     TerminalInput, UiEvent, UiIntent, ViewLogRecord,
 };
-use hopash::tui_runtime::{
+use ratash::tui_runtime::{
     ApplicationCommandExecutor, ApplicationSnapshotSource, BackgroundCommandDispatcher,
     BoundedReconnectTimer, CancellationToken, CommandDispatchError, CommandDispatcher,
     DispatchedEvent, FullSnapshotSource, LogTail, NoShutdownSignal, RatatuiStatusRenderer,
@@ -367,7 +367,7 @@ fn live_status_revisions_coalesce_into_one_background_snapshot_refresh() {
     let events = Arc::new(FakeEvents::default());
     for upload in [20, 30, 40] {
         let mut changed = status(upload);
-        changed.runtime_generation = Some(hopash::domain::RuntimeGeneration(upload));
+        changed.runtime_generation = Some(ratash::domain::RuntimeGeneration(upload));
         events.push(StatusLogEvent::Status {
             connection_generation: 1,
             status: Box::new(changed),
@@ -476,7 +476,7 @@ fn background_snapshot_refresh_replaces_profiles_and_proxies() {
     });
     let mut dispatcher = RecordingDispatcher::default();
     dispatcher.results.push_back(DispatchedEvent {
-        source: hopash::tui::EventSource::CommandResult,
+        source: ratash::tui::EventSource::CommandResult,
         event: UiEvent::SnapshotRefreshed {
             connection_generation: 1,
             base_view_revision: 2,
@@ -609,7 +609,7 @@ fn identical_background_snapshot_does_not_render_an_extra_frame() {
     let initial = snapshot(10);
     let mut dispatcher = RecordingDispatcher::default();
     dispatcher.results.push_back(DispatchedEvent {
-        source: hopash::tui::EventSource::CommandResult,
+        source: ratash::tui::EventSource::CommandResult,
         event: UiEvent::SnapshotRefreshed {
             connection_generation: 1,
             base_view_revision: 2,
@@ -699,8 +699,8 @@ fn live_log_batches_keep_only_the_bounded_tail() {
             .map(|sequence| ViewLogRecord {
                 sequence: sequence as u64,
                 timestamp_unix_ms: sequence as u64,
-                level: hopash::telemetry::LogLevel::Info,
-                source: hopash::telemetry::LogSource::CoreApi,
+                level: ratash::telemetry::LogLevel::Info,
+                source: ratash::telemetry::LogSource::CoreApi,
                 message: "fixture".to_owned(),
             })
             .collect(),
@@ -1299,7 +1299,7 @@ fn status(upload: u64) -> StatusSnapshot {
             lifecycle: CoreLifecycle::Ready,
             pid: Some(42),
             instance_generation: None,
-            restart: hopash::domain::CoreRestartStatus::default(),
+            restart: ratash::domain::CoreRestartStatus::default(),
         },
         tun: TunStatus {
             requested: true,
@@ -1595,8 +1595,8 @@ impl ApplicationClient for MutationOutputClient {
                     resulting_position: Some(0),
                     runtime_apply: RuntimeApplyOutcome {
                         status: RuntimeApplyStatus::Applied,
-                        candidate_generation: Some(hopash::domain::RuntimeGeneration(2)),
-                        committed_generation: Some(hopash::domain::RuntimeGeneration(2)),
+                        candidate_generation: Some(ratash::domain::RuntimeGeneration(2)),
+                        committed_generation: Some(ratash::domain::RuntimeGeneration(2)),
                         recovery: RecoveryOutcome {
                             status: RecoveryStatus::NotRequired,
                             restored_generation: None,
@@ -1755,7 +1755,7 @@ fn proxy_group_summary(name: &str, selected_node: &str) -> ProxyGroupSummary {
         name: name.to_owned(),
         proxy_type: "Selector".to_owned(),
         selectable: true,
-        selected_node: Some(hopash::application::SelectorIdentity {
+        selected_node: Some(ratash::application::SelectorIdentity {
             id: NodeRecordId::for_core(selected_node).as_str().to_owned(),
             name: selected_node.to_owned(),
         }),
@@ -1863,7 +1863,7 @@ impl CommandDispatcher for MutationResyncDispatcher {
                 connection_generation,
                 ..
             } => self.results.push_back(DispatchedEvent {
-                source: hopash::tui::EventSource::CommandResult,
+                source: ratash::tui::EventSource::CommandResult,
                 event: UiEvent::CommandResult {
                     request_id: *request_id,
                     connection_generation: *connection_generation,
@@ -1877,7 +1877,7 @@ impl CommandDispatcher for MutationResyncDispatcher {
                 base_view_revision,
                 base_status_revision,
             } => self.results.push_back(DispatchedEvent {
-                source: hopash::tui::EventSource::CommandResult,
+                source: ratash::tui::EventSource::CommandResult,
                 event: UiEvent::SnapshotRefreshed {
                     connection_generation: *connection_generation,
                     base_view_revision: *base_view_revision,
@@ -2150,7 +2150,7 @@ impl RecordingRenderer {
 impl StatusRenderer for RecordingRenderer {
     fn draw(
         &mut self,
-        state: &hopash::tui::AppState,
+        state: &ratash::tui::AppState,
     ) -> Result<RenderedFrame, StatusInterfaceError> {
         self.uploads.push(
             state

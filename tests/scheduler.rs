@@ -1,13 +1,13 @@
 use std::cell::Cell;
 use std::collections::BTreeSet;
 
-use hopash::constants::{
+use ratash::constants::{
     LATENCY_FRESHNESS, MAX_ACTIVE_NODES, PROBE_INTERVAL, PROBE_TIMEOUT, PROBE_WORKER_COUNT,
     PROFILE_REFRESH_CONCURRENCY, PROFILE_REFRESH_INTERVAL,
 };
-use hopash::domain::{NodeRecordId, ProbeGeneration, ProfileId, SampleState};
-use hopash::profile::ProfileRevision;
-use hopash::scheduler::{
+use ratash::domain::{NodeRecordId, ProbeGeneration, ProfileId, SampleState};
+use ratash::profile::ProfileRevision;
+use ratash::scheduler::{
     ProbeCompletion, ProbeCompletionStatus, ProbeOutcome, ProbeResetError, ProbeScheduler,
     ProbeStatus, ProfileRefreshScheduler, RefreshCompletion, RefreshCompletionStatus,
 };
@@ -388,7 +388,7 @@ fn probe_generation_must_increase_across_deactivation() {
 
 fn complete_success(
     scheduler: &mut ProbeScheduler,
-    task: hopash::scheduler::ProbeTask,
+    task: ratash::scheduler::ProbeTask,
     completed_at_unix_ms: u64,
     delay_ms: u64,
 ) {
@@ -401,9 +401,9 @@ fn complete_success(
 }
 
 fn task_for(
-    tasks: &[hopash::scheduler::ProbeTask],
+    tasks: &[ratash::scheduler::ProbeTask],
     node_id: &NodeRecordId,
-) -> hopash::scheduler::ProbeTask {
+) -> ratash::scheduler::ProbeTask {
     tasks
         .iter()
         .find(|task| &task.node_id == node_id)

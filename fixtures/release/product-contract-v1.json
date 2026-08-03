@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "product": "Hopash RS",
-  "executable": "hopash",
+  "product": "Ratash",
+  "executable": "ratash",
   "minimum_rust_version": "1.88",
   "supported_targets": [
     "aarch64-apple-darwin",

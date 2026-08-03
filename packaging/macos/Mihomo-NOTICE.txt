@@ -1,6 +1,6 @@
-Hopash RS includes Mihomo v1.19.28, distributed under GPL-3.0.
+Ratash includes Mihomo v1.19.28, distributed under GPL-3.0.
 
-The complete corresponding source is published with each Hopash RS release as
+The complete corresponding source is published with each Ratash release as
 mihomo-v1.19.28-source.tar.gz and is also available from the upstream tag:
 
 https://github.com/MetaCubeX/mihomo/tree/v1.19.28

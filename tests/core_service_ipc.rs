@@ -9,20 +9,20 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use hopash::core::{
+use ratash::core::{
     ApplyCandidateResult, ApplyDisposition, CoreControlEndpoint, CoreRuntime,
     CoreRuntimeDiagnosticCategory, CoreRuntimeError, CoreRuntimeErrorKind, CoreRuntimeLifecycle,
     CoreRuntimeRestartStatus, CoreRuntimeStatus, CoreRuntimeTunReason, CoreRuntimeTunStatus,
     ForwardedCoreLog, ForwardedCoreLogBatch, ManagedCoreHandle, OwnerSession, OwnerSessionProof,
     OwnerSessionRequest, ProcessOutputSource, RuntimeBundle, StopCoreResult,
 };
-use hopash::core_service_ipc::{
+use ratash::core_service_ipc::{
     CoreServiceClient, CoreServicePeerAuthorizer, CoreServicePeerIdentity, CoreServiceServer,
     CoreServiceServerConfig,
 };
-use hopash::domain::{CoreInstanceGeneration, RuntimeGeneration};
-use hopash::geodata::GeoDataCatalog;
-use hopash::ipc::{bind_private_listener, read_frame, write_frame};
+use ratash::domain::{CoreInstanceGeneration, RuntimeGeneration};
+use ratash::geodata::GeoDataCatalog;
+use ratash::ipc::{bind_private_listener, read_frame, write_frame};
 use sha2::{Digest, Sha256};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -750,17 +750,17 @@ fn bound_session_proof_is_rejected_across_processes() {
         .expect("the owner session should open");
     let output = Command::new(std::env::current_exe().expect("the test executable should resolve"))
         .args(["--exact", "bound_session_child_attempt", "--nocapture"])
-        .env("HOPASH_TEST_CORE_SERVICE_SOCKET", &harness.socket_path)
+        .env("RATASH_TEST_CORE_SERVICE_SOCKET", &harness.socket_path)
         .env(
-            "HOPASH_TEST_CORE_SERVICE_UID",
+            "RATASH_TEST_CORE_SERVICE_UID",
             nix::unistd::Uid::effective().as_raw().to_string(),
         )
         .env(
-            "HOPASH_TEST_CORE_SERVICE_SESSION_ID",
+            "RATASH_TEST_CORE_SERVICE_SESSION_ID",
             session.proof.session_id(),
         )
         .env(
-            "HOPASH_TEST_CORE_SERVICE_SESSION_TOKEN",
+            "RATASH_TEST_CORE_SERVICE_SESSION_TOKEN",
             session.proof.session_token(),
         )
         .output()
@@ -776,16 +776,16 @@ fn bound_session_proof_is_rejected_across_processes() {
 
 #[test]
 fn bound_session_child_attempt() {
-    let Ok(socket_path) = std::env::var("HOPASH_TEST_CORE_SERVICE_SOCKET") else {
+    let Ok(socket_path) = std::env::var("RATASH_TEST_CORE_SERVICE_SOCKET") else {
         return;
     };
-    let uid = std::env::var("HOPASH_TEST_CORE_SERVICE_UID")
+    let uid = std::env::var("RATASH_TEST_CORE_SERVICE_UID")
         .expect("the service UID should be provided")
         .parse()
         .expect("the service UID should be numeric");
-    let session_id = std::env::var("HOPASH_TEST_CORE_SERVICE_SESSION_ID")
+    let session_id = std::env::var("RATASH_TEST_CORE_SERVICE_SESSION_ID")
         .expect("the session ID should be provided");
-    let session_token = std::env::var("HOPASH_TEST_CORE_SERVICE_SESSION_TOKEN")
+    let session_token = std::env::var("RATASH_TEST_CORE_SERVICE_SESSION_TOKEN")
         .expect("the session token should be provided");
     let client = CoreServiceClient::for_service_uid(socket_path, uid);
 
@@ -957,7 +957,7 @@ fn bundle_ingress_upgrades_a_pre_geodata_generation_and_cleans_interrupted_stagi
                 .expect("the legacy Runtime Generation file should be readable"),
         )
     });
-    let interrupted = generation_root.join(".hopash-geodata-Country.mmdb.pending");
+    let interrupted = generation_root.join(".ratash-geodata-Country.mmdb.pending");
     fs::write(&interrupted, b"interrupted")
         .expect("the interrupted Geo-data staging file should be written");
     fs::set_permissions(&interrupted, fs::Permissions::from_mode(0o400))

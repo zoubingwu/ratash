@@ -7,15 +7,15 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hopash::application::{
+use ratash::application::{
     ApplicationClient, ApplicationError, ApplicationOperation, ApplicationOutput,
     ApplicationService,
 };
-use hopash::daemon::{ShutdownAcknowledgement, ShutdownIntent};
-use hopash::ipc::{IPC_PROTOCOL_VERSION, PeerAuthorizationError, PeerAuthorizer};
-use hopash::ipc_runtime::{IpcClient, IpcServer, IpcServerConfig};
-use hopash::lifecycle::ProcessIdentity;
-use hopash::shutdown_ipc::{
+use ratash::daemon::{ShutdownAcknowledgement, ShutdownIntent};
+use ratash::ipc::{IPC_PROTOCOL_VERSION, PeerAuthorizationError, PeerAuthorizer};
+use ratash::ipc_runtime::{IpcClient, IpcServer, IpcServerConfig};
+use ratash::lifecycle::ProcessIdentity;
+use ratash::shutdown_ipc::{
     ShutdownControlError, ShutdownControlHandler, ShutdownIpcServer, request_shutdown,
 };
 

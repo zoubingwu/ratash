@@ -240,7 +240,7 @@ impl TestDirectory {
     fn new(label: &str) -> Self {
         let unique = uuid::Uuid::new_v4().simple().to_string();
         let path = PathBuf::from("/tmp").join(format!(
-            "hopash-production-{label}-{}-{}",
+            "ratash-production-{label}-{}-{}",
             std::process::id(),
             &unique[..8]
         ));
@@ -347,16 +347,16 @@ fn arguments(values: &[&str]) -> Vec<OsString> {
 #[test]
 fn core_service_mode_requires_exact_absolute_arguments() {
     let invocation = CoreServiceInvocation::parse_process_arguments(&arguments(&[
-        "hopash",
+        "ratash",
         INTERNAL_CORE_SERVICE_MODE,
         "--owner-uid",
         "501",
         "--socket",
-        "/private/var/run/hopash-rs/core.sock",
+        "/private/var/run/ratash/core.sock",
         "--runtime-root",
-        "/private/var/db/hopash-rs/runtime",
+        "/private/var/db/ratash/runtime",
         "--mihomo",
-        "/Library/Application Support/Hopash RS/bin/mihomo",
+        "/Library/Application Support/ratash/bin/mihomo",
     ]))
     .expect("the fixture invocation should parse")
     .expect("the Core service mode should be detected");
@@ -370,7 +370,7 @@ fn core_service_mode_requires_exact_absolute_arguments() {
 #[test]
 fn public_arguments_are_ignored_by_the_core_service_parser() {
     assert_eq!(
-        CoreServiceInvocation::parse_process_arguments(&arguments(&["hopash", "status"]))
+        CoreServiceInvocation::parse_process_arguments(&arguments(&["ratash", "status"]))
             .expect("public arguments should be valid"),
         None
     );
@@ -379,16 +379,16 @@ fn public_arguments_are_ignored_by_the_core_service_parser() {
 #[test]
 fn internal_core_service_arguments_reject_relative_paths() {
     let error = CoreServiceInvocation::parse_process_arguments(&arguments(&[
-        "hopash",
+        "ratash",
         INTERNAL_CORE_SERVICE_MODE,
         "--owner-uid",
         "501",
         "--socket",
         "core.sock",
         "--runtime-root",
-        "/private/var/db/hopash-rs/runtime",
+        "/private/var/db/ratash/runtime",
         "--mihomo",
-        "/Library/Application Support/Hopash RS/bin/mihomo",
+        "/Library/Application Support/ratash/bin/mihomo",
     ]))
     .expect_err("relative service paths must fail closed");
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);

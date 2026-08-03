@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use hopash::core_guardian::{INTERNAL_CORE_GUARDIAN_MODE, read_handshake};
-use hopash::lifecycle::{ProcessInspector, PsProcessInspector};
+use ratash::core_guardian::{INTERNAL_CORE_GUARDIAN_MODE, read_handshake};
+use ratash::lifecycle::{ProcessInspector, PsProcessInspector};
 use sha2::{Digest, Sha256};
 
 struct TestRuntime {
@@ -21,7 +21,7 @@ struct TestRuntime {
 impl TestRuntime {
     fn new(label: &str, script: &[u8]) -> Self {
         let root = Path::new("/private/tmp").join(format!(
-            "hopash-guardian-{label}-{}-{}",
+            "ratash-guardian-{label}-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()
         ));
@@ -45,7 +45,7 @@ impl TestRuntime {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_hopash"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ratash"));
         command
             .arg(INTERNAL_CORE_GUARDIAN_MODE)
             .arg("--mihomo")
@@ -169,7 +169,7 @@ fn ordinary_core_exit_is_reaped_while_the_parent_control_pipe_remains_open() {
 fn guardian_failures_redact_runtime_paths_and_executable_identity() {
     let runtime = TestRuntime::new("secret-path", b"#!/bin/sh\nexit 0\n");
     let secret_digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let output = Command::new(env!("CARGO_BIN_EXE_hopash"))
+    let output = Command::new(env!("CARGO_BIN_EXE_ratash"))
         .arg(INTERNAL_CORE_GUARDIAN_MODE)
         .arg("--mihomo")
         .arg(&runtime.executable)
@@ -218,7 +218,7 @@ fn read_fixture_handshake(
     guardian: &mut Child,
     stdout: &mut impl Read,
     stderr: &mut impl Read,
-) -> hopash::core_guardian::CoreGuardianHandshake {
+) -> ratash::core_guardian::CoreGuardianHandshake {
     match read_handshake(stdout) {
         Ok(handshake) => handshake,
         Err(error) => {

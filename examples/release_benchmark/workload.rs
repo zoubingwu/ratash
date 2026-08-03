@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use hopash::domain::{NodeRecordId, ProfileId};
+use ratash::domain::{NodeRecordId, ProfileId};
 
 use super::reporting::{artifact_metadata, new_buffered_file, write_json_line, write_json_new};
 use super::{WORKLOAD_GENERATOR_VERSION, WORKLOAD_SEED, WorkloadScale};
@@ -32,7 +32,7 @@ pub(super) fn generate_workload(
     let manifest = json!({
         "schema_version": 1,
         "generator": {
-            "name": "hopash-release-workload",
+            "name": "ratash-release-workload",
             "version": WORKLOAD_GENERATOR_VERSION,
             "seed": WORKLOAD_SEED
         },

@@ -246,7 +246,7 @@ fn install_asset_link(
 }
 
 fn pending_link_path(root: &Path, asset: &GeoDataAsset) -> PathBuf {
-    root.join(format!(".hopash-geodata-{}.pending", asset.file_name()))
+    root.join(format!(".ratash-geodata-{}.pending", asset.file_name()))
 }
 
 fn cleanup_pending_link(path: &Path, source: &Path) -> Result<(), GeoDataError> {

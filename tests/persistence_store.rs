@@ -4,11 +4,11 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use hopash::domain::{LocalRuleSetRevision, ProfileId, RuntimeGeneration};
-use hopash::persistence::{
+use ratash::domain::{LocalRuleSetRevision, ProfileId, RuntimeGeneration};
+use ratash::persistence::{
     ObjectId, PERSISTENCE_PRUNE_REMOVAL_LIMIT, PersistenceStore, TransactionBundle, TransactionId,
 };
-use hopash::profile::ProfileRevision;
+use ratash::profile::ProfileRevision;
 use sha2::{Digest, Sha256};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -21,7 +21,7 @@ impl TestDirectory {
     fn new() -> Self {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "hopash-persistence-{}-{sequence}",
+            "ratash-persistence-{}-{sequence}",
             std::process::id()
         ));
         fs::create_dir(&path).expect("test directory should be created");

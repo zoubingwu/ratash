@@ -3,8 +3,8 @@ use std::error::Error;
 use std::path::Path;
 use std::time::Duration;
 
-use hopash::constants::PROBE_WORKER_COUNT;
-use hopash::tui_runtime::ShutdownSignal;
+use ratash::constants::PROBE_WORKER_COUNT;
+use ratash::tui_runtime::ShutdownSignal;
 
 #[path = "release_benchmark/collection.rs"]
 mod collection;

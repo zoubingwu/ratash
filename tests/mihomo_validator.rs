@@ -5,10 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use hopash::config::{AuthoritativeConfig, ConfigCompiler, CoreConfigValidator};
-use hopash::geodata::GeoDataCatalog;
-use hopash::profile::{ProfileSnapshot, SnapshotLimits};
-use hopash::validator::{MihomoCommandValidator, MihomoValidationErrorKind};
+use ratash::config::{AuthoritativeConfig, ConfigCompiler, CoreConfigValidator};
+use ratash::geodata::GeoDataCatalog;
+use ratash::profile::{ProfileSnapshot, SnapshotLimits};
+use ratash::validator::{MihomoCommandValidator, MihomoValidationErrorKind};
 use sha2::{Digest, Sha256};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -21,7 +21,7 @@ impl TestDirectory {
     fn new(name: &str) -> Self {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "hopash-validator-{name}-{}-{sequence}",
+            "ratash-validator-{name}-{}-{sequence}",
             std::process::id()
         ));
         fs::create_dir(&path).expect("test directory should be created");
@@ -97,7 +97,7 @@ exit 0
     fs::create_dir(&source).expect("Geo-data source should be created");
     fs::create_dir(&staging).expect("staging directory should be created");
     let catalog = fixture_geodata_catalog(&source);
-    let interrupted = staging.join(".hopash-geodata-ASN.mmdb.pending");
+    let interrupted = staging.join(".ratash-geodata-ASN.mmdb.pending");
     symlink(source.join("ASN.mmdb"), &interrupted)
         .expect("an interrupted Geo-data link should be staged");
     let effective = effective_configuration(&staging, "MATCH,DIRECT");
@@ -131,7 +131,7 @@ fn configured_geodata_preserves_an_unrecognized_pending_entry() {
     fs::create_dir(&source).expect("Geo-data source should be created");
     fs::create_dir(&staging).expect("staging directory should be created");
     let catalog = fixture_geodata_catalog(&source);
-    let pending = staging.join(".hopash-geodata-ASN.mmdb.pending");
+    let pending = staging.join(".ratash-geodata-ASN.mmdb.pending");
     fs::write(&pending, b"preserve").expect("the unrecognized entry should be written");
     let effective = effective_configuration(&staging, "MATCH,DIRECT");
     let validator = validator(&binary, Duration::from_secs(5))
@@ -293,7 +293,7 @@ fn public_config_validator_seam_returns_a_safe_core_error() {
 fn effective_configuration(
     staging_root: &Path,
     rule: &str,
-) -> hopash::config::EffectiveConfiguration {
+) -> ratash::config::EffectiveConfiguration {
     let snapshot = ProfileSnapshot::parse(
         b"proxies: []\nproxy-groups: []\nrules: []\n",
         SnapshotLimits::new(4_096, 16),
@@ -304,7 +304,7 @@ fn effective_configuration(
         .compile(
             &snapshot,
             &[rule.to_owned()],
-            &AuthoritativeConfig::new("/private/tmp/hopash-core.sock", "fixture-secret"),
+            &AuthoritativeConfig::new("/private/tmp/ratash-core.sock", "fixture-secret"),
             staging_root,
         )
         .expect("fixture configuration should compile")

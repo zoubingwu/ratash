@@ -1,11 +1,11 @@
-use hopash::config::{AuthoritativeConfig, ConfigCompiler, EffectiveConfiguration};
-use hopash::domain::RuntimeGeneration;
-use hopash::profile::{ProfileSnapshot, SnapshotLimits};
-use hopash::runtime_bundle::{
+use ratash::config::{AuthoritativeConfig, ConfigCompiler, EffectiveConfiguration};
+use ratash::domain::RuntimeGeneration;
+use ratash::profile::{ProfileSnapshot, SnapshotLimits};
+use ratash::runtime_bundle::{
     RuntimeBundleStageErrorKind, RuntimeBundleStager, RuntimeGenerationPruneErrorKind,
     RuntimeGenerationRetention, prune_runtime_generations,
 };
-use hopash::service::RuntimeManifestV1;
+use ratash::service::RuntimeManifestV1;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -22,7 +22,7 @@ impl TestDirectory {
     fn new(name: &str) -> Self {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "hopash-runtime-bundle-{name}-{}-{sequence}",
+            "ratash-runtime-bundle-{name}-{}-{sequence}",
             std::process::id()
         ));
         fs::create_dir_all(&path).expect("the fixture directory should be created");
@@ -324,7 +324,7 @@ rules:
         .compile(
             &snapshot,
             &[],
-            &AuthoritativeConfig::new("/tmp/hopash-core.sock", "fixture-secret"),
+            &AuthoritativeConfig::new("/tmp/ratash-core.sock", "fixture-secret"),
             &profile_root,
         )
         .expect("the profile fixture should compile")

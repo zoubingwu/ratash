@@ -1,26 +1,26 @@
 #!/bin/sh
 set -eu
 
-SERVICE_LABEL='io.hopash.core-runtime'
-SERVICE_PLIST='/Library/LaunchDaemons/io.hopash.core-runtime.plist'
-SERVICE_EXECUTABLE='/Library/PrivilegedHelperTools/io.hopash.core-runtime'
-SERVICE_ROOT='/Library/Application Support/Hopash RS'
+SERVICE_LABEL='io.ratash.core-runtime'
+SERVICE_PLIST='/Library/LaunchDaemons/io.ratash.core-runtime.plist'
+SERVICE_EXECUTABLE='/Library/PrivilegedHelperTools/io.ratash.core-runtime'
+SERVICE_ROOT='/Library/Application Support/ratash'
 GEODATA_ROOT="$SERVICE_ROOT/share/geodata"
-CLI_EXECUTABLE='/usr/local/bin/hopash'
+CLI_EXECUTABLE='/usr/local/bin/ratash'
 SERVICE_REMOVAL_ATTEMPTS=600
 
-owner_uid=${HOPASH_OWNER_UID:-}
+owner_uid=${RATASH_OWNER_UID:-}
 if [ -z "$owner_uid" ]; then
     owner_uid=$(/usr/bin/stat -f '%u' /dev/console)
 fi
 case "$owner_uid" in
     ''|*[!0-9]*)
-        echo 'Hopash RS requires a numeric HOPASH_OWNER_UID.' >&2
+        echo 'Ratash requires a numeric RATASH_OWNER_UID.' >&2
         exit 1
         ;;
 esac
 if [ "$owner_uid" -eq 0 ]; then
-    echo 'Hopash RS must be assigned to a non-root local user.' >&2
+    echo 'Ratash must be assigned to a non-root local user.' >&2
     exit 1
 fi
 
@@ -40,7 +40,7 @@ attempt=0
 while /bin/launchctl print "system/$SERVICE_LABEL" >/dev/null 2>&1; do
     attempt=$((attempt + 1))
     if [ "$attempt" -ge "$SERVICE_REMOVAL_ATTEMPTS" ]; then
-        echo 'Hopash RS timed out waiting for the previous Core service to stop.' >&2
+        echo 'Ratash timed out waiting for the previous Core service to stop.' >&2
         exit 1
     fi
     /bin/sleep 0.1

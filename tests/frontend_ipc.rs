@@ -5,16 +5,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hopash::application::{ApplicationService, ApplicationService as FixtureApplication};
-use hopash::error::ProcessExitCode;
-use hopash::frontend_ipc::{
+use ratash::application::{ApplicationService, ApplicationService as FixtureApplication};
+use ratash::error::ProcessExitCode;
+use ratash::frontend_ipc::{
     ForegroundLogFollower, IpcStatusLogEventSource, LogFollowCancellation, LogFollowFormat,
 };
-use hopash::ipc_runtime::{
+use ratash::ipc_runtime::{
     IpcClient, IpcServer, IpcServerConfig, IpcStreamBroker, SameUserPeerAuthorizer,
 };
-use hopash::telemetry::{CoreLogRecord, LogLevel, LogSource};
-use hopash::tui_runtime::{CancellationToken, StatusLogEvent, StatusLogEventSource};
+use ratash::telemetry::{CoreLogRecord, LogLevel, LogSource};
+use ratash::tui_runtime::{CancellationToken, StatusLogEvent, StatusLogEventSource};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -27,7 +27,7 @@ impl TempSocket {
     fn new(label: &str) -> Self {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let directory = PathBuf::from("/tmp").join(format!(
-            "hopash-frontend-ipc-{label}-{}-{id}",
+            "ratash-frontend-ipc-{label}-{}-{id}",
             std::process::id()
         ));
         Self {

@@ -6,23 +6,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hopash::application::{
+use ratash::application::{
     ApplicationClient, ApplicationOperation, ApplicationOutput, ApplicationService,
 };
-use hopash::constants::{
+use ratash::constants::{
     CORE_LOG_LINE_MAX_BYTES, LOG_BROKER_RECOVERY_CAPACITY, LOG_BROKER_RECOVERY_MAX_BYTES,
     LOG_CAPACITY, LOG_TAIL_MAX_BYTES, LOG_TAIL_MAX_RECORDS,
 };
-use hopash::error::ErrorCode;
-use hopash::ipc::{
+use ratash::error::ErrorCode;
+use ratash::ipc::{
     IpcRequest, IpcStreamFrame, IpcStreamPayload, LogStreamItem, RequestId, bind_private_listener,
     read_frame,
 };
-use hopash::ipc_runtime::{
+use ratash::ipc_runtime::{
     IpcClient, IpcServer, IpcServerConfig, IpcStreamBroker, SameUserPeerAuthorizer,
     StatusStreamUpdate,
 };
-use hopash::telemetry::{CoreLogRecord, LogLevel, LogSource, LogTail};
+use ratash::telemetry::{CoreLogRecord, LogLevel, LogSource, LogTail};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -35,7 +35,7 @@ impl TempSocket {
     fn new(label: &str) -> Self {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let directory = PathBuf::from("/tmp").join(format!(
-            "hopash-ipc-stream-{label}-{}-{id}",
+            "ratash-ipc-stream-{label}-{}-{id}",
             std::process::id()
         ));
         let path = directory.join("supervisor.sock");
@@ -652,7 +652,7 @@ fn stream_client_rejects_a_mismatched_request_id() {
             RequestId(request.request_id.0 + 1),
             IpcStreamPayload::Heartbeat,
         );
-        hopash::ipc::write_frame(&mut stream, &frame).expect("fixture frame should write");
+        ratash::ipc::write_frame(&mut stream, &frame).expect("fixture frame should write");
     });
     let client = IpcClient::new(socket.path());
     let mut status = client

@@ -282,7 +282,7 @@ impl BackgroundRuntime {
             let shutdown = Arc::clone(&shutdown);
             spawn_owned(
                 start_guard.threads_mut(),
-                format!("hopash-refresh-{worker}"),
+                format!("ratash-refresh-{worker}"),
                 move || refresh_worker(application, receiver, shutdown),
             )?;
         }
@@ -294,7 +294,7 @@ impl BackgroundRuntime {
             let shutdown = Arc::clone(&shutdown);
             spawn_owned(
                 start_guard.threads_mut(),
-                format!("hopash-probe-{worker}"),
+                format!("ratash-probe-{worker}"),
                 move || probe_worker(application, core, clock, receiver, shutdown),
             )?;
         }
@@ -328,7 +328,7 @@ impl BackgroundRuntime {
         let owner_shutdown = Arc::clone(&shutdown);
         spawn_owned(
             start_guard.threads_mut(),
-            "hopash-background".to_owned(),
+            "ratash-background".to_owned(),
             move || {
                 scheduler_owner(
                     owner_application,
@@ -594,7 +594,7 @@ fn spawn_traffic_thread(
     shutdown: Arc<ShutdownSignal>,
     timing: BackgroundTiming,
 ) -> io::Result<()> {
-    spawn_owned(threads, "hopash-traffic".to_owned(), move || {
+    spawn_owned(threads, "ratash-traffic".to_owned(), move || {
         run_stream(
             application,
             core,
@@ -627,7 +627,7 @@ fn spawn_connection_thread(
     shutdown: Arc<ShutdownSignal>,
     timing: BackgroundTiming,
 ) -> io::Result<()> {
-    spawn_owned(threads, "hopash-connections".to_owned(), move || {
+    spawn_owned(threads, "ratash-connections".to_owned(), move || {
         run_stream(
             application,
             core,
@@ -652,7 +652,7 @@ fn spawn_log_thread(
     shutdown: Arc<ShutdownSignal>,
     timing: BackgroundTiming,
 ) -> io::Result<()> {
-    spawn_owned(threads, "hopash-logs".to_owned(), move || {
+    spawn_owned(threads, "ratash-logs".to_owned(), move || {
         run_stream(
             application,
             core,

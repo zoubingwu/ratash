@@ -621,7 +621,7 @@ fn read_guardian_handshake(
 ) -> Result<(CoreGuardianHandshake, ChildStdout), ServicePlatformError> {
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::Builder::new()
-        .name("hopash-guardian-handshake".to_owned())
+        .name("ratash-guardian-handshake".to_owned())
         .spawn(move || {
             let result = read_handshake(&mut stdout);
             let _ = sender.send((result, stdout));
@@ -1285,7 +1285,7 @@ mod tests {
                 readiness_timeout: Duration::ZERO,
                 ..NativeCoreProcessConfig::default()
             },
-            || Ok(PathBuf::from("/private/tmp/hopash-fixture")),
+            || Ok(PathBuf::from("/private/tmp/ratash-fixture")),
         )
         .err()
         .expect("invalid product settings should fail");
@@ -1589,7 +1589,7 @@ mod tests {
             instance_generation: CoreInstanceGeneration(1),
         };
         let endpoint = CoreControlEndpoint::new(
-            PathBuf::from("/private/tmp/hopash-readiness-cancel-fixture.sock"),
+            PathBuf::from("/private/tmp/ratash-readiness-cancel-fixture.sock"),
             "fixture-secret",
         );
         let controller = NativeCoreProcessController::new(
@@ -1699,7 +1699,7 @@ mod tests {
             ownership: ChildOwnership::Guardian { control: None },
             identity: identity.clone(),
             endpoint: CoreControlEndpoint::new(
-                PathBuf::from("/private/tmp/hopash-guardian-exit-fixture.sock"),
+                PathBuf::from("/private/tmp/ratash-guardian-exit-fixture.sock"),
                 "fixture-secret",
             ),
             exited: false,

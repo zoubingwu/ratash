@@ -19,7 +19,7 @@ use crate::lifecycle::{
 };
 
 pub const INTERNAL_SUPERVISOR_MODE: &str = "__supervisor";
-pub const READINESS_TOKEN_ENV: &str = "HOPASH_SUPERVISOR_READINESS_TOKEN";
+pub const READINESS_TOKEN_ENV: &str = "RATASH_SUPERVISOR_READINESS_TOKEN";
 
 const LIFECYCLE_LEASE_NAME: &str = "lifecycle-operation";
 const SUPERVISOR_LEASE_NAME: &str = "supervisor";

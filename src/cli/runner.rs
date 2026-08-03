@@ -83,7 +83,7 @@ pub fn run_invocation_with_frontend(
 fn supervisor_unavailable() -> ApplicationError {
     ApplicationError::new(
         ErrorCode::SupervisorUnavailable,
-        "The Hopash Supervisor is unavailable",
+        "The Ratash Supervisor is unavailable",
         true,
     )
 }

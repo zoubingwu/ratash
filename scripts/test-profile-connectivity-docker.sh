@@ -56,15 +56,15 @@ ensure_image "$MIHOMO_IMAGE"
 ensure_image "$CURL_IMAGE"
 
 run_id="$(date +%s)-$$"
-core_name="hopash-profile-core-$run_id"
-client_network="hopash-profile-client-$run_id"
-egress_network="hopash-profile-egress-$run_id"
-controller_secret="hopash-profile-controller-$run_id"
+core_name="ratash-profile-core-$run_id"
+client_network="ratash-profile-client-$run_id"
+egress_network="ratash-profile-egress-$run_id"
+controller_secret="ratash-profile-controller-$run_id"
 test_label='profile-connectivity-test'
 
 remove_test_container() {
     container_label=$(docker inspect \
-        --format '{{ index .Config.Labels "io.hopash.purpose" }}' \
+        --format '{{ index .Config.Labels "io.ratash.purpose" }}' \
         "$core_name" 2>/dev/null || true)
     if test "$container_label" = "$test_label"; then
         docker rm --force --volumes "$core_name" >/dev/null 2>&1 || true
@@ -74,7 +74,7 @@ remove_test_container() {
 remove_test_network() {
     network_name=$1
     network_label=$(docker network inspect \
-        --format '{{ index .Labels "io.hopash.purpose" }}' \
+        --format '{{ index .Labels "io.ratash.purpose" }}' \
         "$network_name" 2>/dev/null || true)
     if test "$network_label" = "$test_label"; then
         docker network rm "$network_name" >/dev/null 2>&1 || true
@@ -97,16 +97,16 @@ trap 'exit 143' TERM
 
 docker network create \
     --internal \
-    --label "io.hopash.purpose=$test_label" \
+    --label "io.ratash.purpose=$test_label" \
     "$client_network" >/dev/null
 docker network create \
-    --label "io.hopash.purpose=$test_label" \
+    --label "io.ratash.purpose=$test_label" \
     "$egress_network" >/dev/null
 
 docker create \
     --rm \
     --name "$core_name" \
-    --label "io.hopash.purpose=$test_label" \
+    --label "io.ratash.purpose=$test_label" \
     --log-driver=none \
     --network "$egress_network" \
     --read-only \
@@ -116,15 +116,15 @@ docker create \
     --memory=256m \
     --cpus=1 \
     --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m \
-    --mount "type=bind,src=$profile,dst=/run/hopash-profile.yaml,readonly" \
+    --mount "type=bind,src=$profile,dst=/run/ratash-profile.yaml,readonly" \
     "$MIHOMO_IMAGE" \
-    -f /run/hopash-profile.yaml \
+    -f /run/ratash-profile.yaml \
     -ext-ctl "127.0.0.1:$CONTROLLER_PORT" \
     -secret "$controller_secret" >/dev/null
 docker start "$core_name" >/dev/null
 
 docker network connect \
-    --alias hopash-core \
+    --alias ratash-core \
     "$client_network" \
     "$core_name"
 
@@ -210,7 +210,7 @@ attempt=1
 while test "$attempt" -le 3; do
     if proxy_code=$(run_curl "$client_network" \
         --ipv4 \
-        --proxy "http://hopash-core:$mixed_port" \
+        --proxy "http://ratash-core:$mixed_port" \
         --fail \
         --silent \
         --connect-timeout 8 \

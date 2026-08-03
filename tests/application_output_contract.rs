@@ -1,4 +1,4 @@
-use hopash::application::{
+use ratash::application::{
     ApplicationError, ApplicationOutput, LatencyFreshness, LatencyListOutcome, LatencyProbeStatus,
     LatencyShowOutcome, LatencySummary, LifecycleAction, LifecycleOutcome, LogGap, LogMetadata,
     PolicyTargetValidation, ProfileListOutcome, ProfileMutationAction, ProfileMutationOutcome,
@@ -8,12 +8,12 @@ use hopash::application::{
     RuleMutationOutcome, RuleSummary, RuntimeApplyOutcome, RuntimeApplyStatus, SelectorCandidate,
     SelectorIdentity, SelectorKind,
 };
-use hopash::contract::{ApiError, ApplicationOutputViewV1, JsonEnvelope};
-use hopash::domain::{
+use ratash::contract::{ApiError, ApplicationOutputViewV1, JsonEnvelope};
+use ratash::domain::{
     LocalRuleSetRevision, NodeRecordId, ProbeGeneration, ProfileId, ProxyGroupId,
     RuntimeGeneration, SubscriptionUrl,
 };
-use hopash::error::ErrorCode;
+use ratash::error::ErrorCode;
 
 #[test]
 fn lifecycle_and_profile_outputs_use_versioned_safe_json() {
@@ -21,7 +21,7 @@ fn lifecycle_and_profile_outputs_use_versioned_safe_json() {
         ApplicationOutput::Lifecycle(LifecycleOutcome {
             action: LifecycleAction::Start,
             changed: true,
-            status: hopash::application::ApplicationService::new().status(),
+            status: ratash::application::ApplicationService::new().status(),
         }),
     ));
     let lifecycle_json =

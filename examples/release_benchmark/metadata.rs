@@ -88,7 +88,7 @@ pub(super) fn validate_metadata(
     require_bool_object(workloads, "sustained_traffic_samples", true)?;
 
     let generator = require_object(metadata, "workload_generator")?;
-    require_string_object(generator, "name", "hopash-release-workload")?;
+    require_string_object(generator, "name", "ratash-release-workload")?;
     require_u64_object(generator, "version", WORKLOAD_GENERATOR_VERSION)?;
     require_u64_object(generator, "seed", WORKLOAD_SEED)?;
 
@@ -255,7 +255,7 @@ fn validate_reviewed_report(
         return Err(invalid("reviewed report status must be review_required"));
     }
     let tool = require_object(report, "capture_tool")?;
-    require_string_object(tool, "name", "hopash-release-benchmark")?;
+    require_string_object(tool, "name", "ratash-release-benchmark")?;
     require_u64_object(tool, "version", CAPTURE_TOOL_VERSION)?;
 
     let report_environment = require_object(report, "environment")?;

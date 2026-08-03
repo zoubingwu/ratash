@@ -1,22 +1,22 @@
 {
   "schema_version": 1,
-  "package_identifier": "io.hopash.rs",
-  "service_label": "io.hopash.core-runtime",
+  "package_identifier": "io.ratash",
+  "service_label": "io.ratash.core-runtime",
   "mihomo_version": "v1.19.28",
   "paths": {
-    "cli": "/usr/local/bin/hopash",
-    "service_executable": "/Library/PrivilegedHelperTools/io.hopash.core-runtime",
-    "service_plist": "/Library/LaunchDaemons/io.hopash.core-runtime.plist",
-    "service_socket": "/var/run/hopash-rs/core-service.sock",
-    "service_runtime_root": "/Library/Application Support/Hopash RS/runtime",
-    "mihomo": "/Library/Application Support/Hopash RS/bin/mihomo",
-    "geodata": "/Library/Application Support/Hopash RS/share/geodata",
-    "shared_assets": "/usr/local/share/hopash"
+    "cli": "/usr/local/bin/ratash",
+    "service_executable": "/Library/PrivilegedHelperTools/io.ratash.core-runtime",
+    "service_plist": "/Library/LaunchDaemons/io.ratash.core-runtime.plist",
+    "service_socket": "/var/run/ratash/core-service.sock",
+    "service_runtime_root": "/Library/Application Support/ratash/runtime",
+    "mihomo": "/Library/Application Support/ratash/bin/mihomo",
+    "geodata": "/Library/Application Support/ratash/share/geodata",
+    "shared_assets": "/usr/local/share/ratash"
   },
   "geodata": {
-    "manifest": "/usr/local/share/hopash/release/geodata-manifest.json",
-    "license": "/usr/local/share/hopash/licenses/MetaCubeX-meta-rules-dat-GPL-3.0.txt",
-    "notice": "/usr/local/share/hopash/licenses/GeoData-NOTICE.txt",
+    "manifest": "/usr/local/share/ratash/release/geodata-manifest.json",
+    "license": "/usr/local/share/ratash/licenses/MetaCubeX-meta-rules-dat-GPL-3.0.txt",
+    "notice": "/usr/local/share/ratash/licenses/GeoData-NOTICE.txt",
     "files": [
       "ASN.mmdb",
       "Country.mmdb",
@@ -30,11 +30,11 @@
       "--owner-uid",
       "@OWNER_UID@",
       "--socket",
-      "/var/run/hopash-rs/core-service.sock",
+      "/var/run/ratash/core-service.sock",
       "--runtime-root",
-      "/Library/Application Support/Hopash RS/runtime",
+      "/Library/Application Support/ratash/runtime",
       "--mihomo",
-      "/Library/Application Support/Hopash RS/bin/mihomo"
+      "/Library/Application Support/ratash/bin/mihomo"
     ]
   },
   "targets": {

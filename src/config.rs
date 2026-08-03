@@ -11,7 +11,7 @@ use url::Url;
 
 const BUNDLED_POLICY: &str = include_str!("../fixtures/mihomo/v1.19.28/config-policy.yaml");
 pub const BUNDLED_CORE_VERSION: &str = "v1.19.28";
-const COMPILER_POLICY_REVISION: &str = "hopash-config-policy-v4";
+const COMPILER_POLICY_REVISION: &str = "ratash-config-policy-v4";
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct AuthoritativeConfig {

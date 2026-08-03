@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::Value;
 
-use hopash::tui_runtime::ShutdownSignal;
+use ratash::tui_runtime::ShutdownSignal;
 
 use super::CHILD_CLEANUP_TIMEOUT;
 use super::process_support::{ProcessChildGuard, PtyChildGuard};
@@ -103,9 +103,9 @@ pub(super) fn collect_tui_process_metrics(
     })?;
     let mut command = CommandBuilder::new(&lifecycle.release_binary);
     command.arg("status");
-    command.env("HOPASH_STATE_DIR", &lifecycle.state_root);
-    command.env("HOPASH_CORE_SERVICE_SOCKET", &lifecycle.service_socket);
-    command.env("HOPASH_MIHOMO_PATH", &lifecycle.mihomo);
+    command.env("RATASH_STATE_DIR", &lifecycle.state_root);
+    command.env("RATASH_CORE_SERVICE_SOCKET", &lifecycle.service_socket);
+    command.env("RATASH_MIHOMO_PATH", &lifecycle.mihomo);
     command.env("TERM", "xterm-256color");
     let start = Instant::now();
     let mut child = PtyChildGuard::new(pair.slave.spawn_command(command)?);

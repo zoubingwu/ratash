@@ -922,7 +922,7 @@ mod generation_prune_tests {
     #[test]
     fn a_generation_replaced_after_preflight_is_quarantined_without_deletion() {
         let root = std::env::temp_dir().join(format!(
-            "hopash-runtime-prune-race-{}-{}",
+            "ratash-runtime-prune-race-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));

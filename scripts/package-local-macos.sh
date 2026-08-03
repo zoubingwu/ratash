@@ -46,13 +46,13 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 version=$(/usr/bin/sed -n 's/^version = "\([^"]*\)"/\1/p' "$project_root/Cargo.toml" | /usr/bin/head -n 1)
 [ -n "$version" ] || {
-    echo 'The Hopash version is unavailable.' >&2
+    echo 'The Ratash version is unavailable.' >&2
     exit 1
 }
 
 /bin/mkdir -p "$output"
 output=$(CDPATH= cd -- "$output" && pwd)
-package_name="hopash-$version-$target-local-unsigned.pkg"
+package_name="ratash-$version-$target-local-unsigned.pkg"
 package="$output/$package_name"
 checksum="$package.sha256"
 [ ! -e "$package" ] || {
@@ -64,7 +64,7 @@ checksum="$package.sha256"
     exit 1
 }
 
-work_dir=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/hopash-local-package.XXXXXX")
+work_dir=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/ratash-local-package.XXXXXX")
 cleanup() {
     if [ -n "$work_dir" ] && [ -d "$work_dir" ]; then
         /bin/rm -rf -- "$work_dir"
@@ -130,24 +130,24 @@ curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
 (
     CDPATH= cd -- "$project_root"
     cargo build --locked --release --target "$target" --no-default-features \
-        --features local-unsigned --bin hopash
+        --features local-unsigned --bin ratash
 )
 /usr/bin/install -m 0755 \
-    "$project_root/target/$target/release/hopash" \
-    "$work_dir/hopash"
+    "$project_root/target/$target/release/ratash" \
+    "$work_dir/ratash"
 
-/usr/bin/codesign --force --options runtime --identifier 'hopash' --sign - "$work_dir/hopash"
+/usr/bin/codesign --force --options runtime --identifier 'ratash' --sign - "$work_dir/ratash"
 /usr/bin/codesign --force --options runtime --identifier 'mihomo' --sign - "$work_dir/mihomo"
-/usr/bin/codesign --verify --strict --verbose=2 "$work_dir/hopash"
+/usr/bin/codesign --verify --strict --verbose=2 "$work_dir/ratash"
 /usr/bin/codesign --verify --strict --verbose=2 "$work_dir/mihomo"
 
 mihomo_sha256=$(/usr/bin/shasum -a 256 "$work_dir/mihomo" | /usr/bin/awk '{print $1}')
 package_output="$work_dir/package"
-unset HOPASH_TEST_ALLOW_CUSTOM_GEODATA_MANIFEST
+unset RATASH_TEST_ALLOW_CUSTOM_GEODATA_MANIFEST
 "$project_root/scripts/package-macos.sh" \
     --version "$version" \
     --target "$target" \
-    --hopash "$work_dir/hopash" \
+    --ratash "$work_dir/ratash" \
     --mihomo "$work_dir/mihomo" \
     --mihomo-sha256 "$mihomo_sha256" \
     --mihomo-license "$work_dir/Mihomo-GPL-3.0.txt" \
@@ -156,7 +156,7 @@ unset HOPASH_TEST_ALLOW_CUSTOM_GEODATA_MANIFEST
     --geodata-license "$work_dir/MetaCubeX-meta-rules-dat-GPL-3.0.txt" \
     --output "$package_output" >/dev/null
 
-/bin/mv "$package_output/hopash-$version-$target.pkg" "$package"
+/bin/mv "$package_output/ratash-$version-$target.pkg" "$package"
 (
     CDPATH= cd -- "$output"
     /usr/bin/shasum -a 256 "$package_name" >"$package_name.sha256"

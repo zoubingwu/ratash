@@ -4,11 +4,11 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "hopash",
+    name = "ratash",
     version,
     about = "Manage Mihomo from the command line and a terminal interface",
     disable_help_subcommand = true,
-    after_help = "For automation guidance, run: hopash help agent"
+    after_help = "For automation guidance, run: ratash help agent"
 )]
 pub struct Cli {
     #[command(subcommand)]

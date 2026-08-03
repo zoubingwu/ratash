@@ -523,7 +523,7 @@ fn cleanup_geo_data_repair(
 }
 
 fn pending_geo_data_name(asset: &GeoDataAsset) -> PathBuf {
-    PathBuf::from(format!(".hopash-geodata-{}.pending", asset.file_name()))
+    PathBuf::from(format!(".ratash-geodata-{}.pending", asset.file_name()))
 }
 
 fn sync_directory_descriptor(directory: &OwnedFd) -> Result<(), BundleIngressError> {

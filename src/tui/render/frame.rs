@@ -780,7 +780,7 @@ fn render_message_sheet(title: &str, body: &str, area: Rect, buffer: &mut Buffer
 pub(super) fn render_minimum_size(area: Rect, buffer: &mut Buffer) {
     Paragraph::new(Line::from(vec![
         Span::styled(
-            "HOPASH RS",
+            "RATASH",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
         Span::raw("  Terminal too small"),

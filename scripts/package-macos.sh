@@ -2,13 +2,13 @@
 set -eu
 
 usage() {
-    echo 'usage: package-macos.sh --version VERSION --target TARGET --hopash PATH --mihomo PATH --mihomo-sha256 SHA256 --mihomo-license PATH --geodata-directory DIRECTORY --geodata-manifest PATH --geodata-license PATH (--output DIRECTORY | --stage-only DIRECTORY) [--application-identity IDENTITY] [--installer-identity IDENTITY]' >&2
+    echo 'usage: package-macos.sh --version VERSION --target TARGET --ratash PATH --mihomo PATH --mihomo-sha256 SHA256 --mihomo-license PATH --geodata-directory DIRECTORY --geodata-manifest PATH --geodata-license PATH (--output DIRECTORY | --stage-only DIRECTORY) [--application-identity IDENTITY] [--installer-identity IDENTITY]' >&2
     exit 2
 }
 
 version=''
 target=''
-hopash=''
+ratash=''
 mihomo=''
 mihomo_sha256=''
 mihomo_license=''
@@ -22,7 +22,7 @@ installer_identity=''
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --version|--target|--hopash|--mihomo|--mihomo-sha256|--mihomo-license|--geodata-directory|--geodata-manifest|--geodata-license|--output|--stage-only|--application-identity|--installer-identity)
+        --version|--target|--ratash|--mihomo|--mihomo-sha256|--mihomo-license|--geodata-directory|--geodata-manifest|--geodata-license|--output|--stage-only|--application-identity|--installer-identity)
             [ "$#" -ge 2 ] || usage
             option=$1
             value=$2
@@ -30,7 +30,7 @@ while [ "$#" -gt 0 ]; do
             case "$option" in
                 --version) version=$value ;;
                 --target) target=$value ;;
-                --hopash) hopash=$value ;;
+                --ratash) ratash=$value ;;
                 --mihomo) mihomo=$value ;;
                 --mihomo-sha256) mihomo_sha256=$value ;;
                 --mihomo-license) mihomo_license=$value ;;
@@ -48,7 +48,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$version" ] || usage
-[ -n "$hopash" ] || usage
+[ -n "$ratash" ] || usage
 [ -n "$mihomo" ] || usage
 [ -n "$mihomo_sha256" ] || usage
 [ -n "$mihomo_license" ] || usage
@@ -67,7 +67,7 @@ case "$mihomo_sha256" in
     *[!0-9A-Fa-f]*|'') usage ;;
 esac
 [ "${#mihomo_sha256}" -eq 64 ] || usage
-[ -f "$hopash" ] || { echo 'Hopash executable is unavailable.' >&2; exit 1; }
+[ -f "$ratash" ] || { echo 'Ratash executable is unavailable.' >&2; exit 1; }
 [ -f "$mihomo" ] || { echo 'Mihomo executable is unavailable.' >&2; exit 1; }
 [ -f "$mihomo_license" ] || { echo 'Mihomo license is unavailable.' >&2; exit 1; }
 if [ ! -d "$geodata_directory" ] || [ -L "$geodata_directory" ]; then
@@ -103,7 +103,7 @@ command -v jq >/dev/null 2>&1 || {
     echo 'jq is required to verify the Geo data manifest.' >&2
     exit 1
 }
-if [ "${HOPASH_TEST_ALLOW_CUSTOM_GEODATA_MANIFEST:-0}" = '1' ]; then
+if [ "${RATASH_TEST_ALLOW_CUSTOM_GEODATA_MANIFEST:-0}" = '1' ]; then
     if [ -z "$stage_only" ] || [ -n "$output" ] || [ -n "$application_identity" ] || [ -n "$installer_identity" ]; then
         echo 'Custom Geo data manifests are restricted to unsigned test staging.' >&2
         exit 1
@@ -175,7 +175,7 @@ verify_geodata_asset 1 'Country.mmdb'
 verify_geodata_asset 2 'GeoIP.dat'
 verify_geodata_asset 3 'GeoSite.dat'
 
-work_dir=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/hopash-package.XXXXXX")
+work_dir=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/ratash-package.XXXXXX")
 cleanup() {
     if [ -n "$work_dir" ] && [ -d "$work_dir" ]; then
         /bin/rm -rf -- "$work_dir"
@@ -192,49 +192,49 @@ package_scripts="$stage/scripts"
     "$payload/usr/local/share/bash-completion/completions" \
     "$payload/usr/local/share/zsh/site-functions" \
     "$payload/usr/local/share/fish/vendor_completions.d" \
-    "$payload/usr/local/share/hopash/skills/hopash/agents" \
-    "$payload/usr/local/share/hopash/licenses" \
-    "$payload/usr/local/share/hopash/release" \
+    "$payload/usr/local/share/ratash/skills/ratash/agents" \
+    "$payload/usr/local/share/ratash/licenses" \
+    "$payload/usr/local/share/ratash/release" \
     "$payload/Library/PrivilegedHelperTools" \
     "$payload/Library/LaunchDaemons" \
-    "$payload/Library/Application Support/Hopash RS/bin" \
-    "$payload/Library/Application Support/Hopash RS/share/geodata" \
+    "$payload/Library/Application Support/ratash/bin" \
+    "$payload/Library/Application Support/ratash/share/geodata" \
     "$package_scripts"
 
-/usr/bin/install -m 0755 "$hopash" "$payload/usr/local/bin/hopash"
-/usr/bin/install -m 0755 "$hopash" "$payload/Library/PrivilegedHelperTools/io.hopash.core-runtime"
-/usr/bin/install -m 0755 "$mihomo" "$payload/Library/Application Support/Hopash RS/bin/mihomo"
-/usr/bin/install -m 0644 "$geodata_directory/ASN.mmdb" "$payload/Library/Application Support/Hopash RS/share/geodata/ASN.mmdb"
-/usr/bin/install -m 0644 "$geodata_directory/Country.mmdb" "$payload/Library/Application Support/Hopash RS/share/geodata/Country.mmdb"
-/usr/bin/install -m 0644 "$geodata_directory/GeoIP.dat" "$payload/Library/Application Support/Hopash RS/share/geodata/GeoIP.dat"
-/usr/bin/install -m 0644 "$geodata_directory/GeoSite.dat" "$payload/Library/Application Support/Hopash RS/share/geodata/GeoSite.dat"
-/usr/bin/install -m 0755 "$project_root/packaging/macos/uninstall.sh" "$payload/usr/local/share/hopash/uninstall.sh"
-/usr/bin/install -m 0644 "$project_root/packaging/macos/io.hopash.core-runtime.plist" "$payload/Library/LaunchDaemons/io.hopash.core-runtime.plist"
+/usr/bin/install -m 0755 "$ratash" "$payload/usr/local/bin/ratash"
+/usr/bin/install -m 0755 "$ratash" "$payload/Library/PrivilegedHelperTools/io.ratash.core-runtime"
+/usr/bin/install -m 0755 "$mihomo" "$payload/Library/Application Support/ratash/bin/mihomo"
+/usr/bin/install -m 0644 "$geodata_directory/ASN.mmdb" "$payload/Library/Application Support/ratash/share/geodata/ASN.mmdb"
+/usr/bin/install -m 0644 "$geodata_directory/Country.mmdb" "$payload/Library/Application Support/ratash/share/geodata/Country.mmdb"
+/usr/bin/install -m 0644 "$geodata_directory/GeoIP.dat" "$payload/Library/Application Support/ratash/share/geodata/GeoIP.dat"
+/usr/bin/install -m 0644 "$geodata_directory/GeoSite.dat" "$payload/Library/Application Support/ratash/share/geodata/GeoSite.dat"
+/usr/bin/install -m 0755 "$project_root/packaging/macos/uninstall.sh" "$payload/usr/local/share/ratash/uninstall.sh"
+/usr/bin/install -m 0644 "$project_root/packaging/macos/io.ratash.core-runtime.plist" "$payload/Library/LaunchDaemons/io.ratash.core-runtime.plist"
 for man_page in "$project_root"/packaging/generated/man/man1/*.1; do
     /usr/bin/install -m 0644 "$man_page" "$payload/usr/local/share/man/man1/$(/usr/bin/basename "$man_page")"
 done
-/usr/bin/install -m 0644 "$project_root/packaging/generated/completions/hopash.bash" "$payload/usr/local/share/bash-completion/completions/hopash"
-/usr/bin/install -m 0644 "$project_root/packaging/generated/completions/_hopash" "$payload/usr/local/share/zsh/site-functions/_hopash"
-/usr/bin/install -m 0644 "$project_root/packaging/generated/completions/hopash.fish" "$payload/usr/local/share/fish/vendor_completions.d/hopash.fish"
-/usr/bin/install -m 0644 "$project_root/skills/hopash/SKILL.md" "$payload/usr/local/share/hopash/skills/hopash/SKILL.md"
-/usr/bin/install -m 0644 "$project_root/skills/hopash/agents/openai.yaml" "$payload/usr/local/share/hopash/skills/hopash/agents/openai.yaml"
-/usr/bin/install -m 0644 "$mihomo_license" "$payload/usr/local/share/hopash/licenses/Mihomo-GPL-3.0.txt"
-/usr/bin/install -m 0644 "$project_root/packaging/macos/Mihomo-NOTICE.txt" "$payload/usr/local/share/hopash/licenses/Mihomo-NOTICE.txt"
-/usr/bin/install -m 0644 "$geodata_license" "$payload/usr/local/share/hopash/licenses/MetaCubeX-meta-rules-dat-GPL-3.0.txt"
-/usr/bin/install -m 0644 "$project_root/packaging/macos/GeoData-NOTICE.txt" "$payload/usr/local/share/hopash/licenses/GeoData-NOTICE.txt"
-/usr/bin/install -m 0644 "$project_root/fixtures/release/product-contract-v1.json" "$payload/usr/local/share/hopash/release/product-contract-v1.json"
-/usr/bin/install -m 0644 "$project_root/fixtures/release/benchmark-metadata-v1.json" "$payload/usr/local/share/hopash/release/benchmark-metadata-v1.json"
-/usr/bin/install -m 0644 "$project_root/packaging/macos/package-contract-v1.json" "$payload/usr/local/share/hopash/release/package-contract-v1.json"
-/usr/bin/install -m 0644 "$geodata_manifest" "$payload/usr/local/share/hopash/release/geodata-manifest.json"
+/usr/bin/install -m 0644 "$project_root/packaging/generated/completions/ratash.bash" "$payload/usr/local/share/bash-completion/completions/ratash"
+/usr/bin/install -m 0644 "$project_root/packaging/generated/completions/_ratash" "$payload/usr/local/share/zsh/site-functions/_ratash"
+/usr/bin/install -m 0644 "$project_root/packaging/generated/completions/ratash.fish" "$payload/usr/local/share/fish/vendor_completions.d/ratash.fish"
+/usr/bin/install -m 0644 "$project_root/skills/ratash/SKILL.md" "$payload/usr/local/share/ratash/skills/ratash/SKILL.md"
+/usr/bin/install -m 0644 "$project_root/skills/ratash/agents/openai.yaml" "$payload/usr/local/share/ratash/skills/ratash/agents/openai.yaml"
+/usr/bin/install -m 0644 "$mihomo_license" "$payload/usr/local/share/ratash/licenses/Mihomo-GPL-3.0.txt"
+/usr/bin/install -m 0644 "$project_root/packaging/macos/Mihomo-NOTICE.txt" "$payload/usr/local/share/ratash/licenses/Mihomo-NOTICE.txt"
+/usr/bin/install -m 0644 "$geodata_license" "$payload/usr/local/share/ratash/licenses/MetaCubeX-meta-rules-dat-GPL-3.0.txt"
+/usr/bin/install -m 0644 "$project_root/packaging/macos/GeoData-NOTICE.txt" "$payload/usr/local/share/ratash/licenses/GeoData-NOTICE.txt"
+/usr/bin/install -m 0644 "$project_root/fixtures/release/product-contract-v1.json" "$payload/usr/local/share/ratash/release/product-contract-v1.json"
+/usr/bin/install -m 0644 "$project_root/fixtures/release/benchmark-metadata-v1.json" "$payload/usr/local/share/ratash/release/benchmark-metadata-v1.json"
+/usr/bin/install -m 0644 "$project_root/packaging/macos/package-contract-v1.json" "$payload/usr/local/share/ratash/release/package-contract-v1.json"
+/usr/bin/install -m 0644 "$geodata_manifest" "$payload/usr/local/share/ratash/release/geodata-manifest.json"
 /usr/bin/install -m 0755 "$project_root/packaging/macos/scripts/postinstall" "$package_scripts/postinstall"
 
 if [ -n "$application_identity" ]; then
-    /usr/bin/codesign --force --options runtime --timestamp --identifier 'hopash' --sign "$application_identity" "$payload/usr/local/bin/hopash"
-    /usr/bin/codesign --force --options runtime --timestamp --sign "$application_identity" "$payload/Library/PrivilegedHelperTools/io.hopash.core-runtime"
-    /usr/bin/codesign --force --options runtime --timestamp --sign "$application_identity" "$payload/Library/Application Support/Hopash RS/bin/mihomo"
-    /usr/bin/codesign --verify --strict --verbose=2 "$payload/usr/local/bin/hopash"
-    /usr/bin/codesign --verify --strict --verbose=2 "$payload/Library/PrivilegedHelperTools/io.hopash.core-runtime"
-    /usr/bin/codesign --verify --strict --verbose=2 "$payload/Library/Application Support/Hopash RS/bin/mihomo"
+    /usr/bin/codesign --force --options runtime --timestamp --identifier 'ratash' --sign "$application_identity" "$payload/usr/local/bin/ratash"
+    /usr/bin/codesign --force --options runtime --timestamp --sign "$application_identity" "$payload/Library/PrivilegedHelperTools/io.ratash.core-runtime"
+    /usr/bin/codesign --force --options runtime --timestamp --sign "$application_identity" "$payload/Library/Application Support/ratash/bin/mihomo"
+    /usr/bin/codesign --verify --strict --verbose=2 "$payload/usr/local/bin/ratash"
+    /usr/bin/codesign --verify --strict --verbose=2 "$payload/Library/PrivilegedHelperTools/io.ratash.core-runtime"
+    /usr/bin/codesign --verify --strict --verbose=2 "$payload/Library/Application Support/ratash/bin/mihomo"
 fi
 
 if [ -n "$stage_only" ]; then
@@ -244,14 +244,14 @@ if [ -n "$stage_only" ]; then
 fi
 
 /bin/mkdir -p "$output"
-unsigned_package="$work_dir/hopash-$version-$target-unsigned.pkg"
-final_package="$output/hopash-$version-$target.pkg"
+unsigned_package="$work_dir/ratash-$version-$target-unsigned.pkg"
+final_package="$output/ratash-$version-$target.pkg"
 [ ! -e "$final_package" ] || { echo 'Output package already exists.' >&2; exit 1; }
 [ ! -e "$final_package.sha256" ] || { echo 'Output checksum already exists.' >&2; exit 1; }
 /usr/bin/pkgbuild \
     --root "$payload" \
     --scripts "$package_scripts" \
-    --identifier 'io.hopash.rs' \
+    --identifier 'io.ratash' \
     --version "$version" \
     --ownership recommended \
     --install-location / \

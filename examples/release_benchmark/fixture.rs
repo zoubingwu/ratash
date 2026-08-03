@@ -14,20 +14,20 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
-use hopash::config::ConfigCompiler;
-use hopash::core::{CoreControlEndpoint, OwnerSessionRequest};
-use hopash::core_service_ipc::{CoreServiceServer, CoreServiceServerConfig};
-use hopash::lifecycle::{ProcessInspector, PsProcessInspector};
-use hopash::process_controller::{
+use ratash::config::ConfigCompiler;
+use ratash::core::{CoreControlEndpoint, OwnerSessionRequest};
+use ratash::core_service_ipc::{CoreServiceServer, CoreServiceServerConfig};
+use ratash::lifecycle::{ProcessInspector, PsProcessInspector};
+use ratash::process_controller::{
     NativeCoreProcessConfig, NativeCoreProcessController, UnixCoreControlClient,
 };
-use hopash::service::{
+use ratash::service::{
     CallerCredentialValidator, PrivilegedCoreRuntimeService, PrivilegedServiceConfig,
     PrivilegedServiceDependencies, ProcessIdentityProbe, RuntimeConfigurationPolicy,
     RuntimeManifestFileV1, SecretGenerator, ServicePlatformError, ServicePlatformErrorKind,
     TunCapabilityPreflight,
 };
-use hopash::tui_runtime::{ProcessSignalSource, ShutdownSignal};
+use ratash::tui_runtime::{ProcessSignalSource, ShutdownSignal};
 
 use super::CORE_FIXTURE_WORKER_COUNT;
 use super::reporting::sha256_file;
@@ -169,7 +169,7 @@ pub(super) fn argument_value<'a>(arguments: &'a [String], name: &str) -> Option<
 }
 
 pub(super) fn run_fixture_core(socket: &Path) -> Result<(), Box<dyn Error>> {
-    let active_nodes = env::var("HOPASH_BENCHMARK_ACTIVE_NODES")
+    let active_nodes = env::var("RATASH_BENCHMARK_ACTIVE_NODES")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(1);

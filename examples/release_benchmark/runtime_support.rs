@@ -13,11 +13,11 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde_json::{Value, json};
 
-use hopash::constants::TRAFFIC_SERIES_CAPACITY;
-use hopash::lifecycle::{ProcessIdentity, ProcessInspector, PsProcessInspector};
-use hopash::telemetry::LogLevel;
-use hopash::tui::Page;
-use hopash::tui_runtime::ShutdownSignal;
+use ratash::constants::TRAFFIC_SERIES_CAPACITY;
+use ratash::lifecycle::{ProcessIdentity, ProcessInspector, PsProcessInspector};
+use ratash::telemetry::LogLevel;
+use ratash::tui::Page;
+use ratash::tui_runtime::ShutdownSignal;
 
 use super::process_support::ProcessChildGuard;
 use super::profile_server::wait_for_socket;
@@ -88,9 +88,9 @@ impl LifecycleGuard {
     ) -> Result<std::process::Output, io::Error> {
         Command::new(binary)
             .args(arguments)
-            .env("HOPASH_STATE_DIR", &self.state_root)
-            .env("HOPASH_CORE_SERVICE_SOCKET", &self.service_socket)
-            .env("HOPASH_MIHOMO_PATH", &self.mihomo)
+            .env("RATASH_STATE_DIR", &self.state_root)
+            .env("RATASH_CORE_SERVICE_SOCKET", &self.service_socket)
+            .env("RATASH_MIHOMO_PATH", &self.mihomo)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -199,7 +199,7 @@ pub(super) fn spawn_fixture_service(
         .arg(owner_uid.to_string())
         .arg(mihomo)
         .arg(guardian)
-        .env("HOPASH_BENCHMARK_ACTIVE_NODES", active_nodes.to_string())
+        .env("RATASH_BENCHMARK_ACTIVE_NODES", active_nodes.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

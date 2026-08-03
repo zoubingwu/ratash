@@ -7,7 +7,7 @@ use std::os::unix::net::UnixListener;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use hopash::lifecycle::{
+use ratash::lifecycle::{
     DirectoryLease, InstanceRecord, LeaseAcquisition, LifecycleErrorKind, ProcessIdentity,
     ProcessInspector, StatePaths, remove_verified_stale_socket,
 };
@@ -22,7 +22,7 @@ impl TestDirectory {
     fn new() -> Self {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "hopash-lifecycle-{}-{sequence}",
+            "ratash-lifecycle-{}-{sequence}",
             std::process::id()
         ));
         fs::create_dir(&path).expect("test directory should be created");
@@ -69,7 +69,7 @@ impl ProcessInspector for FakeInspector {
 #[test]
 fn state_paths_use_an_absolute_override_or_the_macos_user_location() {
     let override_paths = StatePaths::from_environment(
-        Some(OsStr::new("/tmp/hopash-state-fixture")),
+        Some(OsStr::new("/tmp/ratash-state-fixture")),
         Some(OsStr::new("/Users/example")),
     )
     .expect("absolute override should resolve");
@@ -78,11 +78,11 @@ fn state_paths_use_an_absolute_override_or_the_macos_user_location() {
 
     assert_eq!(
         override_paths.root,
-        std::path::Path::new("/tmp/hopash-state-fixture")
+        std::path::Path::new("/tmp/ratash-state-fixture")
     );
     assert_eq!(
         default_paths.root,
-        std::path::Path::new("/Users/example/Library/Application Support/Hopash RS")
+        std::path::Path::new("/Users/example/Library/Application Support/ratash")
     );
     assert_eq!(
         default_paths.ipc_socket,

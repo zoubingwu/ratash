@@ -10,15 +10,15 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hopash::core::{
+use ratash::core::{
     ApplyCandidateResult, CoreControlEndpoint, CoreRuntime, CoreRuntimeError, CoreRuntimeErrorKind,
     CoreRuntimeStatus, ForwardedCoreLogBatch, OwnerSession, OwnerSessionProof, OwnerSessionRequest,
     RuntimeBundle, StopCoreResult,
 };
-use hopash::core_service_ipc::{CoreServiceServer, CoreServiceServerConfig};
-use hopash::lifecycle::{InstanceRecord, StatePaths};
+use ratash::core_service_ipc::{CoreServiceServer, CoreServiceServerConfig};
+use ratash::lifecycle::{InstanceRecord, StatePaths};
 
-const CORE_SERVICE_SOCKET_ENV: &str = "HOPASH_CORE_SERVICE_SOCKET";
+const CORE_SERVICE_SOCKET_ENV: &str = "RATASH_CORE_SERVICE_SOCKET";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -31,7 +31,7 @@ impl TestDirectory {
     fn new() -> Self {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let path = Path::new("/tmp").join(format!(
-            "hopash-production-lifecycle-{}-{sequence}",
+            "ratash-production-lifecycle-{}-{sequence}",
             std::process::id()
         ));
         fs::create_dir(&path).expect("the lifecycle fixture root should be created");
@@ -202,9 +202,9 @@ impl LifecycleCommands {
         let mut command = Command::new(&self.binary);
         command
             .args(arguments)
-            .env("HOPASH_STATE_DIR", &self.state_root)
+            .env("RATASH_STATE_DIR", &self.state_root)
             .env(CORE_SERVICE_SOCKET_ENV, &self.core_service_socket)
-            .env("HOPASH_MIHOMO_PATH", &self.mihomo_fixture)
+            .env("RATASH_MIHOMO_PATH", &self.mihomo_fixture)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -277,7 +277,7 @@ fn production_binary_lifecycle_is_ready_idempotent_persistent_and_replaces_exact
     )
     .expect("the fake Core service should start");
     let commands = LifecycleCommands {
-        binary: PathBuf::from(env!("CARGO_BIN_EXE_hopash")),
+        binary: PathBuf::from(env!("CARGO_BIN_EXE_ratash")),
         state_root: state_root.clone(),
         core_service_socket: core_service_socket.clone(),
         mihomo_fixture,

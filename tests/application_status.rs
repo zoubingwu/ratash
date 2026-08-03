@@ -1,5 +1,5 @@
-use hopash::application::{ApplicationOperation, ApplicationOutput, ApplicationService};
-use hopash::domain::{CoreLifecycle, SupervisorLifecycle, TunReason};
+use ratash::application::{ApplicationOperation, ApplicationOutput, ApplicationService};
+use ratash::domain::{CoreLifecycle, SupervisorLifecycle, TunReason};
 
 #[test]
 fn new_application_is_ready_with_an_unconfigured_core() {

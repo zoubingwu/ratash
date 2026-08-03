@@ -1,7 +1,7 @@
 use clap::{Command, CommandFactory};
 use clap_complete::{generate_to, shells};
 use clap_mangen::Man;
-use hopash::cli::Cli;
+use ratash::cli::Cli;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -30,12 +30,12 @@ fn generate_assets(root: &Path) -> Result<(), io::Error> {
     let man_pages = root.join("man/man1");
     fs::create_dir_all(&completions)?;
     fs::create_dir_all(&man_pages)?;
-    generate_to(shells::Bash, &mut Cli::command(), "hopash", &completions)?;
-    generate_to(shells::Zsh, &mut Cli::command(), "hopash", &completions)?;
-    let fish = generate_to(shells::Fish, &mut Cli::command(), "hopash", &completions)?;
+    generate_to(shells::Bash, &mut Cli::command(), "ratash", &completions)?;
+    generate_to(shells::Zsh, &mut Cli::command(), "ratash", &completions)?;
+    let fish = generate_to(shells::Fish, &mut Cli::command(), "ratash", &completions)?;
     writeln!(
         OpenOptions::new().append(true).open(fish)?,
-        "complete -c hopash -n \"__fish_hopash_using_subcommand help\" -f -a \"agent\" -d \"Stable operation guidance for AI Agents and scripts\""
+        "complete -c ratash -n \"__fish_ratash_using_subcommand help\" -f -a \"agent\" -d \"Stable operation guidance for AI Agents and scripts\""
     )?;
     generate_man_pages(Cli::command(), &man_pages)?;
     Ok(())
@@ -56,8 +56,8 @@ fn generate_man_pages(mut command: Command, directory: &Path) -> Result<(), io::
     let path = Man::new(command)
         .title(title)
         .date("2026-08-01")
-        .source(format!("Hopash RS {}", env!("CARGO_PKG_VERSION")))
-        .manual("Hopash RS User Commands")
+        .source(format!("Ratash {}", env!("CARGO_PKG_VERSION")))
+        .manual("Ratash User Commands")
         .generate_to(directory)?;
     let content = fs::read_to_string(&path)?;
     let normalized = content
@@ -110,7 +110,7 @@ struct TemporaryDirectory {
 
 impl TemporaryDirectory {
     fn new() -> Result<Self, io::Error> {
-        let path = env::temp_dir().join(format!("hopash-release-assets-{}", uuid::Uuid::new_v4()));
+        let path = env::temp_dir().join(format!("ratash-release-assets-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&path)?;
         Ok(Self { path })
     }

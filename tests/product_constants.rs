@@ -1,6 +1,6 @@
-use hopash::constants::*;
-use hopash::process_controller::NativeCoreProcessConfig;
-use hopash::service::PrivilegedServiceConfig;
+use ratash::constants::*;
+use ratash::process_controller::NativeCoreProcessConfig;
+use ratash::service::PrivilegedServiceConfig;
 use std::path::PathBuf;
 
 #[test]

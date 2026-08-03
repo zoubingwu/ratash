@@ -324,7 +324,7 @@ fn stopped_status(
 fn bootstrap_error() -> ApplicationError {
     ApplicationError::new(
         ErrorCode::Internal,
-        "The Hopash process environment could not be initialized",
+        "The Ratash process environment could not be initialized",
         false,
     )
 }
@@ -450,7 +450,7 @@ impl LogSignalBridge {
         let (stop, stop_receiver) = tokio::sync::oneshot::channel();
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
-            .name("hopash-log-signals".to_owned())
+            .name("ratash-log-signals".to_owned())
             .spawn(move || run_log_signal_worker(cancellation, stop_receiver, ready_sender))?;
         match ready_receiver.recv() {
             Ok(Ok(())) => Ok(Self {

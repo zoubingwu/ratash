@@ -1,8 +1,8 @@
-use hopash::diagnostics::{
+use ratash::diagnostics::{
     WrapperDiagnosticCategory, WrapperDiagnosticContext, WrapperDiagnosticError,
     WrapperDiagnosticRing, WrapperDiagnosticState,
 };
-use hopash::domain::{CoreInstanceGeneration, RuntimeGeneration, SupervisorHealthReason};
+use ratash::domain::{CoreInstanceGeneration, RuntimeGeneration, SupervisorHealthReason};
 
 #[test]
 fn supervisor_health_reasons_map_to_cause_scoped_categories() {

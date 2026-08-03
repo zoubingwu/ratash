@@ -1,4 +1,4 @@
-use hopash::contract::{ApiError, ErrorCode, JsonEnvelope};
+use ratash::contract::{ApiError, ErrorCode, JsonEnvelope};
 
 #[test]
 fn success_envelope_has_a_versioned_machine_contract() {

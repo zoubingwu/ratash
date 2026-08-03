@@ -107,15 +107,15 @@ use foreground::ShutdownControlPort;
 use foreground::expect_status;
 
 pub const INTERNAL_CORE_SERVICE_MODE: &str = "__core-service";
-pub const CORE_SERVICE_SOCKET_PATH: &str = "/var/run/hopash-rs/core-service.sock";
-pub const BUNDLED_MIHOMO_PATH: &str = "/Library/Application Support/Hopash RS/bin/mihomo";
-pub const BUNDLED_GEODATA_PATH: &str = "/Library/Application Support/Hopash RS/share/geodata";
+pub const CORE_SERVICE_SOCKET_PATH: &str = "/var/run/ratash/core-service.sock";
+pub const BUNDLED_MIHOMO_PATH: &str = "/Library/Application Support/ratash/bin/mihomo";
+pub const BUNDLED_GEODATA_PATH: &str = "/Library/Application Support/ratash/share/geodata";
 
-const INSTALLED_HOPASH_PATH: &str = "/usr/local/bin/hopash";
-pub const HOPASH_CODE_IDENTIFIER: &str = "hopash";
+const INSTALLED_RATASH_PATH: &str = "/usr/local/bin/ratash";
+pub const RATASH_CODE_IDENTIFIER: &str = "ratash";
 
 #[cfg(debug_assertions)]
-const DEBUG_CORE_SERVICE_SOCKET_ENV: &str = "HOPASH_CORE_SERVICE_SOCKET";
+const DEBUG_CORE_SERVICE_SOCKET_ENV: &str = "RATASH_CORE_SERVICE_SOCKET";
 
 const OBSERVER_LOG_BATCH: usize = 256;
 
@@ -176,7 +176,7 @@ impl CoreServiceInvocation {
 }
 
 #[derive(Clone, Debug)]
-struct InstalledHopashPeerAuthorizer {
+struct InstalledRatashPeerAuthorizer {
     executable: PathBuf,
     identity: InstalledFileIdentity,
 }
@@ -212,10 +212,10 @@ impl RuntimeConfigurationPolicy for BundledConfigurationPolicy {
     }
 }
 
-impl InstalledHopashPeerAuthorizer {
+impl InstalledRatashPeerAuthorizer {
     #[cfg(target_os = "macos")]
     fn new() -> io::Result<Self> {
-        let expected = PathBuf::from(INSTALLED_HOPASH_PATH);
+        let expected = PathBuf::from(INSTALLED_RATASH_PATH);
         let metadata = fs::symlink_metadata(&expected).map_err(peer_signature_error)?;
         if !metadata.file_type().is_file()
             || metadata.uid() != 0
@@ -223,14 +223,14 @@ impl InstalledHopashPeerAuthorizer {
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "the installed Hopash executable has unsafe ownership or permissions",
+                "the installed Ratash executable has unsafe ownership or permissions",
             ));
         }
         let executable = fs::canonicalize(&expected).map_err(peer_signature_error)?;
         if executable != expected {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "the installed Hopash executable path is not canonical",
+                "the installed Ratash executable path is not canonical",
             ));
         }
         #[cfg(feature = "local-unsigned")]
@@ -240,7 +240,7 @@ impl InstalledHopashPeerAuthorizer {
         let url = CFURL::from_path(&executable, false).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "the installed Hopash executable path is invalid",
+                "the installed Ratash executable path is invalid",
             )
         })?;
         let code =
@@ -266,7 +266,7 @@ impl InstalledHopashPeerAuthorizer {
     }
 }
 
-impl CoreServicePeerAuthorizer for InstalledHopashPeerAuthorizer {
+impl CoreServicePeerAuthorizer for InstalledRatashPeerAuthorizer {
     #[cfg(target_os = "macos")]
     fn authorize(&self, peer: &CoreServicePeerIdentity) -> io::Result<()> {
         let token = peer.audit_token().ok_or_else(|| {
@@ -320,7 +320,7 @@ impl CoreServicePeerAuthorizer for InstalledHopashPeerAuthorizer {
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "the installed Hopash executable changed after service startup",
+                "the installed Ratash executable changed after service startup",
             ));
         }
         Ok(())
@@ -342,7 +342,7 @@ fn validate_local_install_ancestors(executable: &Path) -> io::Result<()> {
         if !metadata.is_dir() || metadata.uid() != 0 || metadata.permissions().mode() & 0o022 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "the installed Hopash path has unsafe ancestor permissions",
+                "the installed Ratash path has unsafe ancestor permissions",
             ));
         }
     }
@@ -369,7 +369,7 @@ fn static_code_validation_flags() -> CodeSigningFlags {
 
 #[cfg(all(target_os = "macos", feature = "local-unsigned"))]
 fn installed_code_requirement() -> io::Result<SecRequirement> {
-    format!("identifier \"{HOPASH_CODE_IDENTIFIER}\"")
+    format!("identifier \"{RATASH_CODE_IDENTIFIER}\"")
         .parse()
         .map_err(peer_signature_error)
 }
@@ -377,7 +377,7 @@ fn installed_code_requirement() -> io::Result<SecRequirement> {
 #[cfg(all(target_os = "macos", not(feature = "local-unsigned")))]
 fn installed_code_requirement() -> io::Result<SecRequirement> {
     format!(
-        "anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate 1[field.1.2.840.113635.100.6.2.6] exists and identifier \"{HOPASH_CODE_IDENTIFIER}\""
+        "anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate 1[field.1.2.840.113635.100.6.2.6] exists and identifier \"{RATASH_CODE_IDENTIFIER}\""
     )
         .parse()
         .map_err(peer_signature_error)
@@ -388,7 +388,7 @@ fn peer_signature_error(error: impl fmt::Debug) -> io::Error {
     let _ = error;
     io::Error::new(
         io::ErrorKind::PermissionDenied,
-        "the installed Hopash signature is invalid",
+        "the installed Ratash signature is invalid",
     )
 }
 
@@ -430,7 +430,7 @@ pub fn run_core_service(invocation: CoreServiceInvocation) -> io::Result<()> {
             "the privileged Core service requires root privileges",
         ));
     }
-    let peer_authorizer = Arc::new(InstalledHopashPeerAuthorizer::new()?);
+    let peer_authorizer = Arc::new(InstalledRatashPeerAuthorizer::new()?);
     let compiler = ConfigCompiler::bundled().map_err(invalid_product_configuration)?;
     let geodata = GeoDataCatalog::bundled().map_err(invalid_product_configuration)?;
     let compiler_policy_sha256 = compiler.compiler_policy_sha256().to_owned();
@@ -1309,7 +1309,7 @@ impl SupervisorObserver {
         let shutdown = Arc::new(WakeSignal::default());
         let worker_shutdown = Arc::clone(&shutdown);
         let thread = thread::Builder::new()
-            .name("hopash-observer".to_owned())
+            .name("ratash-observer".to_owned())
             .spawn(move || observer_loop(dependencies, worker_shutdown))?;
         Ok(Self {
             shutdown,
@@ -1577,7 +1577,7 @@ fn readiness_failure_from_daemon(error: &DaemonError) -> ReadinessFailure {
 }
 
 fn bundled_mihomo_path() -> io::Result<PathBuf> {
-    let path = std::env::var_os("HOPASH_MIHOMO_PATH")
+    let path = std::env::var_os("RATASH_MIHOMO_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(BUNDLED_MIHOMO_PATH));
     if path.is_absolute() {

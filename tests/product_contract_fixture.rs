@@ -1,9 +1,9 @@
-use hopash::config::BUNDLED_CORE_VERSION;
-use hopash::constants::*;
-use hopash::contract::SCHEMA_VERSION;
-use hopash::core::PROXY_VIEW_SCHEMA_VERSION;
-use hopash::error::ProcessExitCode;
-use hopash::ipc::IPC_PROTOCOL_VERSION;
+use ratash::config::BUNDLED_CORE_VERSION;
+use ratash::constants::*;
+use ratash::contract::SCHEMA_VERSION;
+use ratash::core::PROXY_VIEW_SCHEMA_VERSION;
+use ratash::error::ProcessExitCode;
+use ratash::ipc::IPC_PROTOCOL_VERSION;
 use serde_json::Value;
 
 fn fixture() -> Value {

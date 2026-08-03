@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ratash"
+  short_description: "Operate Ratash safely through its CLI"
+  default_prompt: "Use $ratash to inspect Ratash status and perform one precise operation."

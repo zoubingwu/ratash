@@ -1,8 +1,8 @@
-use hopash::config::{
+use ratash::config::{
     AuthoritativeConfig, ConfigCompiler, ConfigError, CoreConfigValidator, CoreValidationError,
     EffectiveConfiguration, ProviderKind, ProviderSection,
 };
-use hopash::profile::{ProfileSnapshot, SnapshotLimits};
+use ratash::profile::{ProfileSnapshot, SnapshotLimits};
 use serde_yaml_ng::Value;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
@@ -15,7 +15,7 @@ fn snapshot(yaml: &str) -> ProfileSnapshot {
 
 fn temporary_root(test_name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
-        "hopash-{test_name}-{}-{}",
+        "ratash-{test_name}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -87,7 +87,7 @@ rules:
         "DOMAIN,example.com,DIRECT".to_owned(),
         "MATCH,Main".to_owned(),
     ];
-    let authoritative = AuthoritativeConfig::new("/private/tmp/hopash-core.sock", "runtime-secret");
+    let authoritative = AuthoritativeConfig::new("/private/tmp/ratash-core.sock", "runtime-secret");
     let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
 
     let effective = compiler
@@ -125,7 +125,7 @@ rules:
     assert_eq!(document.get("interface-name"), None);
     assert_eq!(
         document["external-controller-unix"].as_str(),
-        Some("/private/tmp/hopash-core.sock")
+        Some("/private/tmp/ratash-core.sock")
     );
     assert_eq!(document["secret"].as_str(), Some("runtime-secret"));
     assert_eq!(
@@ -216,7 +216,7 @@ proxy-providers:
 }
 
 #[test]
-fn policy_enforces_hopash_owned_record_shapes() {
+fn policy_enforces_ratash_owned_record_shapes() {
     let staging_root = temporary_root("policy-shapes");
     let compiler = ConfigCompiler::bundled().expect("the bundled policy should load");
     let authoritative = AuthoritativeConfig::new("/tmp/core.sock", "secret");

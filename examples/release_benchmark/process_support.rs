@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
-use hopash::tui_runtime::ShutdownSignal;
+use ratash::tui_runtime::ShutdownSignal;
 
 use super::CHILD_CLEANUP_TIMEOUT;
 use super::support::{ensure_collection_running, invalid};

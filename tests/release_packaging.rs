@@ -1,4 +1,4 @@
-use hopash::constants::{
+use ratash::constants::{
     CORE_RESTART_INITIAL_BACKOFF, CORE_RESTART_LIMIT, CORE_RESTART_MAX_BACKOFF,
     CORE_SERVICE_LIVENESS_INTERVAL,
 };
@@ -97,24 +97,24 @@ fn release_contract_pins_both_macos_installers_and_core_artifacts() {
         serde_json::from_str(PACKAGE_CONTRACT).expect("package contract should be valid JSON");
 
     assert_eq!(package["schema_version"], 1);
-    assert_eq!(package["package_identifier"], "io.hopash.rs");
-    assert_eq!(package["service_label"], "io.hopash.core-runtime");
+    assert_eq!(package["package_identifier"], "io.ratash");
+    assert_eq!(package["service_label"], "io.ratash.core-runtime");
     assert_eq!(package["mihomo_version"], product["mihomo_version"]);
     assert_eq!(
         package["paths"]["mihomo"],
-        "/Library/Application Support/Hopash RS/bin/mihomo"
+        "/Library/Application Support/ratash/bin/mihomo"
     );
     assert_eq!(
         package["paths"]["service_socket"],
-        "/var/run/hopash-rs/core-service.sock"
+        "/var/run/ratash/core-service.sock"
     );
     assert_eq!(
         package["paths"]["geodata"],
-        "/Library/Application Support/Hopash RS/share/geodata"
+        "/Library/Application Support/ratash/share/geodata"
     );
     assert_eq!(
         package["geodata"]["manifest"],
-        "/usr/local/share/hopash/release/geodata-manifest.json"
+        "/usr/local/share/ratash/release/geodata-manifest.json"
     );
     assert_eq!(
         package["geodata"]["files"],
@@ -158,17 +158,17 @@ fn release_contract_pins_both_macos_installers_and_core_artifacts() {
 #[test]
 fn package_staging_contains_the_complete_installation_contract() {
     let fixture = TempDirectory::new("package-stage");
-    let hopash = fixture.path.join("hopash");
+    let ratash = fixture.path.join("ratash");
     let mihomo = fixture.path.join("mihomo");
     let mihomo_license = fixture.path.join("Mihomo-GPL-3.0.txt");
     let geodata = write_geodata_fixture(&fixture.path);
-    fs::write(&hopash, b"fixture hopash executable")
-        .expect("fixture Hopash executable should be written");
+    fs::write(&ratash, b"fixture ratash executable")
+        .expect("fixture Ratash executable should be written");
     fs::write(&mihomo, b"fixture Mihomo executable")
         .expect("fixture Mihomo executable should be written");
     fs::write(&mihomo_license, b"fixture GPL-3.0 license")
         .expect("fixture Mihomo license should be written");
-    set_mode(&hopash, 0o755);
+    set_mode(&ratash, 0o755);
     set_mode(&mihomo, 0o755);
     let stage = fixture.path.join("stage");
     let digest = hex_digest(&fs::read(&mihomo).expect("fixture Mihomo should be readable"));
@@ -178,8 +178,8 @@ fn package_staging_contains_the_complete_installation_contract() {
         .arg(project_path("scripts/package-macos.sh"))
         .args(["--version", "0.1.0"])
         .args(["--target", "aarch64-apple-darwin"])
-        .arg("--hopash")
-        .arg(&hopash)
+        .arg("--ratash")
+        .arg(&ratash)
         .arg("--mihomo")
         .arg(&mihomo)
         .args(["--mihomo-sha256", &digest])
@@ -199,10 +199,10 @@ fn package_staging_contains_the_complete_installation_contract() {
     );
 
     for executable in [
-        "payload/usr/local/bin/hopash",
-        "payload/Library/PrivilegedHelperTools/io.hopash.core-runtime",
-        "payload/Library/Application Support/Hopash RS/bin/mihomo",
-        "payload/usr/local/share/hopash/uninstall.sh",
+        "payload/usr/local/bin/ratash",
+        "payload/Library/PrivilegedHelperTools/io.ratash.core-runtime",
+        "payload/Library/Application Support/ratash/bin/mihomo",
+        "payload/usr/local/share/ratash/uninstall.sh",
     ] {
         let path = stage.join(executable);
         assert!(path.is_file(), "missing {}", path.display());
@@ -210,25 +210,25 @@ fn package_staging_contains_the_complete_installation_contract() {
     }
 
     for asset in [
-        "payload/usr/local/share/man/man1/hopash.1",
-        "payload/usr/local/share/man/man1/hopash-profile-add.1",
-        "payload/usr/local/share/bash-completion/completions/hopash",
-        "payload/usr/local/share/zsh/site-functions/_hopash",
-        "payload/usr/local/share/fish/vendor_completions.d/hopash.fish",
-        "payload/usr/local/share/hopash/skills/hopash/SKILL.md",
-        "payload/usr/local/share/hopash/release/product-contract-v1.json",
-        "payload/usr/local/share/hopash/release/benchmark-metadata-v1.json",
-        "payload/usr/local/share/hopash/release/package-contract-v1.json",
-        "payload/usr/local/share/hopash/release/geodata-manifest.json",
-        "payload/usr/local/share/hopash/licenses/Mihomo-GPL-3.0.txt",
-        "payload/usr/local/share/hopash/licenses/Mihomo-NOTICE.txt",
-        "payload/usr/local/share/hopash/licenses/MetaCubeX-meta-rules-dat-GPL-3.0.txt",
-        "payload/usr/local/share/hopash/licenses/GeoData-NOTICE.txt",
-        "payload/Library/Application Support/Hopash RS/share/geodata/ASN.mmdb",
-        "payload/Library/Application Support/Hopash RS/share/geodata/Country.mmdb",
-        "payload/Library/Application Support/Hopash RS/share/geodata/GeoIP.dat",
-        "payload/Library/Application Support/Hopash RS/share/geodata/GeoSite.dat",
-        "payload/Library/LaunchDaemons/io.hopash.core-runtime.plist",
+        "payload/usr/local/share/man/man1/ratash.1",
+        "payload/usr/local/share/man/man1/ratash-profile-add.1",
+        "payload/usr/local/share/bash-completion/completions/ratash",
+        "payload/usr/local/share/zsh/site-functions/_ratash",
+        "payload/usr/local/share/fish/vendor_completions.d/ratash.fish",
+        "payload/usr/local/share/ratash/skills/ratash/SKILL.md",
+        "payload/usr/local/share/ratash/release/product-contract-v1.json",
+        "payload/usr/local/share/ratash/release/benchmark-metadata-v1.json",
+        "payload/usr/local/share/ratash/release/package-contract-v1.json",
+        "payload/usr/local/share/ratash/release/geodata-manifest.json",
+        "payload/usr/local/share/ratash/licenses/Mihomo-GPL-3.0.txt",
+        "payload/usr/local/share/ratash/licenses/Mihomo-NOTICE.txt",
+        "payload/usr/local/share/ratash/licenses/MetaCubeX-meta-rules-dat-GPL-3.0.txt",
+        "payload/usr/local/share/ratash/licenses/GeoData-NOTICE.txt",
+        "payload/Library/Application Support/ratash/share/geodata/ASN.mmdb",
+        "payload/Library/Application Support/ratash/share/geodata/Country.mmdb",
+        "payload/Library/Application Support/ratash/share/geodata/GeoIP.dat",
+        "payload/Library/Application Support/ratash/share/geodata/GeoSite.dat",
+        "payload/Library/LaunchDaemons/io.ratash.core-runtime.plist",
         "scripts/postinstall",
     ] {
         let path = stage.join(asset);
@@ -247,7 +247,7 @@ fn package_staging_contains_the_complete_installation_contract() {
     }
 
     let plist = fs::read_to_string(
-        stage.join("payload/Library/LaunchDaemons/io.hopash.core-runtime.plist"),
+        stage.join("payload/Library/LaunchDaemons/io.ratash.core-runtime.plist"),
     )
     .expect("staged LaunchDaemon should be readable");
     for required in [
@@ -255,11 +255,11 @@ fn package_staging_contains_the_complete_installation_contract() {
         "--owner-uid",
         "@OWNER_UID@",
         "--socket",
-        "/var/run/hopash-rs/core-service.sock",
+        "/var/run/ratash/core-service.sock",
         "--runtime-root",
-        "/Library/Application Support/Hopash RS/runtime",
+        "/Library/Application Support/ratash/runtime",
         "--mihomo",
-        "/Library/Application Support/Hopash RS/bin/mihomo",
+        "/Library/Application Support/ratash/bin/mihomo",
         "<key>ExitTimeOut</key>",
         "<integer>50</integer>",
     ] {
@@ -270,12 +270,12 @@ fn package_staging_contains_the_complete_installation_contract() {
 #[test]
 fn package_builder_rejects_missing_symlinked_and_changed_geodata_assets() {
     let fixture = TempDirectory::new("package-geodata-verification");
-    let hopash = fixture.path.join("hopash");
+    let ratash = fixture.path.join("ratash");
     let mihomo = fixture.path.join("mihomo");
     let mihomo_license = fixture.path.join("Mihomo-GPL-3.0.txt");
     let geodata = write_geodata_fixture(&fixture.path);
-    fs::write(&hopash, b"fixture hopash executable")
-        .expect("fixture Hopash executable should be written");
+    fs::write(&ratash, b"fixture ratash executable")
+        .expect("fixture Ratash executable should be written");
     fs::write(&mihomo, b"fixture Mihomo executable")
         .expect("fixture Mihomo executable should be written");
     fs::write(&mihomo_license, b"fixture GPL-3.0 license")
@@ -287,8 +287,8 @@ fn package_builder_rejects_missing_symlinked_and_changed_geodata_assets() {
             .arg(project_path("scripts/package-macos.sh"))
             .args(["--version", "0.1.0"])
             .args(["--target", "aarch64-apple-darwin"])
-            .arg("--hopash")
-            .arg(&hopash)
+            .arg("--ratash")
+            .arg(&ratash)
             .arg("--mihomo")
             .arg(&mihomo)
             .args(["--mihomo-sha256", &mihomo_digest])
@@ -296,7 +296,7 @@ fn package_builder_rejects_missing_symlinked_and_changed_geodata_assets() {
             .arg(&mihomo_license);
         add_geodata_arguments(&mut command, &geodata);
         if !allow_custom_manifest {
-            command.env_remove("HOPASH_TEST_ALLOW_CUSTOM_GEODATA_MANIFEST");
+            command.env_remove("RATASH_TEST_ALLOW_CUSTOM_GEODATA_MANIFEST");
         }
         command
             .arg("--stage-only")
@@ -364,21 +364,21 @@ fn postinstall_waits_for_a_booted_out_service_before_bootstrap() {
 
     let uninstaller = fs::read_to_string(project_path("packaging/macos/uninstall.sh"))
         .expect("uninstaller should be readable");
-    assert!(uninstaller.contains("'/Library/Application Support/Hopash RS'"));
+    assert!(uninstaller.contains("'/Library/Application Support/ratash'"));
 }
 
 #[test]
 fn package_builder_rejects_a_custom_manifest_for_installable_output() {
     let fixture = TempDirectory::new("package-build");
-    let hopash = fixture.path.join("hopash");
+    let ratash = fixture.path.join("ratash");
     let mihomo = fixture.path.join("mihomo");
     let mihomo_license = fixture.path.join("Mihomo-GPL-3.0.txt");
     let geodata = write_geodata_fixture(&fixture.path);
-    fs::write(&hopash, b"#!/bin/sh\nexit 0\n").expect("fixture Hopash should be written");
+    fs::write(&ratash, b"#!/bin/sh\nexit 0\n").expect("fixture Ratash should be written");
     fs::write(&mihomo, b"#!/bin/sh\nexit 0\n").expect("fixture Mihomo should be written");
     fs::write(&mihomo_license, b"fixture GPL-3.0 license")
         .expect("fixture Mihomo license should be written");
-    set_mode(&hopash, 0o755);
+    set_mode(&ratash, 0o755);
     set_mode(&mihomo, 0o755);
     let digest = hex_digest(&fs::read(&mihomo).expect("fixture Mihomo should be readable"));
     let output_directory = fixture.path.join("dist");
@@ -388,8 +388,8 @@ fn package_builder_rejects_a_custom_manifest_for_installable_output() {
         .arg(project_path("scripts/package-macos.sh"))
         .args(["--version", "0.1.0"])
         .args(["--target", "aarch64-apple-darwin"])
-        .arg("--hopash")
-        .arg(&hopash)
+        .arg("--ratash")
+        .arg(&ratash)
         .arg("--mihomo")
         .arg(&mihomo)
         .args(["--mihomo-sha256", &digest])
@@ -412,10 +412,10 @@ fn package_builder_rejects_a_custom_manifest_for_installable_output() {
 #[test]
 fn generated_shell_and_manual_assets_cover_only_the_public_command_surface() {
     let assets = [
-        project_path("packaging/generated/completions/hopash.bash"),
-        project_path("packaging/generated/completions/_hopash"),
-        project_path("packaging/generated/completions/hopash.fish"),
-        project_path("packaging/generated/man/man1/hopash.1"),
+        project_path("packaging/generated/completions/ratash.bash"),
+        project_path("packaging/generated/completions/_ratash"),
+        project_path("packaging/generated/completions/ratash.fish"),
+        project_path("packaging/generated/man/man1/ratash.1"),
     ];
     for path in assets {
         let content = fs::read_to_string(&path)
@@ -494,7 +494,7 @@ fn release_metadata_names_every_required_resource_measurement() {
     );
     assert_eq!(
         metadata["workload_generator"]["name"],
-        "hopash-release-workload"
+        "ratash-release-workload"
     );
     assert_eq!(metadata["workload_generator"]["version"], 2);
     assert_eq!(
@@ -701,11 +701,11 @@ fn benchmark_capture_scripts_enforce_provenance_and_complete_wakeup_samples() {
 #[test]
 fn package_builder_rejects_partial_signing_configuration_before_staging() {
     let fixture = TempDirectory::new("partial-signing");
-    let hopash = fixture.path.join("hopash");
+    let ratash = fixture.path.join("ratash");
     let mihomo = fixture.path.join("mihomo");
     let mihomo_license = fixture.path.join("Mihomo-GPL-3.0.txt");
     let geodata = write_geodata_fixture(&fixture.path);
-    fs::write(&hopash, b"fixture hopash").expect("fixture Hopash should be written");
+    fs::write(&ratash, b"fixture ratash").expect("fixture Ratash should be written");
     fs::write(&mihomo, b"fixture mihomo").expect("fixture Mihomo should be written");
     fs::write(&mihomo_license, b"fixture license")
         .expect("fixture Mihomo license should be written");
@@ -716,8 +716,8 @@ fn package_builder_rejects_partial_signing_configuration_before_staging() {
         .arg(project_path("scripts/package-macos.sh"))
         .args(["--version", "0.1.0"])
         .args(["--target", "aarch64-apple-darwin"])
-        .arg("--hopash")
-        .arg(&hopash)
+        .arg("--ratash")
+        .arg(&ratash)
         .arg("--mihomo")
         .arg(&mihomo)
         .args(["--mihomo-sha256", &digest])
@@ -744,13 +744,13 @@ fn readme_stays_user_facing_and_documents_the_installed_workflow() {
     for required in [
         "## Installation",
         "## Project Status",
-        "HOPASH_OWNER_UID",
+        "RATASH_OWNER_UID",
         "shasum -a 256",
         "## Shell Completion",
         "## Uninstall",
-        "hopash start",
-        "hopash status",
-        "hopash help agent",
+        "ratash start",
+        "ratash status",
+        "ratash help agent",
         "package-local-macos.sh",
         "local-unsigned",
     ] {
@@ -872,7 +872,7 @@ fn write_geodata_fixture(root: &Path) -> GeodataFixture {
 
 fn add_geodata_arguments(command: &mut Command, fixture: &GeodataFixture) {
     command
-        .env("HOPASH_TEST_ALLOW_CUSTOM_GEODATA_MANIFEST", "1")
+        .env("RATASH_TEST_ALLOW_CUSTOM_GEODATA_MANIFEST", "1")
         .arg("--geodata-directory")
         .arg(&fixture.directory)
         .arg("--geodata-manifest")
@@ -887,7 +887,7 @@ struct TempDirectory {
 
 impl TempDirectory {
     fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("hopash-{label}-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("ratash-{label}-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&path).expect("temporary directory should be created");
         Self { path }
     }

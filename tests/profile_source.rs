@@ -1,6 +1,6 @@
-use hopash::domain::SubscriptionUrl;
-use hopash::profile::{ProfileSnapshot, RefreshStage, SnapshotLimits};
-use hopash::profile_source::{
+use ratash::domain::SubscriptionUrl;
+use ratash::profile::{ProfileSnapshot, RefreshStage, SnapshotLimits};
+use ratash::profile_source::{
     DownloadErrorKind, ProfileSource, ProfileSourcePolicy, ReqwestProfileSource,
 };
 use std::sync::Arc;

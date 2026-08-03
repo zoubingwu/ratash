@@ -1,6 +1,6 @@
-use hopash::application::{ApplicationService, Clock};
-use hopash::contract::{JsonEnvelope, StatusViewV1};
-use hopash::domain::{
+use ratash::application::{ApplicationService, Clock};
+use ratash::contract::{JsonEnvelope, StatusViewV1};
+use ratash::domain::{
     ApplyState, CoreDiagnosticCategory, CoreLifecycle, CoreRestartStatus, RuntimeApplyPhase,
     RuntimeApplySnapshot, RuntimeGeneration, RuntimeRecoverySnapshot, RuntimeRecoveryStatus,
     SupervisorHealthReason, SupervisorLifecycle,

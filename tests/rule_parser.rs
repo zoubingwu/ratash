@@ -1,5 +1,5 @@
-use hopash::domain::LocalRuleSetRevision;
-use hopash::rule::{
+use ratash::domain::LocalRuleSetRevision;
+use ratash::rule::{
     LocalRuleSet, ParsedRule, RuleDocumentError, RulePlacement, RuleSetError, RuleSetLimits,
     RuleString, RuleStringError, RuleType, parse_rule,
 };
@@ -16,15 +16,15 @@ fn product_limits_are_sourced_from_the_shared_release_contract() {
 
     assert_eq!(
         limits.max_document_bytes,
-        hopash::constants::LOCAL_RULE_SET_MAX_BYTES
+        ratash::constants::LOCAL_RULE_SET_MAX_BYTES
     );
     assert_eq!(
         limits.max_rule_bytes,
-        hopash::constants::RULE_STRING_MAX_BYTES
+        ratash::constants::RULE_STRING_MAX_BYTES
     );
     assert_eq!(
         limits.max_rule_count,
-        hopash::constants::LOCAL_RULE_COUNT_MAX
+        ratash::constants::LOCAL_RULE_COUNT_MAX
     );
 }
 
@@ -461,7 +461,7 @@ fn mutation_rejects_an_unparseable_candidate_before_changing_state() {
     assert_eq!(
         result,
         Err(RuleSetError::InvalidRule(
-            hopash::rule::RuleParseError::UnsupportedRuleType("UNKNOWN".to_owned())
+            ratash::rule::RuleParseError::UnsupportedRuleType("UNKNOWN".to_owned())
         ))
     );
     assert_eq!(rules.list().unwrap().entries[0].rule, &existing);
@@ -507,7 +507,7 @@ fn failed_and_idempotent_mutations_preserve_the_revision_and_rules() {
     assert_eq!(
         rules.add(invalid, RulePlacement::Append),
         Err(RuleSetError::InvalidRule(
-            hopash::rule::RuleParseError::UnsupportedRuleType("UNKNOWN".to_owned())
+            ratash::rule::RuleParseError::UnsupportedRuleType("UNKNOWN".to_owned())
         ))
     );
     assert_eq!(rules.remove(&missing), Err(RuleSetError::RuleNotFound));

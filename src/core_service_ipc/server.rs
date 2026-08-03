@@ -182,7 +182,7 @@ impl CoreServiceServer {
         });
         let thread_accept_metrics = CoreServiceAcceptMetrics::default();
         let thread = match thread::Builder::new()
-            .name("hopash-core-service-accept".to_owned())
+            .name("ratash-core-service-accept".to_owned())
             .spawn(move || {
                 run_server(
                     listener,
@@ -439,7 +439,7 @@ fn spawn_workers(
             let context = Arc::clone(&context);
             let shutdown = Arc::clone(&shutdown);
             thread::Builder::new()
-                .name(format!("hopash-core-service-worker-{index}"))
+                .name(format!("ratash-core-service-worker-{index}"))
                 .spawn(move || worker_loop(receiver, context, io_timeout, shutdown))
         })
         .collect()
@@ -787,7 +787,7 @@ mod accept_loop_tests {
                 protocol_version: CORE_RUNTIME_PROTOCOL_VERSION,
                 owner_generation: 1,
                 endpoint: CoreControlEndpoint::new(
-                    PathBuf::from("/private/tmp/hopash-deadline-core.sock"),
+                    PathBuf::from("/private/tmp/ratash-deadline-core.sock"),
                     "fixture-secret",
                 ),
             };

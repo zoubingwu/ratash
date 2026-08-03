@@ -337,7 +337,7 @@ impl ProcessSignalSource {
         let wake = Arc::new(Mutex::new(None));
         let worker_wake = Arc::clone(&wake);
         let worker = thread::Builder::new()
-            .name("hopash-tui-signals".to_owned())
+            .name("ratash-tui-signals".to_owned())
             .spawn(move || {
                 run_signal_worker(worker_requested, worker_wake, stop_receiver, ready_sender);
             })
@@ -527,7 +527,7 @@ impl CrosstermEventSource {
         let worker_buffer = Arc::clone(&buffer);
         let worker_wake = Arc::clone(&wake);
         let worker = thread::Builder::new()
-            .name("hopash-tui-terminal-events".to_owned())
+            .name("ratash-tui-terminal-events".to_owned())
             .spawn(move || run_terminal_event_worker(worker_buffer, worker_wake, stop_receiver))
             .map_err(|_| {
                 StatusInterfaceError::new(

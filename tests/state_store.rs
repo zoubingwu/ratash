@@ -1,13 +1,13 @@
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use hopash::domain::{NodeRecordId, ProfileId, RuntimeGeneration, SubscriptionUrl};
-use hopash::profile::{
+use ratash::domain::{NodeRecordId, ProfileId, RuntimeGeneration, SubscriptionUrl};
+use ratash::profile::{
     Profile, ProfileCatalog, ProfileRevision, ProfileSnapshot, RefreshFailure, RefreshStage,
     SnapshotLimits,
 };
-use hopash::rule::{LocalRuleSet, RuleSetLimits, RuleString};
-use hopash::state::{AuthoritativeState, AuthoritativeStateStore, StateStoreErrorKind};
+use ratash::rule::{LocalRuleSet, RuleSetLimits, RuleString};
+use ratash::state::{AuthoritativeState, AuthoritativeStateStore, StateStoreErrorKind};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -19,7 +19,7 @@ impl TestDirectory {
     fn new() -> Self {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "hopash-state-store-{}-{sequence}",
+            "ratash-state-store-{}-{sequence}",
             std::process::id()
         ));
         fs::create_dir(&path).expect("test directory should be created");

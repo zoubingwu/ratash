@@ -1,7 +1,7 @@
-# Hopash RS Compact TUI Prototype
+# Ratash Compact TUI Prototype
 
 > **PROTOTYPE — review artifact.** This document tests one design question before implementation:
-> can Hopash make status, proxy selection, and troubleshooting fast with a border-light layout,
+> can Ratash make status, proxy selection, and troubleshooting fast with a border-light layout,
 > while remaining useful at 80×24?
 
 ## Direction

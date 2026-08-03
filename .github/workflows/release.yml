@@ -48,7 +48,7 @@ jobs:
           cargo run --locked --example generate-release-assets -- --check
       - name: Enforce the approved resource benchmark gate
         run: cargo run --locked --release --example release-benchmark -- validate fixtures/release/benchmark-metadata-v1.json --require-approved
-      - name: Build Hopash RS
+      - name: Build Ratash
         run: cargo build --locked --release --no-default-features --target "${{ matrix.target }}"
       - name: Download and verify the pinned Mihomo Core
         shell: bash
@@ -72,7 +72,7 @@ jobs:
           test -n "$MACOS_CERTIFICATE_P12"
           test -n "$MACOS_CERTIFICATE_PASSWORD"
           test -n "$KEYCHAIN_PASSWORD"
-          keychain="$RUNNER_TEMP/hopash-signing.keychain-db"
+          keychain="$RUNNER_TEMP/ratash-signing.keychain-db"
           printf '%s' "$MACOS_CERTIFICATE_P12" | /usr/bin/base64 -D >"$RUNNER_TEMP/signing.p12"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
           security set-keychain-settings -lut 21600 "$keychain"
@@ -122,12 +122,12 @@ jobs:
           set -euo pipefail
           test -n "$APPLICATION_IDENTITY"
           test -n "$INSTALLER_IDENTITY"
-          unset HOPASH_TEST_ALLOW_CUSTOM_GEODATA_MANIFEST
+          unset RATASH_TEST_ALLOW_CUSTOM_GEODATA_MANIFEST
           mkdir -p dist
           ./scripts/package-macos.sh \
             --version '${{ steps.release.outputs.version }}' \
             --target '${{ matrix.target }}' \
-            --hopash 'target/${{ matrix.target }}/release/hopash' \
+            --ratash 'target/${{ matrix.target }}/release/ratash' \
             --mihomo "$RUNNER_TEMP/mihomo" \
             --mihomo-sha256 "$(shasum -a 256 "$RUNNER_TEMP/mihomo" | awk '{print $1}')" \
             --mihomo-license "$RUNNER_TEMP/Mihomo-GPL-3.0.txt" \
@@ -148,7 +148,7 @@ jobs:
           test -n "$APPLE_ID"
           test -n "$APPLE_TEAM_ID"
           test -n "$APPLE_APP_PASSWORD"
-          package="dist/hopash-${{ steps.release.outputs.version }}-${{ matrix.target }}.pkg"
+          package="dist/ratash-${{ steps.release.outputs.version }}-${{ matrix.target }}.pkg"
           xcrun notarytool submit "$package" \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
@@ -165,7 +165,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          wrapper_bytes=$(stat -f '%z' 'target/${{ matrix.target }}/release/hopash')
+          wrapper_bytes=$(stat -f '%z' 'target/${{ matrix.target }}/release/ratash')
           jq \
             --arg target '${{ matrix.target }}' \
             --argjson wrapper_binary_bytes "$wrapper_bytes" \
@@ -181,7 +181,7 @@ jobs:
       - name: Upload the release bundle
         uses: actions/upload-artifact@v4
         with:
-          name: hopash-${{ matrix.target }}
+          name: ratash-${{ matrix.target }}
           path: dist/
           if-no-files-found: error
 
@@ -193,7 +193,7 @@ jobs:
       - name: Download release bundles
         uses: actions/download-artifact@v4
         with:
-          pattern: hopash-*
+          pattern: ratash-*
           path: dist
           merge-multiple: true
       - name: Write release notes
@@ -208,7 +208,7 @@ jobs:
               echo "- $(basename "$package"): $bytes bytes"
             done
             echo
-            echo 'Each installer contains the same signed Hopash executable for the public CLI, Supervisor, and privileged service entry points. Per-target binary size and the approved versioned resource benchmark results are attached as benchmark metadata.'
+            echo 'Each installer contains the same signed Ratash executable for the public CLI, Supervisor, and privileged service entry points. Per-target binary size and the approved versioned resource benchmark results are attached as benchmark metadata.'
           } >release-notes.md
       - name: Publish the corresponding GPL sources
         shell: bash

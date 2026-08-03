@@ -1,4 +1,4 @@
-use hopash::contract::{ErrorCode, ProcessExitCode};
+use ratash::contract::{ErrorCode, ProcessExitCode};
 
 #[test]
 fn public_error_codes_map_to_stable_process_exit_classes() {

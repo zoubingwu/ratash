@@ -1,4 +1,4 @@
-use hopash::domain::{NodeRecordId, ProfileId, ProxyGroupId, SubscriptionUrl};
+use ratash::domain::{NodeRecordId, ProfileId, ProxyGroupId, SubscriptionUrl};
 
 #[test]
 fn subscription_url_accepts_http_and_https_at_the_domain_boundary() {
@@ -16,7 +16,7 @@ fn subscription_url_accepts_http_and_https_at_the_domain_boundary() {
     assert!(SubscriptionUrl::parse("https://?token=secret").is_err());
     let oversized = format!(
         "https://example.test/{}",
-        "a".repeat(hopash::constants::SUBSCRIPTION_URL_MAX_BYTES)
+        "a".repeat(ratash::constants::SUBSCRIPTION_URL_MAX_BYTES)
     );
     assert!(SubscriptionUrl::parse(&oversized).is_err());
 }
@@ -91,6 +91,10 @@ fn node_record_ids_are_deterministic_and_source_aware() {
     );
     assert_ne!(core, provider_a);
     assert_ne!(provider_a, provider_b);
+    assert_eq!(
+        core.as_str(),
+        "node_v1_49e7f2b1a0de14015972d446f0bc4db8e951e813de1f69b3467e7bb8a1c9e1e9"
+    );
     assert!(core.as_str().starts_with("node_v1_"));
     assert_eq!(core.as_str().len(), "node_v1_".len() + 64);
     assert!(!core.as_str().contains("Shared Node"));
@@ -108,7 +112,7 @@ fn proxy_group_ids_are_stable_opaque_and_round_trip_through_text() {
 
     assert_eq!(
         automatic.as_str(),
-        "group_v1_d06398df81b2e85f5b7b89ec63befdda5d65ad8ebbd9a9da46eda1d0d61b0b6e"
+        "group_v1_3ccb994cc84c2cea481bc0515bdf491c30cd73519e1efe873c95e9b148a3ed90"
     );
     assert_eq!(automatic, ProxyGroupId::for_name("Automatic"));
     assert_ne!(automatic, ProxyGroupId::for_name("automatic"));

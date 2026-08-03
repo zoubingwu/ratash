@@ -185,7 +185,7 @@ impl ShutdownIpcServer {
         let handler: Arc<dyn ShutdownControlHandler> = handler;
         let authorizer: Arc<dyn PeerAuthorizer> = authorizer;
         let thread = match thread::Builder::new()
-            .name("hopash-shutdown-ipc".to_owned())
+            .name("ratash-shutdown-ipc".to_owned())
             .spawn(move || {
                 run_server(
                     listener,
@@ -384,7 +384,7 @@ fn spawn_workers(
             let shutdown = Arc::clone(&shutdown);
             let active_connections = Arc::clone(&active_connections);
             thread::Builder::new()
-                .name(format!("hopash-shutdown-worker-{index}"))
+                .name(format!("ratash-shutdown-worker-{index}"))
                 .spawn(move || {
                     worker_loop(receiver, handler, io_timeout, shutdown, active_connections)
                 })

@@ -258,7 +258,7 @@ impl BackgroundCommandDispatcher {
             let worker_wait_returns = Arc::clone(&worker_wait_returns);
             let worker_sources = sources.clone();
             let worker = thread::Builder::new()
-                .name(format!("hopash-tui-command-{index}"))
+                .name(format!("ratash-tui-command-{index}"))
                 .spawn(move || {
                     command_worker(CommandWorkerContext {
                         receiver,

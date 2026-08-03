@@ -11,9 +11,9 @@ use nix::unistd::Pid;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::{Map, Value, json};
 
-use hopash::domain::{NodeRecordId, ProfileId};
-use hopash::lifecycle::{ProcessIdentity, ProcessInspector, PsProcessInspector};
-use hopash::tui_runtime::ShutdownSignal;
+use ratash::domain::{NodeRecordId, ProfileId};
+use ratash::lifecycle::{ProcessIdentity, ProcessInspector, PsProcessInspector};
+use ratash::tui_runtime::ShutdownSignal;
 
 use super::collection::capture_results_with_environment;
 use super::metadata::validate_metadata;
@@ -136,7 +136,7 @@ fn approved_metadata_enforces_thresholds_and_regression_budgets() {
         "schema_version": 1,
         "status": "review_required",
         "capture_tool": {
-            "name": "hopash-release-benchmark",
+            "name": "ratash-release-benchmark",
             "version": CAPTURE_TOOL_VERSION
         },
         "environment": capture_environment,
@@ -148,7 +148,7 @@ fn approved_metadata_enforces_thresholds_and_regression_budgets() {
         "workload": {
             "manifest_sha256": workload_digest,
             "generator": {
-                "name": "hopash-release-workload",
+                "name": "ratash-release-workload",
                 "version": WORKLOAD_GENERATOR_VERSION,
                 "seed": WORKLOAD_SEED
             },
@@ -247,7 +247,7 @@ fn collector_digest_changes_when_a_module_changes() {
 fn release_aggregation_rejects_smoke_samples_and_short_curves() {
     let smoke = json!({
         "collector": {
-            "name": "hopash-release-benchmark",
+            "name": "ratash-release-benchmark",
             "version": CAPTURE_TOOL_VERSION,
             "smoke": true
         }
@@ -321,7 +321,7 @@ fn summary_requires_all_twenty_one_measurements_and_uses_the_median() {
                 "schema_version": 1,
                 "workload_manifest_sha256": workload_digest,
                 "collector": {
-                    "name": "hopash-release-benchmark",
+                    "name": "ratash-release-benchmark",
                     "version": CAPTURE_TOOL_VERSION,
                     "smoke": false
                 },

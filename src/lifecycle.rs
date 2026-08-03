@@ -39,7 +39,7 @@ impl StatePaths {
     }
 
     pub fn discover() -> Result<Self, LifecycleError> {
-        let override_root = std::env::var_os("HOPASH_STATE_DIR");
+        let override_root = std::env::var_os("RATASH_STATE_DIR");
         let home = std::env::var_os("HOME");
         Self::from_environment(override_root.as_deref(), home.as_deref())
     }
@@ -61,7 +61,7 @@ impl StatePaths {
             )
             .join("Library")
             .join("Application Support")
-            .join("Hopash RS"),
+            .join("ratash"),
         };
         Ok(Self::for_root(root))
     }
@@ -572,7 +572,7 @@ impl fmt::Display for LifecycleError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self.kind {
             LifecycleErrorKind::HomeUnavailable => "the user home directory is unavailable",
-            LifecycleErrorKind::InvalidStateRoot => "the Hopash state root is invalid",
+            LifecycleErrorKind::InvalidStateRoot => "the Ratash state root is invalid",
             LifecycleErrorKind::InvalidLeaseName => "the lifecycle lease name is invalid",
             LifecycleErrorKind::InvalidLeaseRecord => "the lifecycle lease record is invalid",
             LifecycleErrorKind::InvalidInstanceRecord => "the instance record is invalid",

@@ -6,28 +6,28 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use hopash::config::{AuthoritativeConfig, ConfigCompiler, EffectiveConfiguration};
-use hopash::constants::CORE_RESTART_INITIAL_BACKOFF;
-use hopash::core::{
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
+use ratash::config::{AuthoritativeConfig, ConfigCompiler, EffectiveConfiguration};
+use ratash::constants::CORE_RESTART_INITIAL_BACKOFF;
+use ratash::core::{
     ApplyDisposition, CoreControlEndpoint, CoreRuntime, CoreRuntimeErrorKind, CoreRuntimeLifecycle,
     MihomoReadiness, OwnerSessionRequest,
 };
-use hopash::domain::RuntimeGeneration;
-use hopash::lifecycle::{ProcessInspector, PsProcessInspector};
-use hopash::process_controller::{
+use ratash::domain::RuntimeGeneration;
+use ratash::lifecycle::{ProcessInspector, PsProcessInspector};
+use ratash::process_controller::{
     CoreControlClient, NativeCoreProcessConfig, NativeCoreProcessController,
     SystemProcessIdentityProbe,
 };
-use hopash::profile::{ProfileSnapshot, SnapshotLimits};
-use hopash::runtime_bundle::RuntimeBundleStager;
-use hopash::service::{
+use ratash::profile::{ProfileSnapshot, SnapshotLimits};
+use ratash::runtime_bundle::RuntimeBundleStager;
+use ratash::service::{
     CORE_RUNTIME_PROTOCOL_VERSION, CallerCredentialValidator, CoreProcessController,
     PrivilegedCoreRuntimeService, PrivilegedServiceConfig, PrivilegedServiceDependencies,
     RuntimeConfigurationPolicy, RuntimeManifestFileV1, ServiceMaintenanceOutcome,
     ServicePlatformError, TunCapabilityPreflight, UnexpectedExitOutcome, UuidSecretGenerator,
 };
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
 use sha2::{Digest, Sha256};
 
 struct TestDirectory(PathBuf);
@@ -63,7 +63,7 @@ impl CoreControlClient for FakeControl {
     ) -> Result<MihomoReadiness, ServicePlatformError> {
         if !endpoint.socket_path.exists() {
             let listener = UnixListener::bind(&endpoint.socket_path).map_err(|_| {
-                ServicePlatformError::new(hopash::service::ServicePlatformErrorKind::Readiness)
+                ServicePlatformError::new(ratash::service::ServicePlatformErrorKind::Readiness)
             })?;
             *self
                 .endpoint_listener
@@ -212,7 +212,7 @@ fn verified_runtime_restarts_for_each_generation_forwards_bounded_logs_and_stops
     assert_ne!(second.managed_core.pid, first.managed_core.pid);
     assert_eq!(
         second.managed_core.instance_generation,
-        hopash::domain::CoreInstanceGeneration(first.managed_core.instance_generation.0 + 1)
+        ratash::domain::CoreInstanceGeneration(first.managed_core.instance_generation.0 + 1)
     );
     assert_eq!(second.managed_core.runtime_generation, RuntimeGeneration(2));
     let reloads = control
@@ -272,7 +272,7 @@ fn verified_runtime_restarts_for_each_generation_forwards_bounded_logs_and_stops
     assert_eq!(restarted.runtime_generation, RuntimeGeneration(2));
     assert_eq!(
         restarted.instance_generation,
-        hopash::domain::CoreInstanceGeneration(first.managed_core.instance_generation.0 + 2)
+        ratash::domain::CoreInstanceGeneration(first.managed_core.instance_generation.0 + 2)
     );
 
     let stopped = service
@@ -321,7 +321,7 @@ fn guarded_controller_stop_and_drop_contain_the_exact_core() {
         },
         Arc::new(FakeControl::default()),
         Arc::new(PsProcessInspector),
-        PathBuf::from(env!("CARGO_BIN_EXE_hopash")),
+        PathBuf::from(env!("CARGO_BIN_EXE_ratash")),
     )
     .expect("guarded process controller should be configured");
     let service = PrivilegedCoreRuntimeService::new(
@@ -614,9 +614,9 @@ fn core_control_endpoint_is_private_to_the_owner_and_service() {
 
 fn wait_for_logs(
     service: &PrivilegedCoreRuntimeService,
-    proof: &hopash::core::OwnerSessionProof,
+    proof: &ratash::core::OwnerSessionProof,
     expected: usize,
-) -> hopash::core::ForwardedCoreLogBatch {
+) -> ratash::core::ForwardedCoreLogBatch {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let batch = service

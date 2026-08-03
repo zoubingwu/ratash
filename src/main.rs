@@ -1,8 +1,8 @@
-use hopash::cli::parse_process_invocation;
-use hopash::core_guardian::{CoreGuardianInvocation, run_core_guardian};
-use hopash::daemon::InternalSupervisorInvocation;
-use hopash::error::ProcessExitCode;
-use hopash::production::{
+use ratash::cli::parse_process_invocation;
+use ratash::core_guardian::{CoreGuardianInvocation, run_core_guardian};
+use ratash::daemon::InternalSupervisorInvocation;
+use ratash::error::ProcessExitCode;
+use ratash::production::{
     CoreServiceInvocation, run_core_service, run_internal_supervisor, run_public_invocation,
 };
 use std::io::{self, Write};

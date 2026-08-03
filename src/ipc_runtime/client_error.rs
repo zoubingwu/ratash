@@ -19,7 +19,7 @@ use crate::ipc::IpcError;
 pub(super) fn connect_error(_error: io::Error) -> ApplicationError {
     ApplicationError::new(
         ErrorCode::SupervisorUnavailable,
-        "The Hopash Supervisor IPC endpoint is unavailable",
+        "The Ratash Supervisor IPC endpoint is unavailable",
         true,
     )
 }

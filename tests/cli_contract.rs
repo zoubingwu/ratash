@@ -1,11 +1,11 @@
 use clap::{CommandFactory, Parser};
-use hopash::application::{ApplicationOperation, RulePlacement};
-use hopash::cli::{Cli, Invocation, OutputMode};
-use hopash::domain::SubscriptionUrl;
+use ratash::application::{ApplicationOperation, RulePlacement};
+use ratash::cli::{Cli, Invocation, OutputMode};
+use ratash::domain::SubscriptionUrl;
 
 #[test]
 fn bare_command_routes_to_general_help() {
-    let cli = Cli::try_parse_from(["hopash"]).expect("bare command should parse");
+    let cli = Cli::try_parse_from(["ratash"]).expect("bare command should parse");
 
     assert_eq!(cli.into_invocation(), Invocation::PrintGeneralHelp);
 }
@@ -14,17 +14,17 @@ fn bare_command_routes_to_general_help() {
 fn lifecycle_commands_preserve_the_output_mode() {
     let cases = [
         (
-            vec!["hopash", "start"],
+            vec!["ratash", "start"],
             ApplicationOperation::Start,
             OutputMode::Human,
         ),
         (
-            vec!["hopash", "stop", "--json"],
+            vec!["ratash", "stop", "--json"],
             ApplicationOperation::Stop,
             OutputMode::Json,
         ),
         (
-            vec!["hopash", "restart"],
+            vec!["ratash", "restart"],
             ApplicationOperation::Restart,
             OutputMode::Human,
         ),
@@ -42,10 +42,10 @@ fn lifecycle_commands_preserve_the_output_mode() {
 
 #[test]
 fn status_selects_the_terminal_interface_or_json_query() {
-    let interactive = Cli::try_parse_from(["hopash", "status"])
+    let interactive = Cli::try_parse_from(["ratash", "status"])
         .expect("interactive status should parse")
         .into_invocation();
-    let json = Cli::try_parse_from(["hopash", "status", "--json"])
+    let json = Cli::try_parse_from(["ratash", "status", "--json"])
         .expect("JSON status should parse")
         .into_invocation();
 
@@ -64,7 +64,7 @@ fn profile_commands_preserve_urls_selectors_and_output_modes() {
     let cases = [
         (
             vec![
-                "hopash",
+                "ratash",
                 "profile",
                 "add",
                 "https://example.com/sub?token=secret",
@@ -77,19 +77,19 @@ fn profile_commands_preserve_urls_selectors_and_output_modes() {
             OutputMode::Json,
         ),
         (
-            vec!["hopash", "profile", "list"],
+            vec!["ratash", "profile", "list"],
             ApplicationOperation::ProfileList,
             OutputMode::Human,
         ),
         (
-            vec!["hopash", "profile", "use", "Office Profile"],
+            vec!["ratash", "profile", "use", "Office Profile"],
             ApplicationOperation::ProfileUse {
                 profile: "Office Profile".to_owned(),
             },
             OutputMode::Human,
         ),
         (
-            vec!["hopash", "profile", "remove", "profile-01", "--json"],
+            vec!["ratash", "profile", "remove", "profile-01", "--json"],
             ApplicationOperation::ProfileRemove {
                 profile: "profile-01".to_owned(),
             },
@@ -105,21 +105,21 @@ fn profile_commands_preserve_urls_selectors_and_output_modes() {
         );
     }
 
-    assert!(Cli::try_parse_from(["hopash", "profile", "add", "file:///tmp/profile.yaml"]).is_err());
+    assert!(Cli::try_parse_from(["ratash", "profile", "add", "file:///tmp/profile.yaml"]).is_err());
 }
 
 #[test]
 fn proxy_and_latency_commands_preserve_case_sensitive_selectors() {
     let cases = [
         (
-            vec!["hopash", "proxy", "list", "Auto Select", "--json"],
+            vec!["ratash", "proxy", "list", "Auto Select", "--json"],
             ApplicationOperation::ProxyList {
                 group: "Auto Select".to_owned(),
             },
             OutputMode::Json,
         ),
         (
-            vec!["hopash", "proxy", "select", "Auto Select", "HK Node 01"],
+            vec!["ratash", "proxy", "select", "Auto Select", "HK Node 01"],
             ApplicationOperation::ProxySelect {
                 group: "Auto Select".to_owned(),
                 node: "HK Node 01".to_owned(),
@@ -127,12 +127,12 @@ fn proxy_and_latency_commands_preserve_case_sensitive_selectors() {
             OutputMode::Human,
         ),
         (
-            vec!["hopash", "latency", "list", "--json"],
+            vec!["ratash", "latency", "list", "--json"],
             ApplicationOperation::LatencyList,
             OutputMode::Json,
         ),
         (
-            vec!["hopash", "latency", "show", "Provider/HK Node 01"],
+            vec!["ratash", "latency", "show", "Provider/HK Node 01"],
             ApplicationOperation::LatencyShow {
                 node: "Provider/HK Node 01".to_owned(),
             },
@@ -155,12 +155,12 @@ fn rule_commands_preserve_complete_strings_and_require_one_placement() {
     let anchor = "MATCH,PROXY";
     let cases = [
         (
-            vec!["hopash", "rule", "list", "--json"],
+            vec!["ratash", "rule", "list", "--json"],
             ApplicationOperation::RuleList,
             OutputMode::Json,
         ),
         (
-            vec!["hopash", "rule", "add", logical_rule, "--before", anchor],
+            vec!["ratash", "rule", "add", logical_rule, "--before", anchor],
             ApplicationOperation::RuleAdd {
                 rule: logical_rule.to_owned(),
                 placement: RulePlacement::Before(anchor.to_owned()),
@@ -169,7 +169,7 @@ fn rule_commands_preserve_complete_strings_and_require_one_placement() {
         ),
         (
             vec![
-                "hopash",
+                "ratash",
                 "rule",
                 "replace",
                 "DOMAIN-SUFFIX,Example.com,PROXY",
@@ -184,7 +184,7 @@ fn rule_commands_preserve_complete_strings_and_require_one_placement() {
         ),
         (
             vec![
-                "hopash",
+                "ratash",
                 "rule",
                 "remove",
                 "DOMAIN-SUFFIX,Example.com,DIRECT",
@@ -204,10 +204,10 @@ fn rule_commands_preserve_complete_strings_and_require_one_placement() {
         );
     }
 
-    assert!(Cli::try_parse_from(["hopash", "rule", "add", "MATCH,DIRECT"]).is_err());
+    assert!(Cli::try_parse_from(["ratash", "rule", "add", "MATCH,DIRECT"]).is_err());
     assert!(
         Cli::try_parse_from([
-            "hopash",
+            "ratash",
             "rule",
             "add",
             "MATCH,DIRECT",
@@ -220,16 +220,16 @@ fn rule_commands_preserve_complete_strings_and_require_one_placement() {
 
 #[test]
 fn logs_and_help_route_to_dedicated_local_invocations() {
-    let human_logs = Cli::try_parse_from(["hopash", "logs", "--follow"])
+    let human_logs = Cli::try_parse_from(["ratash", "logs", "--follow"])
         .expect("human log follow should parse")
         .into_invocation();
-    let json_logs = Cli::try_parse_from(["hopash", "logs", "--follow", "--json"])
+    let json_logs = Cli::try_parse_from(["ratash", "logs", "--follow", "--json"])
         .expect("JSON log follow should parse")
         .into_invocation();
-    let help = Cli::try_parse_from(["hopash", "help"])
+    let help = Cli::try_parse_from(["ratash", "help"])
         .expect("general help should parse")
         .into_invocation();
-    let agent_help = Cli::try_parse_from(["hopash", "help", "agent"])
+    let agent_help = Cli::try_parse_from(["ratash", "help", "agent"])
         .expect("agent help should parse")
         .into_invocation();
 
@@ -248,7 +248,7 @@ fn logs_and_help_route_to_dedicated_local_invocations() {
     assert_eq!(help, Invocation::PrintGeneralHelp);
     assert_eq!(agent_help, Invocation::PrintAgentHelp);
 
-    assert!(Cli::try_parse_from(["hopash", "logs"]).is_err());
+    assert!(Cli::try_parse_from(["ratash", "logs"]).is_err());
 }
 
 #[test]
@@ -276,7 +276,7 @@ fn root_help_lists_the_public_surface_only() {
 fn every_public_command_argument_and_flag_has_help_text() {
     let mut command = Cli::command();
     command.build();
-    assert_help_tree(&command, "hopash");
+    assert_help_tree(&command, "ratash");
 }
 
 fn assert_help_tree(command: &clap::Command, path: &str) {

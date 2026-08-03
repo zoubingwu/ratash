@@ -1,5 +1,5 @@
-use hopash::domain::{ProfileId, SubscriptionUrl};
-use hopash::profile::{
+use ratash::domain::{ProfileId, SubscriptionUrl};
+use ratash::profile::{
     Profile, ProfileNameSource, ProfileSnapshot, SnapshotError, SnapshotLimits, derive_profile_name,
 };
 

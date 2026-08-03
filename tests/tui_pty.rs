@@ -6,26 +6,26 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hopash::application::{ApplicationOperation, LatencyFreshness, LatencyProbeStatus};
-use hopash::domain::{
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use ratash::application::{ApplicationOperation, LatencyFreshness, LatencyProbeStatus};
+use ratash::domain::{
     ActiveProfileSummary, ApplyState, CoreLifecycle, CoreStatus, NodeRecordId, ProbeQueueStatus,
     ProfileId, ProxyGroupId, SampleState, StatusSnapshot, StreamHealthSet, StreamState,
     SupervisorLifecycle, SupervisorStatus, TrafficSample, TunStatus,
 };
-use hopash::tui::{
+use ratash::tui::{
     CrosstermControl, FullViewSnapshot, ProfileRow, ProxyGroupRow, ProxyGroupSnapshot, ProxyRow,
     TerminalSession, ViewLogRecord,
 };
-use hopash::tui_runtime::{
+use ratash::tui_runtime::{
     CancellationToken, FullSnapshotSource, LogTail, StatusInterfaceError, StatusInterfaceSources,
     StatusLogEvent, StatusLogEventSource, UiCommandExecutor, run_crossterm_status_interface,
     run_crossterm_status_interface_with_render_writer, run_with_terminal_session,
 };
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
-const CHILD_SCENARIO_ENV: &str = "HOPASH_TUI_PTY_CHILD_SCENARIO";
+const CHILD_SCENARIO_ENV: &str = "RATASH_TUI_PTY_CHILD_SCENARIO";
 const PTY_TIMEOUT: Duration = Duration::from_secs(8);
 const INITIAL_PTY_SIZE: PtySize = PtySize {
     rows: 24,
@@ -85,12 +85,12 @@ fn real_pty_interaction_covers_resize_keyboard_mouse_and_restoration() {
     interactive.write_input(b"p");
     interactive.wait_for_text("PROFILES (2)");
     interactive.write_input(b"\r");
-    interactive.wait_for_text("HOPASH_PTY_COMMAND profile_use");
+    interactive.wait_for_text("RATASH_PTY_COMMAND profile_use");
     interactive.wait_for_text("Success: done");
     interactive.write_input(b"2");
     interactive.wait_for_text("Nodes (2)");
     interactive.write_input(b"\x1b[<0;25;7M\x1b[<0;25;7m");
-    interactive.wait_for_text("HOPASH_PTY_COMMAND proxy_select");
+    interactive.wait_for_text("RATASH_PTY_COMMAND proxy_select");
     interactive.write_input(b"5");
     interactive.wait_for_text("LOGS");
     interactive.write_input(b"\x1b[<0;52;4M\x1b[<0;52;4m");
@@ -200,7 +200,7 @@ fn assert_stalled_command_restoration(scenario: &str, signal: Option<Signal>) {
     let mut session = PtySession::spawn(scenario);
     session.wait_for_text("UP");
     session.write_input(b"p\r");
-    session.wait_for_text("HOPASH_PTY_COMMAND stalled");
+    session.wait_for_text("RATASH_PTY_COMMAND stalled");
     let started = Instant::now();
     if let Some(signal) = signal {
         session.signal(signal);
@@ -221,7 +221,7 @@ fn exercise_partial_terminal_initialization() {
         .expect_err("the injected terminal writer should reject terminal setup");
     assert_eq!(
         error.kind,
-        hopash::tui_runtime::StatusInterfaceErrorKind::TerminalSetup
+        ratash::tui_runtime::StatusInterfaceErrorKind::TerminalSetup
     );
     assert!(
         control.into_inner().failed,
@@ -253,7 +253,7 @@ fn exercise_render_failure() {
     .expect_err("the injected frame writer should reject rendering");
     assert_eq!(
         error.kind,
-        hopash::tui_runtime::StatusInterfaceErrorKind::Render
+        ratash::tui_runtime::StatusInterfaceErrorKind::Render
     );
 }
 
@@ -262,7 +262,7 @@ fn emit_terminal_result(scenario: &str) {
         .expect("the PTY raw-mode state should remain readable");
     let (cols, rows) = crossterm::terminal::size()
         .expect("the PTY dimensions should remain readable after cleanup");
-    println!("HOPASH_PTY_RESULT scenario={scenario} raw={raw} size={cols}x{rows}");
+    println!("RATASH_PTY_RESULT scenario={scenario} raw={raw} size={cols}x{rows}");
     io::stdout()
         .flush()
         .expect("the PTY result marker should flush");
@@ -355,19 +355,19 @@ impl UiCommandExecutor for StalledCommands {
         _operation: ApplicationOperation,
         cancellation: &CancellationToken,
     ) -> Result<String, StatusInterfaceError> {
-        eprintln!("HOPASH_PTY_COMMAND stalled");
+        eprintln!("RATASH_PTY_COMMAND stalled");
         let (sender, receiver) = mpsc::sync_channel(1);
         let _registration = cancellation.register_interrupt(move || {
             let _ = sender.send(());
         });
         receiver.recv_timeout(Duration::from_secs(4)).map_err(|_| {
             StatusInterfaceError::new(
-                hopash::tui_runtime::StatusInterfaceErrorKind::Command,
+                ratash::tui_runtime::StatusInterfaceErrorKind::Command,
                 "The stalled fixture did not receive cancellation",
             )
         })?;
         Err(StatusInterfaceError::new(
-            hopash::tui_runtime::StatusInterfaceErrorKind::Command,
+            ratash::tui_runtime::StatusInterfaceErrorKind::Command,
             "The foreground command was cancelled",
         ))
     }
@@ -381,10 +381,10 @@ impl UiCommandExecutor for ImmediateCommands {
     ) -> Result<String, StatusInterfaceError> {
         match operation {
             ApplicationOperation::ProfileUse { .. } => {
-                eprintln!("HOPASH_PTY_COMMAND profile_use");
+                eprintln!("RATASH_PTY_COMMAND profile_use");
             }
             ApplicationOperation::ProxySelect { .. } => {
-                eprintln!("HOPASH_PTY_COMMAND proxy_select");
+                eprintln!("RATASH_PTY_COMMAND proxy_select");
             }
             other => panic!("unexpected PTY command: {other:?}"),
         }
@@ -405,7 +405,7 @@ fn full_snapshot() -> FullViewSnapshot {
                 lifecycle: CoreLifecycle::Ready,
                 pid: Some(42),
                 instance_generation: None,
-                restart: hopash::domain::CoreRestartStatus::default(),
+                restart: ratash::domain::CoreRestartStatus::default(),
             },
             tun: TunStatus {
                 requested: true,
@@ -742,7 +742,7 @@ fn spawn_pty_reader(
 ) -> (mpsc::Receiver<Vec<u8>>, thread::JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel();
     let thread = thread::Builder::new()
-        .name("hopash-tui-pty-reader".to_owned())
+        .name("ratash-tui-pty-reader".to_owned())
         .spawn(move || {
             let mut buffer = [0_u8; 4096];
             loop {
@@ -829,7 +829,7 @@ fn terminal_mode_sequences() -> [(&'static [u8], &'static [u8], &'static str); 9
 }
 
 fn assert_result_marker(output: &[u8], scenario: &str) {
-    let marker = format!("HOPASH_PTY_RESULT scenario={scenario} raw=false");
+    let marker = format!("RATASH_PTY_RESULT scenario={scenario} raw=false");
     assert_output_contains(output, marker.as_bytes(), "terminal result marker");
 }
 

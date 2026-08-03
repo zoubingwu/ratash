@@ -2,25 +2,25 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use hopash::application::{ApplicationError, Clock};
-use hopash::background::{BackgroundApplication, BackgroundCorePort, BackgroundRuntime};
-use hopash::constants::{PROBE_WORKER_COUNT, PROFILE_REFRESH_CONCURRENCY};
-use hopash::core::{
+use ratash::application::{ApplicationError, Clock};
+use ratash::background::{BackgroundApplication, BackgroundCorePort, BackgroundRuntime};
+use ratash::constants::{PROBE_WORKER_COUNT, PROFILE_REFRESH_CONCURRENCY};
+use ratash::core::{
     ConnectionSummary, CoreControlEndpoint, CoreEvent, CoreEventStream, DelayProbeRequest,
     DelayTarget, ManagedCoreHandle, MihomoError, MihomoErrorKind, MihomoLogFrame, MihomoLogLevel,
     TrafficFrame,
 };
-use hopash::domain::{
+use ratash::domain::{
     CoreInstanceGeneration, NodeRecordId, ProbeGeneration, RuntimeGeneration, StreamState,
     TrafficSample,
 };
-use hopash::profile::ProfileRevision;
-use hopash::scheduler::{
+use ratash::profile::ProfileRevision;
+use ratash::scheduler::{
     ProbeCompletion, ProbeCompletionStatus, ProbeOutcome, ProbeScheduler, ProfileRefreshScheduler,
     RefreshCompletion, RefreshTask,
 };
-use hopash::supervisor::{ProfileRefreshDisposition, ScheduledProbe, TelemetryStream};
-use hopash::telemetry::{LogLevel, LogSource};
+use ratash::supervisor::{ProfileRefreshDisposition, ScheduledProbe, TelemetryStream};
+use ratash::telemetry::{LogLevel, LogSource};
 
 const WAIT_LIMIT: Duration = Duration::from_secs(3);
 
@@ -115,7 +115,7 @@ impl HarnessApplication {
         let mut refreshes = ProfileRefreshScheduler::new();
         for revision in 1..=profile_count {
             refreshes.upsert(
-                hopash::domain::ProfileId::new(),
+                ratash::domain::ProfileId::new(),
                 ProfileRevision(revision as u64),
                 0,
             );
@@ -168,7 +168,7 @@ impl HarnessApplication {
 
     fn for_traffic_stream(clock: Arc<FixedClock>, generation: CoreInstanceGeneration) -> Self {
         Self {
-            managed_thread: Some("hopash-traffic"),
+            managed_thread: Some("ratash-traffic"),
             ..Self::for_streams(clock, generation)
         }
     }
@@ -204,7 +204,7 @@ impl HarnessApplication {
             observed
                 .traffic
                 .iter()
-                .any(|(_, sample)| sample.state == hopash::domain::SampleState::Stale)
+                .any(|(_, sample)| sample.state == ratash::domain::SampleState::Stale)
         }));
     }
 }
@@ -723,7 +723,7 @@ fn telemetry_streams_publish_fresh_generation_scoped_values() {
                 upload_bytes_per_second: 11,
                 download_bytes_per_second: 29,
                 sampled_at_unix_ms: Some(9_000),
-                state: hopash::domain::SampleState::Fresh,
+                state: ratash::domain::SampleState::Fresh,
             }
         )]
     );
@@ -824,7 +824,7 @@ fn stale_traffic_publishes_an_explicit_zero_sample_once() {
                 upload_bytes_per_second: 0,
                 download_bytes_per_second: 0,
                 sampled_at_unix_ms: Some(10_000),
-                state: hopash::domain::SampleState::Stale,
+                state: ratash::domain::SampleState::Stale,
             }
         )]
     );
@@ -850,7 +850,7 @@ fn managed_core(generation: CoreInstanceGeneration) -> ManagedCoreHandle {
     ManagedCoreHandle {
         pid: 123,
         process_start_identity: "fixture-start".to_owned(),
-        endpoint: CoreControlEndpoint::new("/tmp/hopash-background-fixture.sock", "fixture-secret"),
+        endpoint: CoreControlEndpoint::new("/tmp/ratash-background-fixture.sock", "fixture-secret"),
         instance_generation: generation,
         runtime_generation: RuntimeGeneration(1),
     }

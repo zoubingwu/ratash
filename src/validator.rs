@@ -232,9 +232,9 @@ impl ValidationFiles {
     fn create(root: &Path, configuration: &[u8]) -> Result<Self, MihomoValidationError> {
         let token = uuid::Uuid::new_v4();
         let files = Self {
-            configuration: root.join(format!(".hopash-validation-{token}.yaml")),
-            stdout: root.join(format!(".hopash-validation-{token}.stdout")),
-            stderr: root.join(format!(".hopash-validation-{token}.stderr")),
+            configuration: root.join(format!(".ratash-validation-{token}.yaml")),
+            stdout: root.join(format!(".ratash-validation-{token}.stdout")),
+            stderr: root.join(format!(".ratash-validation-{token}.stderr")),
             cleaned: false,
         };
         write_private_new(&files.configuration, configuration)?;
