@@ -1,0 +1,248 @@
+#!/bin/sh
+set -eu
+
+repository='zoubingwu/ratash'
+releases_url="https://github.com/$repository/releases"
+package_identifier='io.ratash'
+ratash_binary='/usr/local/bin/ratash'
+installed_uninstaller='/usr/local/share/ratash/uninstall.sh'
+temporary_directory=''
+
+usage() {
+    echo 'Usage: install.sh [install|update|uninstall]'
+    echo
+    echo '  install     Install the latest signed release or update an existing installation.'
+    echo '  update      Update an existing installation to the latest signed release.'
+    echo '  uninstall   Remove Ratash while preserving user Profiles and rules.'
+}
+
+fail() {
+    echo "Ratash: $*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [ -n "$temporary_directory" ] && [ -d "$temporary_directory" ]; then
+        /bin/rm -rf -- "$temporary_directory"
+    fi
+}
+
+download() {
+    source_url=$1
+    destination=$2
+    /usr/bin/curl \
+        --fail \
+        --silent \
+        --show-error \
+        --location \
+        --proto '=https' \
+        --proto-redir '=https' \
+        --tlsv1.2 \
+        --retry 3 \
+        --output "$destination" \
+        "$source_url"
+}
+
+is_installed() {
+    /usr/sbin/pkgutil --pkg-info "$package_identifier" >/dev/null 2>&1
+}
+
+installed_version() {
+    /usr/sbin/pkgutil --pkg-info "$package_identifier" 2>/dev/null \
+        | /usr/bin/sed -n 's/^version: //p'
+}
+
+is_release_version() {
+    candidate=$1
+    case "$candidate" in
+        '' | .* | *. | *..* | *[!0-9.]*) return 1 ;;
+    esac
+
+    previous_ifs=$IFS
+    IFS=.
+    set -- $candidate
+    IFS=$previous_ifs
+    [ "$#" -eq 3 ] || return 1
+    for component in "$@"; do
+        case "$component" in
+            '' | *[!0-9]*) return 1 ;;
+        esac
+    done
+}
+
+latest_release() {
+    effective_url=$(
+        /usr/bin/curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --proto '=https' \
+            --proto-redir '=https' \
+            --tlsv1.2 \
+            --retry 3 \
+            --output /dev/null \
+            --write-out '%{url_effective}' \
+            "$releases_url/latest"
+    )
+    effective_url=${effective_url%/}
+    tag=${effective_url##*/}
+    case "$effective_url" in
+        "$releases_url/tag/$tag") ;;
+        *) fail 'GitHub returned an unexpected latest-release URL.' ;;
+    esac
+    version=${tag#v}
+    if [ "$tag" = "$version" ] || ! is_release_version "$version"; then
+        fail 'The latest Ratash release tag is invalid.'
+    fi
+    echo "$tag"
+}
+
+require_macos_user() {
+    [ "$(/usr/bin/uname -s)" = 'Darwin' ] || fail 'The installer supports macOS.'
+    [ "$(/usr/bin/id -u)" -ne 0 ] \
+        || fail 'Run this script as your normal macOS user. It will request sudo itself.'
+}
+
+release_target() {
+    case "$(/usr/bin/uname -m)" in
+        arm64) echo 'aarch64-apple-darwin' ;;
+        x86_64) echo 'x86_64-apple-darwin' ;;
+        *) fail 'This Mac architecture is unsupported.' ;;
+    esac
+}
+
+make_temporary_directory() {
+    /usr/bin/mktemp -d '/tmp/ratash-install.XXXXXX'
+}
+
+verify_package() {
+    package=$1
+    package_name=$2
+    package_directory=$3
+    (
+        CDPATH= cd -- "$package_directory"
+        /usr/bin/shasum -a 256 -c "$package_name.sha256"
+    )
+    /usr/sbin/pkgutil --check-signature "$package" >/dev/null
+    /usr/sbin/spctl --assess --type install "$package"
+}
+
+acquire_privileges() {
+    /usr/bin/sudo -v
+}
+
+stop_ratash() {
+    if [ -x "$ratash_binary" ]; then
+        /usr/local/bin/ratash stop --json
+    fi
+}
+
+install_package() {
+    package=$1
+    owner_uid=$(/usr/bin/id -u)
+    /usr/bin/sudo /usr/bin/env RATASH_OWNER_UID="$owner_uid" \
+        /usr/sbin/installer \
+        -pkg "$package" \
+        -target /
+}
+
+verify_installation() {
+    expected_version=$1
+    installed=$(installed_version)
+    [ "$installed" = "$expected_version" ] \
+        || fail "The installed package reports version ${installed:-unknown}; expected $expected_version."
+    /usr/local/bin/ratash --version
+    /usr/bin/sudo /bin/launchctl print 'system/io.ratash.core-runtime' >/dev/null
+}
+
+start_ratash() {
+    /usr/local/bin/ratash start --json
+}
+
+has_installed_uninstaller() {
+    [ -x "$installed_uninstaller" ]
+}
+
+ratash_artifact_exists() {
+    [ -e "$ratash_binary" ]
+}
+
+run_uninstaller() {
+    /usr/bin/sudo "$installed_uninstaller"
+}
+
+install_release() {
+    requested_action=$1
+    if [ "$requested_action" = 'update' ] && ! is_installed; then
+        fail 'Ratash is not installed. Run the install command first.'
+    fi
+
+    target=$(release_target)
+    tag=$(latest_release)
+    version=${tag#v}
+
+    package_name="ratash-$version-$target.pkg"
+    asset_url="$releases_url/download/$tag/$package_name"
+    temporary_directory=$(make_temporary_directory)
+    package="$temporary_directory/$package_name"
+    checksum="$package.sha256"
+
+    echo "Downloading Ratash $version for $target..."
+    download "$asset_url" "$package"
+    download "$asset_url.sha256" "$checksum"
+    verify_package "$package" "$package_name" "$temporary_directory"
+    acquire_privileges
+    stop_ratash
+    install_package "$package"
+    verify_installation "$version"
+    start_ratash
+    echo "Ratash $version was installed and started."
+}
+
+uninstall_ratash() {
+    if ! has_installed_uninstaller; then
+        if ! is_installed && ! ratash_artifact_exists; then
+            echo 'Ratash is already removed.'
+            return
+        fi
+        fail 'The installed Ratash uninstaller is unavailable. Reinstall Ratash, then uninstall it.'
+    fi
+
+    acquire_privileges
+    stop_ratash
+    run_uninstaller
+}
+
+main() {
+    if [ "$#" -eq 0 ]; then
+        action='install'
+    else
+        action=$1
+        shift
+    fi
+    [ "$#" -eq 0 ] || fail 'Only one lifecycle action is accepted.'
+
+    case "$action" in
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        install | update | uninstall) ;;
+        *)
+            usage >&2
+            exit 2
+            ;;
+    esac
+
+    require_macos_user
+    trap cleanup 0
+    trap 'exit 1' 1 2 15
+
+    case "$action" in
+        install|update) install_release "$action" ;;
+        uninstall) uninstall_ratash ;;
+    esac
+}
+
+main "$@"

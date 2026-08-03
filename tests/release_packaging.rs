@@ -394,6 +394,98 @@ fn local_installer_restarts_ratash_around_the_package_upgrade() {
 }
 
 #[test]
+fn public_installer_owns_install_update_and_uninstall_lifecycle() {
+    let path = project_path("install.sh");
+    let installer = fs::read_to_string(&path).expect("public installer should be readable");
+
+    assert_eq!(mode(&path), 0o755);
+    for required in [
+        "zoubingwu/ratash",
+        "install|update",
+        "uninstall)",
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "\"$releases_url/latest\"",
+        "--proto '=https'",
+        "--proto-redir '=https'",
+        "--tlsv1.2",
+        "--retry 3",
+        "/usr/bin/shasum -a 256 -c",
+        "/usr/sbin/pkgutil --check-signature",
+        "/usr/sbin/spctl --assess --type install",
+        "/usr/local/bin/ratash stop --json",
+        "/usr/sbin/installer",
+        "/usr/local/bin/ratash start --json",
+        "RATASH_OWNER_UID",
+        "/usr/local/share/ratash/uninstall.sh",
+    ] {
+        assert!(
+            installer.contains(required),
+            "public installer is missing {required}"
+        );
+    }
+
+    let checksum = installer
+        .find("/usr/bin/shasum -a 256 -c")
+        .expect("public installer should verify the package checksum");
+    let signature = installer
+        .find("/usr/sbin/pkgutil --check-signature")
+        .expect("public installer should verify the package signature");
+    let assessment = installer
+        .find("/usr/sbin/spctl --assess --type install")
+        .expect("public installer should assess the package signature");
+    assert!(checksum < signature && signature < assessment);
+    assert!(!installer.contains("stop --json || true"));
+}
+
+#[test]
+fn public_installer_executes_lifecycle_branches_in_order() {
+    let expected_install = [
+        "download:ratash-9.8.7-aarch64-apple-darwin.pkg",
+        "download:ratash-9.8.7-aarch64-apple-darwin.pkg.sha256",
+        "verify",
+        "sudo",
+        "stop",
+        "install",
+        "installed:9.8.7",
+        "start",
+    ]
+    .join("\n")
+        + "\n";
+    for scenario in ["install", "same-version-update"] {
+        let (output, trace) = run_public_installer_scenario(scenario);
+        assert!(
+            output.status.success(),
+            "{scenario}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(trace, expected_install, "{scenario}");
+    }
+
+    let (missing_update, trace) = run_public_installer_scenario("missing-update");
+    assert_eq!(missing_update.status.code(), Some(1));
+    assert!(trace.is_empty());
+    assert!(
+        String::from_utf8_lossy(&missing_update.stderr)
+            .contains("Ratash is not installed. Run the install command first.")
+    );
+
+    let (stop_failure, trace) = run_public_installer_scenario("stop-failure");
+    assert_eq!(stop_failure.status.code(), Some(42));
+    assert!(trace.ends_with("sudo\nstop\n"), "{trace}");
+    assert!(!trace.contains("\ninstall\n"));
+
+    let (uninstall, trace) = run_public_installer_scenario("uninstall");
+    assert!(uninstall.status.success());
+    assert_eq!(trace, "sudo\nstop\nuninstall\n");
+
+    let (absent, trace) = run_public_installer_scenario("absent-uninstall");
+    assert!(absent.status.success());
+    assert!(trace.is_empty());
+    assert!(String::from_utf8_lossy(&absent.stdout).contains("Ratash is already removed."));
+}
+
+#[test]
 fn package_builder_rejects_a_custom_manifest_for_installable_output() {
     let fixture = TempDirectory::new("package-build");
     let ratash = fixture.path.join("ratash");
@@ -615,6 +707,7 @@ fn release_metadata_names_every_required_resource_measurement() {
 #[test]
 fn package_scripts_are_valid_posix_shell() {
     for script in [
+        "install.sh",
         "scripts/package-macos.sh",
         "scripts/package-local-macos.sh",
         "scripts/validate-pinned-mihomo-geodata.sh",
@@ -780,6 +873,9 @@ fn readme_stays_user_facing_and_documents_the_installed_workflow() {
         "ratash help agent",
         "package-local-macos.sh",
         "local-unsigned",
+        "curl -fsSL https://raw.githubusercontent.com/zoubingwu/ratash/main/install.sh | sh",
+        "sh -s -- update",
+        "sh -s -- uninstall",
     ] {
         assert!(readme.contains(required), "README is missing {required}");
     }
@@ -800,6 +896,109 @@ fn readme_stays_user_facing_and_documents_the_installed_workflow() {
 
 fn project_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
+}
+
+fn run_public_installer_scenario(scenario: &str) -> (std::process::Output, String) {
+    let fixture = TempDirectory::new("public-installer");
+    let installer = fs::read_to_string(project_path("install.sh"))
+        .expect("public installer should be readable");
+    let mut harness = installer
+        .strip_suffix("main \"$@\"\n")
+        .expect("public installer should end with its main call")
+        .to_owned();
+    harness.push_str(
+        r#"
+scenario=$1
+trace_file=$2
+
+record() {
+    printf '%s\n' "$1" >>"$trace_file"
+}
+
+is_installed() {
+    [ "$scenario" != 'missing-update' ] && [ "$scenario" != 'absent-uninstall' ]
+}
+
+installed_version() {
+    echo '9.8.7'
+}
+
+release_target() {
+    echo 'aarch64-apple-darwin'
+}
+
+latest_release() {
+    echo 'v9.8.7'
+}
+
+make_temporary_directory() {
+    test_directory="${trace_file}.tmp"
+    mkdir -p "$test_directory"
+    echo "$test_directory"
+}
+
+download() {
+    record "download:${1##*/}"
+    : >"$2"
+}
+
+verify_package() {
+    record 'verify'
+}
+
+acquire_privileges() {
+    record 'sudo'
+}
+
+stop_ratash() {
+    record 'stop'
+    [ "$scenario" != 'stop-failure' ] || return 42
+}
+
+install_package() {
+    record 'install'
+}
+
+verify_installation() {
+    record "installed:$1"
+}
+
+start_ratash() {
+    record 'start'
+}
+
+has_installed_uninstaller() {
+    [ "$scenario" != 'absent-uninstall' ]
+}
+
+ratash_artifact_exists() {
+    return 1
+}
+
+run_uninstaller() {
+    record 'uninstall'
+}
+
+case "$scenario" in
+    install | stop-failure) install_release install ;;
+    same-version-update | missing-update) install_release update ;;
+    uninstall | absent-uninstall) uninstall_ratash ;;
+    *) exit 64 ;;
+esac
+"#,
+    );
+    let harness_path = fixture.path.join("harness.sh");
+    let trace_path = fixture.path.join("trace");
+    fs::write(&harness_path, harness).expect("installer harness should be written");
+
+    let output = Command::new("sh")
+        .arg(&harness_path)
+        .arg(scenario)
+        .arg(&trace_path)
+        .output()
+        .expect("installer harness should run");
+    let trace = fs::read_to_string(&trace_path).unwrap_or_default();
+    (output, trace)
 }
 
 fn set_mode(path: &Path, value: u32) {

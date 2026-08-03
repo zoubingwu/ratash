@@ -10,6 +10,18 @@ Ratash is in pre-release development for macOS. Tagged releases pass the full co
 
 ## Installation
 
+Install the latest signed release for the current Mac architecture:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zoubingwu/ratash/main/install.sh | sh
+```
+
+The installer downloads the latest notarized package from GitHub Releases, verifies its SHA-256 checksum and Developer ID signature, requests `sudo`, and starts Ratash. Run the same lifecycle entry point to update an existing installation:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zoubingwu/ratash/main/install.sh | sh -s -- update
+```
+
 ### Personal package
 
 Build a complete package from a source checkout without an Apple Developer account:
@@ -30,7 +42,7 @@ Copy `install-ratash.sh`, the matching `*-local-unsigned.pkg`, and its `.pkg.sha
 
 The installer verifies the package, stops an existing Ratash Supervisor before the Core service upgrade, and starts the replacement Supervisor after installation.
 
-### Signed release package
+### Manual signed release package
 
 Download the `.pkg` and matching `.pkg.sha256` file for your Mac from [GitHub Releases](../../releases/latest):
 
@@ -117,11 +129,10 @@ source /usr/local/share/bash-completion/completions/ratash
 
 ## Uninstall
 
-Stop Ratash and run the packaged uninstaller:
+Run the fixed lifecycle entry point:
 
 ```sh
-ratash stop
-sudo /usr/local/share/ratash/uninstall.sh
+curl -fsSL https://raw.githubusercontent.com/zoubingwu/ratash/main/install.sh | sh -s -- uninstall
 ```
 
-The uninstaller preserves each user's saved Profiles and Local Rule Set under `~/Library/Application Support/ratash`.
+The uninstaller stops Ratash, removes the application and system service, and preserves each user's saved Profiles and Local Rule Set under `~/Library/Application Support/ratash`.
