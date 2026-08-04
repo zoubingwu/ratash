@@ -3,6 +3,7 @@ use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -100,6 +101,7 @@ impl ActiveOperations {
             stream: stream
                 .try_clone()
                 .map_err(|_| unavailable("Mihomo cancellation handle creation failed"))?,
+            cancelled: AtomicBool::new(false),
         });
         let cancelled = {
             let mut state = self
@@ -177,11 +179,17 @@ impl ActiveOperations {
 #[derive(Debug)]
 struct ActiveOperation {
     stream: UnixStream,
+    cancelled: AtomicBool,
 }
 
 impl ActiveOperation {
     fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
         let _ = self.stream.shutdown(Shutdown::Both);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
     }
 }
 
@@ -396,7 +404,7 @@ impl UnixMihomoAdapter {
             generation,
             decoder,
             cancelled: false,
-            _active_operation: active_operation,
+            active_operation,
         }))
     }
 }
@@ -1322,7 +1330,7 @@ struct UnixWebSocketEventStream<T> {
     generation: CoreInstanceGeneration,
     decoder: fn(&[u8]) -> Result<T, ProjectionError>,
     cancelled: bool,
-    _active_operation: Arc<ActiveOperation>,
+    active_operation: Arc<ActiveOperation>,
 }
 
 impl<T: Send> CoreEventStream<T> for UnixWebSocketEventStream<T> {
@@ -1358,6 +1366,9 @@ impl<T: Send> CoreEventStream<T> for UnixWebSocketEventStream<T> {
                     return Err(invalid_response(
                         "Mihomo WebSocket emitted a non-text event",
                     ));
+                }
+                Err(_) if self.active_operation.is_cancelled() => {
+                    return Err(stream_closed("Mihomo WebSocket read was cancelled"));
                 }
                 Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
                     self.cancelled = true;
