@@ -571,7 +571,7 @@ fn public_installer_executes_lifecycle_branches_in_order() {
     ]
     .join("\n")
         + "\n";
-    for scenario in ["install", "same-version-update"] {
+    for scenario in ["install", "older-version-update"] {
         let (output, trace) = run_public_installer_scenario(scenario);
         assert!(
             output.status.success(),
@@ -591,6 +591,26 @@ fn public_installer_executes_lifecycle_branches_in_order() {
                 "Ratash: Verifying the installation...",
                 "Ratash: Starting the service...",
                 "Ratash 9.8.7 is installed and running.",
+                "",
+            ]
+            .join("\n"),
+            "{scenario}"
+        );
+    }
+
+    for scenario in ["same-version-install", "same-version-update"] {
+        let (output, trace) = run_public_installer_scenario(scenario);
+        assert!(
+            output.status.success(),
+            "{scenario}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(trace.is_empty(), "{scenario}: {trace}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            [
+                "Ratash: Checking for the latest release...",
+                "Ratash 9.8.7 is already up to date.",
                 "",
             ]
             .join("\n"),
@@ -1076,11 +1096,17 @@ record() {
 }
 
 is_installed() {
-    [ "$scenario" != 'missing-update' ] && [ "$scenario" != 'absent-uninstall' ]
+    case "$scenario" in
+        install | missing-update | absent-uninstall) return 1 ;;
+        *) return 0 ;;
+    esac
 }
 
 installed_version() {
-    echo '9.8.7'
+    case "$scenario" in
+        same-version-install | same-version-update) echo '9.8.7' ;;
+        *) echo '9.8.6' ;;
+    esac
 }
 
 release_target() {
@@ -1142,8 +1168,8 @@ run_uninstaller() {
 }
 
 case "$scenario" in
-    install | stop-failure) install_release install ;;
-    same-version-update | missing-update) install_release update ;;
+    install | same-version-install | stop-failure) install_release install ;;
+    older-version-update | same-version-update | missing-update) install_release update ;;
     uninstall | absent-uninstall) uninstall_ratash ;;
     *) exit 64 ;;
 esac

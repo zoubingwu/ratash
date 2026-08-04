@@ -160,7 +160,10 @@ run_uninstaller() {
 
 install_release() {
     requested_action=$1
-    if [ "$requested_action" = 'update' ] && ! is_installed; then
+    current_version=''
+    if is_installed; then
+        current_version=$(installed_version)
+    elif [ "$requested_action" = 'update' ]; then
         fail 'Ratash is not installed. Run the install command first.'
     fi
 
@@ -169,6 +172,10 @@ install_release() {
     progress 'Checking for the latest release...'
     tag=$(latest_release "$temporary_directory/latest.json")
     version=${tag#v}
+    if [ "$current_version" = "$version" ]; then
+        echo "Ratash $version is already up to date."
+        return
+    fi
 
     package_name="ratash-$version-$target.pkg"
     asset_url="$download_url/releases/$tag/$package_name"
