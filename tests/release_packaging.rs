@@ -871,7 +871,7 @@ fn readme_stays_user_facing_and_documents_the_installed_workflow() {
         "ratash help agent",
         "package-local-macos.sh",
         "local-unsigned",
-        "curl -fsSL https://raw.githubusercontent.com/zoubingwu/ratash/main/install.sh | sh",
+        "curl -fsSL https://github.com/zoubingwu/ratash/releases/latest/download/install.sh | sh",
         "sh -s -- update",
         "sh -s -- uninstall",
     ] {

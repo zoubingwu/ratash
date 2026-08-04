@@ -6,20 +6,20 @@ The executable is named `ratash`. The first release supports Apple Silicon and I
 
 ## Project Status
 
-Ratash is in pre-release development for macOS. Tagged releases pass the full contract, resource, packaging, signing, and notarization gates before publication.
+Ratash 0.1.1 is the first public macOS release. Tagged releases pass the full contract, resource, packaging, and checksum gates before publication.
 
 ## Installation
 
-Install the latest signed release for the current Mac architecture:
+Install the latest release for the current Mac architecture:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/zoubingwu/ratash/main/install.sh | sh
+curl -fsSL https://github.com/zoubingwu/ratash/releases/latest/download/install.sh | sh
 ```
 
-The installer downloads the latest notarized package from GitHub Releases, verifies its SHA-256 checksum and Developer ID signature, requests `sudo`, and starts Ratash. Run the same lifecycle entry point to update an existing installation:
+The installer downloads the matching unsigned package from GitHub Releases, verifies its SHA-256 checksum, requests `sudo`, installs it with macOS installer trust approval, and starts Ratash. Run the same lifecycle entry point to update an existing installation:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/zoubingwu/ratash/main/install.sh | sh -s -- update
+curl -fsSL https://github.com/zoubingwu/ratash/releases/latest/download/install.sh | sh -s -- update
 ```
 
 ### Personal package
@@ -30,7 +30,7 @@ Build a complete package from a source checkout without an Apple Developer accou
 ./scripts/package-local-macos.sh --output dist
 ```
 
-The script builds Ratash with the `local-unsigned` trust policy, downloads and verifies the pinned Mihomo Core, adds an ad-hoc code identity, and creates a package, its SHA-256 file, and `install-ratash.sh`. The resulting package requires no signing credentials. macOS may show a developer warning; approve the package in **System Settings > Privacy & Security** when prompted.
+The script builds Ratash with the `local-unsigned` trust policy, downloads and verifies the pinned Mihomo Core, adds an ad-hoc code identity, and creates a package, its SHA-256 file, and `install-ratash.sh`. This is the same trust model used by the public 0.1.1 packages. macOS may show a developer warning; approve the package in **System Settings > Privacy & Security** when prompted.
 
 The personal trust policy requires `/usr/local` and `/usr/local/bin` to be root-owned and protected from group and other writes.
 
@@ -42,7 +42,7 @@ Copy `install-ratash.sh`, the matching `*-local-unsigned.pkg`, and its `.pkg.sha
 
 The installer verifies the package, stops an existing Ratash Supervisor before the Core service upgrade, and starts the replacement Supervisor after installation.
 
-### Manual signed release package
+### Manual release package
 
 Download the `.pkg` and matching `.pkg.sha256` file for your Mac from [GitHub Releases](../../releases/latest):
 
@@ -54,7 +54,7 @@ Verify and install the package from its download directory:
 ```sh
 PACKAGE='ratash-0.1.1-aarch64-apple-darwin.pkg'
 shasum -a 256 -c "$PACKAGE.sha256"
-sudo env RATASH_OWNER_UID="$(id -u)" /usr/sbin/installer -pkg "$PACKAGE" -target /
+sudo env RATASH_OWNER_UID="$(id -u)" /usr/sbin/installer -allowUntrusted -pkg "$PACKAGE" -target /
 ```
 
 The package installs the `ratash` command, the compatible Mihomo Core, the macOS service required for TUN operation, shell completions, the `ratash(1)` manual, and the Ratash AI Skill.
@@ -132,7 +132,7 @@ source /usr/local/share/bash-completion/completions/ratash
 Run the fixed lifecycle entry point:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/zoubingwu/ratash/main/install.sh | sh -s -- uninstall
+curl -fsSL https://github.com/zoubingwu/ratash/releases/latest/download/install.sh | sh -s -- uninstall
 ```
 
 The uninstaller stops Ratash, removes the application and system service, and preserves each user's saved Profiles and Local Rule Set under `~/Library/Application Support/ratash`.
