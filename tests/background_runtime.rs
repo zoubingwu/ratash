@@ -186,10 +186,22 @@ impl HarnessApplication {
     }
 
     fn wait_for_telemetry(&self) {
+        let generation = CoreInstanceGeneration(self.managed_generation.load(Ordering::Acquire));
         drop(wait_for(&self.observed, &self.changed, |observed| {
             !observed.traffic.is_empty()
                 && !observed.connections.is_empty()
                 && !observed.logs.is_empty()
+                && [
+                    TelemetryStream::Traffic,
+                    TelemetryStream::Connections,
+                    TelemetryStream::Logs,
+                ]
+                .into_iter()
+                .all(|stream| {
+                    observed
+                        .stream_states
+                        .contains(&(generation, stream, StreamState::Healthy))
+                })
         }));
     }
 
