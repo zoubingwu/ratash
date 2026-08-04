@@ -196,6 +196,8 @@ impl OwnedCoreState {
 struct OwnedEndpointIdentity {
     device: u64,
     inode: u64,
+    change_time_seconds: i64,
+    change_time_nanoseconds: i64,
 }
 
 struct ServiceState {
@@ -913,7 +915,7 @@ impl PrivilegedCoreRuntimeService {
             .dependencies
             .processes
             .grant_endpoint_access(&owner.endpoint, owner.owner_uid);
-        if record.endpoint_identity.is_none() {
+        if endpoint_access.is_ok() {
             record.endpoint_identity = capture_endpoint_identity(&owner.endpoint.socket_path);
         }
         if endpoint_access.is_err() {
@@ -1069,6 +1071,8 @@ fn capture_endpoint_identity(path: &Path) -> Option<OwnedEndpointIdentity> {
     Some(OwnedEndpointIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
+        change_time_seconds: metadata.ctime(),
+        change_time_nanoseconds: metadata.ctime_nsec(),
     })
 }
 
@@ -1092,6 +1096,8 @@ fn remove_matching_endpoint(
     if !metadata.file_type().is_socket()
         || metadata.dev() != expected.device
         || metadata.ino() != expected.inode
+        || metadata.ctime() != expected.change_time_seconds
+        || metadata.ctime_nsec() != expected.change_time_nanoseconds
     {
         return Ok(());
     }
