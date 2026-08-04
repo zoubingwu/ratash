@@ -1292,10 +1292,12 @@ fn unauthorized_peers_are_closed_before_application_dispatch() {
     let request = IpcRequest::new(RequestId(1), RequestOperation::GetStatus(EmptyPayload {}));
     write_frame(&mut stream, &request).expect("fixture request should write");
     let mut byte = [0_u8; 1];
-    assert_eq!(
-        stream.read(&mut byte).expect("rejected peer should close"),
-        0
-    );
+    match stream.read(&mut byte) {
+        Ok(0) => {}
+        Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+        Ok(_) => panic!("rejected peer should close without a response"),
+        Err(error) => panic!("rejected peer close failed: {error}"),
+    }
     assert_eq!(application.calls.load(Ordering::Relaxed), 0);
 
     server.shutdown().expect("server should stop cleanly");
