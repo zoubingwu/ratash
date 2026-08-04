@@ -19,7 +19,7 @@ fn version_flag_prints_the_package_version() {
         .expect("ratash --version should start");
 
     assert!(output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "ratash 0.1.2\n");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "ratash 0.1.3\n");
     assert!(output.stderr.is_empty());
 }
 
