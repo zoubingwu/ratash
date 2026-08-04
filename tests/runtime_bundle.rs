@@ -40,12 +40,12 @@ impl Drop for TestDirectory {
 fn stages_a_private_complete_and_idempotent_runtime_generation() {
     let directory = TestDirectory::new("complete");
     let effective = effective_configuration(&directory.path);
-    let binary = Path::new("/bin/sh");
-    let binary_sha256 = sha256(&fs::read(binary).expect("the fixture binary should be readable"));
+    let binary = fixture_binary();
+    let binary_sha256 = sha256(&fs::read(&binary).expect("the fixture binary should be readable"));
     let runtime_root = directory.path.join("runtime");
     let stager = RuntimeBundleStager::new(
         &runtime_root,
-        binary,
+        &binary,
         &binary_sha256,
         effective.compiler_policy_sha256(),
     )
@@ -102,11 +102,11 @@ fn stages_a_private_complete_and_idempotent_runtime_generation() {
 fn rejects_changed_existing_provider_content() {
     let directory = TestDirectory::new("tampered-provider");
     let effective = effective_configuration(&directory.path);
-    let binary = Path::new("/bin/sh");
-    let binary_sha256 = sha256(&fs::read(binary).expect("the fixture binary should be readable"));
+    let binary = fixture_binary();
+    let binary_sha256 = sha256(&fs::read(&binary).expect("the fixture binary should be readable"));
     let stager = RuntimeBundleStager::new(
         directory.path.join("runtime"),
-        binary,
+        &binary,
         binary_sha256,
         effective.compiler_policy_sha256(),
     )
@@ -132,9 +132,10 @@ fn rejects_changed_existing_provider_content() {
 fn rejects_binary_symlinks_and_identity_changes() {
     let directory = TestDirectory::new("binary-identity");
     let effective = effective_configuration(&directory.path);
+    let binary = fixture_binary();
     let binary_link = directory.path.join("mihomo-link");
-    symlink("/bin/sh", &binary_link).expect("the binary symlink should be created");
-    let real_binary = fs::read("/bin/sh").expect("the fixture binary should be readable");
+    symlink(&binary, &binary_link).expect("the binary symlink should be created");
+    let real_binary = fs::read(&binary).expect("the fixture binary should be readable");
     let runtime_root = directory.path.join("runtime");
     let symlink_stager = RuntimeBundleStager::new(
         &runtime_root,
@@ -153,7 +154,7 @@ fn rejects_binary_symlinks_and_identity_changes() {
 
     let mismatch_stager = RuntimeBundleStager::new(
         &runtime_root,
-        "/bin/sh",
+        &binary,
         sha256(b"different binary"),
         effective.compiler_policy_sha256(),
     )
@@ -171,10 +172,11 @@ fn rejects_binary_symlinks_and_identity_changes() {
 fn rejects_a_different_compiler_policy() {
     let directory = TestDirectory::new("compiler-policy");
     let effective = effective_configuration(&directory.path);
-    let binary = fs::read("/bin/sh").expect("the fixture binary should be readable");
+    let binary_path = fixture_binary();
+    let binary = fs::read(&binary_path).expect("the fixture binary should be readable");
     let stager = RuntimeBundleStager::new(
         directory.path.join("runtime"),
-        "/bin/sh",
+        binary_path,
         sha256(&binary),
         sha256(b"different compiler policy"),
     )
@@ -187,6 +189,10 @@ fn rejects_a_different_compiler_policy() {
             .kind(),
         RuntimeBundleStageErrorKind::CompilerPolicyMismatch
     );
+}
+
+fn fixture_binary() -> PathBuf {
+    std::env::current_exe().expect("the fixture executable path should resolve")
 }
 
 #[test]
