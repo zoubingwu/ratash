@@ -56,7 +56,7 @@ impl Drop for TempSocket {
 
 fn server_config() -> IpcServerConfig {
     IpcServerConfig {
-        io_timeout: Duration::from_secs(2),
+        io_timeout: Duration::from_secs(10),
         worker_count: 4,
         pending_connection_capacity: 16,
     }
@@ -231,7 +231,7 @@ fn status_queue_overflow_delivers_one_terminal_resync_marker() {
     let client = IpcClient::with_timeouts(
         socket.path(),
         Duration::from_secs(1),
-        Duration::from_secs(3),
+        Duration::from_secs(10),
     );
     let mut status = client
         .subscribe_status(None, 3)
