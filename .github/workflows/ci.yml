@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install the minimum Rust toolchain
         uses: dtolnay/rust-toolchain@1.88.0
       - name: Check all targets with the minimum Rust version
@@ -29,7 +29,7 @@ jobs:
     runs-on: macos-15
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install the minimum Rust toolchain
         uses: dtolnay/rust-toolchain@1.88.0
       - name: Check all macOS targets with the minimum Rust version
@@ -40,7 +40,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install the stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -67,7 +67,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install the stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -86,7 +86,7 @@ jobs:
     runs-on: macos-15
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install the stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Check deterministic release benchmark tooling
