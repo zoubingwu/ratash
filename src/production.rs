@@ -186,6 +186,7 @@ struct InstalledRatashPeerAuthorizer {
     identity: InstalledFileIdentity,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct InstalledFileIdentity {
     device: u64,
