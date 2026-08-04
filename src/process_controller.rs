@@ -1115,6 +1115,7 @@ fn check_macos_tun_control_socket() -> Result<(), ServicePlatformError> {
     .map_err(map_tun_socket_error)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn map_tun_socket_error(error: io::Error) -> ServicePlatformError {
     let kind = match error.raw_os_error() {
         Some(nix::libc::EAFNOSUPPORT | nix::libc::EPROTONOSUPPORT | nix::libc::ENOPROTOOPT) => {

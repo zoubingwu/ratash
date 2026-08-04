@@ -81,6 +81,7 @@ impl LifecycleGuard {
             .env("RATASH_STATE_DIR", &self.state_root)
             .env("RATASH_CORE_SERVICE_SOCKET", &self.service_socket)
             .env("RATASH_MIHOMO_PATH", &self.mihomo)
+            .env("RATASH_BENCHMARK_FIXTURE", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

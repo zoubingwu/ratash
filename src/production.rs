@@ -111,11 +111,14 @@ pub const CORE_SERVICE_SOCKET_PATH: &str = "/var/run/ratash/core-service.sock";
 pub const BUNDLED_MIHOMO_PATH: &str = "/Library/Application Support/ratash/bin/mihomo";
 pub const BUNDLED_GEODATA_PATH: &str = "/Library/Application Support/ratash/share/geodata";
 
+#[cfg(target_os = "macos")]
 const INSTALLED_RATASH_PATH: &str = "/usr/local/bin/ratash";
 pub const RATASH_CODE_IDENTIFIER: &str = "ratash";
 
 #[cfg(debug_assertions)]
 const DEBUG_CORE_SERVICE_SOCKET_ENV: &str = "RATASH_CORE_SERVICE_SOCKET";
+#[cfg(debug_assertions)]
+const DEBUG_BENCHMARK_FIXTURE_ENV: &str = "RATASH_BENCHMARK_FIXTURE";
 
 const OBSERVER_LOG_BATCH: usize = 256;
 
@@ -177,7 +180,9 @@ impl CoreServiceInvocation {
 
 #[derive(Clone, Debug)]
 struct InstalledRatashPeerAuthorizer {
+    #[cfg(target_os = "macos")]
     executable: PathBuf,
+    #[cfg(target_os = "macos")]
     identity: InstalledFileIdentity,
 }
 
@@ -619,20 +624,32 @@ fn run_owned_supervisor(
         session.endpoint.secret().to_owned(),
     );
 
-    let validator: Arc<dyn CoreConfigValidator + Send + Sync> = Arc::new(
-        MihomoCommandValidator::bundled(
-            &mihomo_binary,
-            &mihomo_binary_sha256,
-            BUNDLED_GEODATA_PATH,
-        )
-        .map_err(|_| {
-            StartupError::new(
-                StartupStage::SupervisorInitialization,
-                StartupFailureCategory::Configuration,
-                "The Mihomo validation policy is invalid",
+    let validator = {
+        #[cfg(debug_assertions)]
+        if std::env::var(DEBUG_BENCHMARK_FIXTURE_ENV).as_deref() == Ok("1") {
+            MihomoCommandValidator::new(
+                &mihomo_binary,
+                &mihomo_binary_sha256,
+                crate::constants::MIHOMO_VALIDATION_TIMEOUT,
             )
-        })?,
-    );
+        } else {
+            MihomoCommandValidator::bundled(
+                &mihomo_binary,
+                &mihomo_binary_sha256,
+                BUNDLED_GEODATA_PATH,
+            )
+        }
+        #[cfg(not(debug_assertions))]
+        MihomoCommandValidator::bundled(&mihomo_binary, &mihomo_binary_sha256, BUNDLED_GEODATA_PATH)
+    }
+    .map_err(|_| {
+        StartupError::new(
+            StartupStage::SupervisorInitialization,
+            StartupFailureCategory::Configuration,
+            "The Mihomo validation policy is invalid",
+        )
+    })?;
+    let validator: Arc<dyn CoreConfigValidator + Send + Sync> = Arc::new(validator);
     let bundle_root = paths.runtime.join("generations");
     let stager = Arc::new(
         RuntimeBundleStager::new(

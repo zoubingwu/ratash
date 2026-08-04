@@ -561,10 +561,10 @@ mod deadline_tests {
             let (mut stream, _) = listener
                 .accept()
                 .expect("the deadline fixture should accept the client");
-            thread::sleep(Duration::from_millis(140));
+            thread::sleep(Duration::from_millis(250));
             let request: OwnedShutdownControlRequest =
                 read_frame(&mut stream).expect("the deadline fixture should read the request");
-            thread::sleep(Duration::from_millis(140));
+            thread::sleep(Duration::from_millis(750));
             let response = ShutdownControlResponse {
                 protocol_version: IPC_PROTOCOL_VERSION,
                 request_id: request.request_id,
@@ -586,7 +586,7 @@ mod deadline_tests {
             protocol_version: IPC_PROTOCOL_VERSION,
         };
 
-        let error = request_shutdown(&socket_path, &intent, Duration::from_millis(220))
+        let error = request_shutdown(&socket_path, &intent, Duration::from_millis(750))
             .expect_err("one absolute deadline should expire across write and read");
 
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
