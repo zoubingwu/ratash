@@ -494,7 +494,6 @@ impl RuntimeBundleStager {
                 RuntimeBundleStageErrorKind::ConfigurationTooLarge,
             ));
         }
-        let binary = read_verified_binary(&self.binary, &self.binary_sha256)?;
         let providers = provider_staging_plan(configuration)?;
         let configuration_sha256 = crate::digest::sha256_hex(configuration_bytes);
         let manifest = RuntimeManifestV1::new(
@@ -516,11 +515,12 @@ impl RuntimeBundleStager {
         let final_root = self.root.join(format!("generation-{:020}", generation.0));
 
         if final_root.exists() {
+            verify_binary(&self.binary, &self.binary_sha256)?;
             verify_existing(
                 &final_root,
                 &manifest_bytes,
                 configuration_bytes,
-                &binary,
+                &self.binary_sha256,
                 &providers,
             )?;
             return Ok(self.bundle(generation, final_root, manifest_sha256));
@@ -535,7 +535,6 @@ impl RuntimeBundleStager {
         let stage_result = self.stage_pending(
             &pending_root,
             configuration_bytes,
-            &binary,
             &manifest_bytes,
             &providers,
         );
@@ -557,7 +556,7 @@ impl RuntimeBundleStager {
                     &final_root,
                     &manifest_bytes,
                     configuration_bytes,
-                    &binary,
+                    &self.binary_sha256,
                     &providers,
                 )?;
             }
@@ -574,14 +573,13 @@ impl RuntimeBundleStager {
         &self,
         pending_root: &Path,
         configuration_bytes: &[u8],
-        binary: &[u8],
         manifest: &[u8],
         providers: &ProviderStagingPlan,
     ) -> Result<(), RuntimeBundleStageError> {
-        write_new(
+        copy_verified_binary(
+            &self.binary,
             &pending_root.join(RUNTIME_CORE_EXECUTABLE_NAME),
-            binary,
-            0o500,
+            &self.binary_sha256,
         )?;
         write_new(
             &pending_root.join("config.yaml"),
@@ -705,10 +703,19 @@ fn prepare_private_root(root: &Path) -> Result<(), RuntimeBundleStageError> {
         .map_err(RuntimeBundleStageError::io)
 }
 
-fn read_verified_binary(
-    path: &Path,
-    expected_sha256: &str,
-) -> Result<Vec<u8>, RuntimeBundleStageError> {
+fn verify_binary(path: &Path, expected_sha256: &str) -> Result<(), RuntimeBundleStageError> {
+    let file = open_binary(path)?;
+    let digest = crate::digest::sha256_reader_hex_bounded(file, MIHOMO_BINARY_MAX_BYTES)
+        .map_err(|_| RuntimeBundleStageError::new(RuntimeBundleStageErrorKind::InvalidBinary))?;
+    if digest != expected_sha256 {
+        return Err(RuntimeBundleStageError::new(
+            RuntimeBundleStageErrorKind::BinaryIdentityMismatch,
+        ));
+    }
+    Ok(())
+}
+
+fn open_binary(path: &Path) -> Result<File, RuntimeBundleStageError> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|_| RuntimeBundleStageError::new(RuntimeBundleStageErrorKind::InvalidBinary))?;
     if metadata.file_type().is_symlink()
@@ -720,14 +727,51 @@ fn read_verified_binary(
             RuntimeBundleStageErrorKind::InvalidBinary,
         ));
     }
-    let content = read_limited(path, MIHOMO_BINARY_MAX_BYTES)
+    let file = File::open(path)
         .map_err(|_| RuntimeBundleStageError::new(RuntimeBundleStageErrorKind::InvalidBinary))?;
-    if crate::digest::sha256_hex(&content) != expected_sha256 {
+    let opened = file
+        .metadata()
+        .map_err(|_| RuntimeBundleStageError::new(RuntimeBundleStageErrorKind::InvalidBinary))?;
+    if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+        return Err(RuntimeBundleStageError::new(
+            RuntimeBundleStageErrorKind::InvalidBinary,
+        ));
+    }
+    Ok(file)
+}
+
+fn copy_verified_binary(
+    source: &Path,
+    destination: &Path,
+    expected_sha256: &str,
+) -> Result<(), RuntimeBundleStageError> {
+    let source = open_binary(source)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true).mode(0o500);
+    let mut destination_file = options
+        .open(destination)
+        .map_err(RuntimeBundleStageError::io)?;
+    let digest = crate::digest::copy_and_sha256_hex_bounded(
+        source,
+        &mut destination_file,
+        MIHOMO_BINARY_MAX_BYTES,
+    )
+    .map_err(|error| {
+        if error.kind() == io::ErrorKind::InvalidData {
+            RuntimeBundleStageError::new(RuntimeBundleStageErrorKind::InvalidBinary)
+        } else {
+            RuntimeBundleStageError::io(error)
+        }
+    })?;
+    if digest != expected_sha256 {
         return Err(RuntimeBundleStageError::new(
             RuntimeBundleStageErrorKind::BinaryIdentityMismatch,
         ));
     }
-    Ok(content)
+    destination_file
+        .sync_all()
+        .map_err(RuntimeBundleStageError::io)?;
+    Ok(())
 }
 
 fn read_local_provider(path: &Path) -> Result<Vec<u8>, RuntimeBundleStageError> {
@@ -768,7 +812,7 @@ fn verify_existing(
     root: &Path,
     manifest: &[u8],
     configuration: &[u8],
-    binary: &[u8],
+    binary_sha256: &str,
     providers: &ProviderStagingPlan,
 ) -> Result<(), RuntimeBundleStageError> {
     let metadata = fs::symlink_metadata(root).map_err(RuntimeBundleStageError::io)?;
@@ -777,27 +821,15 @@ fn verify_existing(
             RuntimeBundleStageErrorKind::ExistingGenerationMismatch,
         ));
     }
-    for (path, expected, limit, executable) in [
-        (
-            root.join("manifest.json"),
-            manifest,
-            MANIFEST_MAX_BYTES,
-            false,
-        ),
+    for (path, expected, limit) in [
+        (root.join("manifest.json"), manifest, MANIFEST_MAX_BYTES),
         (
             root.join("config.yaml"),
             configuration,
             EFFECTIVE_CONFIGURATION_MAX_BYTES,
-            false,
-        ),
-        (
-            root.join(RUNTIME_CORE_EXECUTABLE_NAME),
-            binary,
-            MIHOMO_BINARY_MAX_BYTES,
-            true,
         ),
     ] {
-        let actual = read_existing_file(&path, limit, executable).map_err(|_| {
+        let actual = read_existing_file(&path, limit).map_err(|_| {
             RuntimeBundleStageError::new(RuntimeBundleStageErrorKind::ExistingGenerationMismatch)
         })?;
         if actual != expected {
@@ -806,15 +838,16 @@ fn verify_existing(
             ));
         }
     }
+    verify_binary(&root.join(RUNTIME_CORE_EXECUTABLE_NAME), binary_sha256).map_err(|_| {
+        RuntimeBundleStageError::new(RuntimeBundleStageErrorKind::ExistingGenerationMismatch)
+    })?;
     for provider in &providers.local_files {
-        let actual = read_existing_file(
-            &root.join(&provider.path),
-            PROFILE_RESPONSE_MAX_BYTES,
-            false,
-        )
-        .map_err(|_| {
-            RuntimeBundleStageError::new(RuntimeBundleStageErrorKind::ExistingGenerationMismatch)
-        })?;
+        let actual = read_existing_file(&root.join(&provider.path), PROFILE_RESPONSE_MAX_BYTES)
+            .map_err(|_| {
+                RuntimeBundleStageError::new(
+                    RuntimeBundleStageErrorKind::ExistingGenerationMismatch,
+                )
+            })?;
         if actual != provider.content {
             return Err(RuntimeBundleStageError::new(
                 RuntimeBundleStageErrorKind::ExistingGenerationMismatch,
@@ -824,12 +857,9 @@ fn verify_existing(
     Ok(())
 }
 
-fn read_existing_file(path: &Path, limit: usize, executable: bool) -> io::Result<Vec<u8>> {
+fn read_existing_file(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || executable && metadata.permissions().mode() & 0o111 == 0
-    {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "staged file shape is invalid",

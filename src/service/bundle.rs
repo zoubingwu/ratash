@@ -164,11 +164,12 @@ pub(super) fn verify_runtime_bundle(
     }
 
     let executable_path = generation_root.join(RUNTIME_CORE_EXECUTABLE_NAME);
-    let binary =
-        read_bounded_executable(&generation_root, &executable_path, MIHOMO_BINARY_MAX_BYTES)?;
-    if crate::digest::sha256_hex(&binary) != bundle.mihomo_binary_sha256 {
-        return Err(invalid_bundle("Mihomo binary identity mismatch"));
-    }
+    verify_bounded_executable_digest(
+        &generation_root,
+        &executable_path,
+        MIHOMO_BINARY_MAX_BYTES,
+        &bundle.mihomo_binary_sha256,
+    )?;
     let configuration_path = generation_root.join("config.yaml");
     let configuration = read_bounded_regular(
         &generation_root,
@@ -261,16 +262,31 @@ fn read_bounded_regular(
     Ok(bytes)
 }
 
-fn read_bounded_executable(
+fn verify_bounded_executable_digest(
     root: &Path,
     path: &Path,
     max_bytes: usize,
-) -> Result<Vec<u8>, CoreRuntimeError> {
+    expected_sha256: &str,
+) -> Result<(), CoreRuntimeError> {
     let metadata =
         fs::symlink_metadata(path).map_err(|_| invalid_bundle("runtime file is unavailable"))?;
+    if !metadata.file_type().is_file() || metadata.len() > max_bytes as u64 {
+        return Err(invalid_bundle("runtime file shape or size is invalid"));
+    }
     #[cfg(unix)]
     if metadata.permissions().mode() & 0o111 == 0 {
         return Err(invalid_bundle("Mihomo binary is not executable"));
     }
-    read_bounded_regular(root, path, max_bytes)
+    let canonical = fs::canonicalize(path)
+        .map_err(|_| invalid_bundle("runtime file canonicalization failed"))?;
+    if !canonical.starts_with(root) {
+        return Err(invalid_bundle("runtime file escaped generation root"));
+    }
+    let file = fs::File::open(canonical).map_err(|_| invalid_bundle("runtime file read failed"))?;
+    let digest = crate::digest::sha256_reader_hex_bounded(file, max_bytes)
+        .map_err(|_| invalid_bundle("runtime file read failed"))?;
+    if digest != expected_sha256 {
+        return Err(invalid_bundle("Mihomo binary identity mismatch"));
+    }
+    Ok(())
 }

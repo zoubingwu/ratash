@@ -181,9 +181,11 @@ impl MihomoCommandValidator {
                 MihomoValidationErrorKind::InvalidBinary,
             ));
         }
-        let content = read_limited(&self.binary, MIHOMO_BINARY_MAX_BYTES)
+        let file = File::open(&self.binary)
             .map_err(|_| MihomoValidationError::new(MihomoValidationErrorKind::InvalidBinary))?;
-        if crate::digest::sha256_hex(&content) != self.expected_sha256 {
+        let digest = crate::digest::sha256_reader_hex_bounded(file, MIHOMO_BINARY_MAX_BYTES)
+            .map_err(|_| MihomoValidationError::new(MihomoValidationErrorKind::InvalidBinary))?;
+        if digest != self.expected_sha256 {
             return Err(MihomoValidationError::new(
                 MihomoValidationErrorKind::BinaryIdentityMismatch,
             ));

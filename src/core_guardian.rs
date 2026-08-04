@@ -509,12 +509,8 @@ fn verify_runtime_inputs(invocation: &CoreGuardianInvocation) -> io::Result<()> 
             "the guarded Core runtime changed while opening",
         ));
     }
-    let mut content = Vec::with_capacity(binary.len() as usize);
-    file.take((MIHOMO_BINARY_MAX_BYTES as u64).saturating_add(1))
-        .read_to_end(&mut content)?;
-    if content.len() > MIHOMO_BINARY_MAX_BYTES
-        || crate::digest::sha256_hex(&content) != invocation.mihomo_sha256
-    {
+    let digest = crate::digest::sha256_reader_hex_bounded(file, MIHOMO_BINARY_MAX_BYTES)?;
+    if digest != invocation.mihomo_sha256 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "the guarded Core executable identity is invalid",

@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -1652,16 +1652,7 @@ fn verified_binary_sha256(path: &Path) -> io::Result<String> {
             "the Mihomo executable changed while opening",
         ));
     }
-    let mut content = Vec::with_capacity(metadata.len() as usize);
-    file.take((MIHOMO_BINARY_MAX_BYTES as u64).saturating_add(1))
-        .read_to_end(&mut content)?;
-    if content.len() > MIHOMO_BINARY_MAX_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "the Mihomo executable is too large",
-        ));
-    }
-    Ok(crate::digest::sha256_hex(&content))
+    crate::digest::sha256_reader_hex_bounded(file, MIHOMO_BINARY_MAX_BYTES)
 }
 
 fn invalid_product_configuration(_error: impl fmt::Display) -> io::Error {
