@@ -20,6 +20,10 @@ fail() {
     exit 1
 }
 
+progress() {
+    echo "Ratash: $*"
+}
+
 cleanup() {
     if [ -n "$temporary_directory" ] && [ -d "$temporary_directory" ]; then
         /bin/rm -rf -- "$temporary_directory"
@@ -162,6 +166,7 @@ install_release() {
 
     target=$(release_target)
     temporary_directory=$(make_temporary_directory)
+    progress 'Checking for the latest release...'
     tag=$(latest_release "$temporary_directory/latest.json")
     version=${tag#v}
 
@@ -170,16 +175,22 @@ install_release() {
     package="$temporary_directory/$package_name"
     checksum="$package.sha256"
 
-    echo "Downloading Ratash $version for $target..."
+    progress "Downloading version $version for this Mac..."
     download "$asset_url" "$package"
     download "$asset_url.sha256" "$checksum"
+    progress 'Verifying the downloaded package...'
     verify_package "$package_name" "$temporary_directory"
+    progress 'Requesting administrator access...'
     acquire_privileges
-    stop_ratash
+    progress 'Preparing the current service...'
+    stop_ratash >/dev/null
+    progress "Installing version $version..."
     install_package "$package"
+    progress 'Verifying the installation...'
     verify_installation "$version"
-    start_ratash
-    echo "Ratash $version was installed and started."
+    progress 'Starting the service...'
+    start_ratash >/dev/null
+    echo "Ratash $version is installed and running."
 }
 
 uninstall_ratash() {
@@ -191,9 +202,13 @@ uninstall_ratash() {
         fail 'The installed Ratash uninstaller is unavailable. Reinstall Ratash, then uninstall it.'
     fi
 
+    progress 'Requesting administrator access...'
     acquire_privileges
-    stop_ratash
-    run_uninstaller
+    progress 'Stopping the service...'
+    stop_ratash >/dev/null
+    progress 'Removing the application...'
+    run_uninstaller >/dev/null
+    echo 'Ratash was removed. Your Profiles and rules were preserved.'
 }
 
 main() {

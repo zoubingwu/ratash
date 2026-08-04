@@ -579,6 +579,23 @@ fn public_installer_executes_lifecycle_branches_in_order() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(trace, expected_install, "{scenario}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            [
+                "Ratash: Checking for the latest release...",
+                "Ratash: Downloading version 9.8.7 for this Mac...",
+                "Ratash: Verifying the downloaded package...",
+                "Ratash: Requesting administrator access...",
+                "Ratash: Preparing the current service...",
+                "Ratash: Installing version 9.8.7...",
+                "Ratash: Verifying the installation...",
+                "Ratash: Starting the service...",
+                "Ratash 9.8.7 is installed and running.",
+                "",
+            ]
+            .join("\n"),
+            "{scenario}"
+        );
     }
 
     let (missing_update, trace) = run_public_installer_scenario("missing-update");
@@ -597,6 +614,17 @@ fn public_installer_executes_lifecycle_branches_in_order() {
     let (uninstall, trace) = run_public_installer_scenario("uninstall");
     assert!(uninstall.status.success());
     assert_eq!(trace, "sudo\nstop\nuninstall\n");
+    assert_eq!(
+        String::from_utf8_lossy(&uninstall.stdout),
+        [
+            "Ratash: Requesting administrator access...",
+            "Ratash: Stopping the service...",
+            "Ratash: Removing the application...",
+            "Ratash was removed. Your Profiles and rules were preserved.",
+            "",
+        ]
+        .join("\n")
+    );
 
     let (absent, trace) = run_public_installer_scenario("absent-uninstall");
     assert!(absent.status.success());
@@ -1084,6 +1112,7 @@ acquire_privileges() {
 
 stop_ratash() {
     record 'stop'
+    printf '{"data":{"status":"fixture stop lifecycle JSON"}}\n'
     [ "$scenario" != 'stop-failure' ] || return 42
 }
 
@@ -1097,6 +1126,7 @@ verify_installation() {
 
 start_ratash() {
     record 'start'
+    printf '{"data":{"status":"fixture start lifecycle JSON"}}\n'
 }
 
 has_installed_uninstaller() {
