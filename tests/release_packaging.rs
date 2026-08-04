@@ -407,12 +407,13 @@ fn public_installer_owns_install_update_and_uninstall_lifecycle() {
 
     assert_eq!(mode(&path), 0o755);
     for required in [
-        "zoubingwu/ratash",
+        "https://ratash.zoubingwu.com",
         "install|update",
         "uninstall)",
         "aarch64-apple-darwin",
         "x86_64-apple-darwin",
-        "\"$releases_url/latest\"",
+        "releases/latest.json",
+        "releases/$tag/$package_name",
         "--proto '=https'",
         "--proto-redir '=https'",
         "--tlsv1.2",
@@ -441,6 +442,96 @@ fn public_installer_owns_install_update_and_uninstall_lifecycle() {
     assert!(!installer.contains("/usr/sbin/pkgutil --check-signature"));
     assert!(!installer.contains("/usr/sbin/spctl --assess --type install"));
     assert!(!installer.contains("stop --json || true"));
+}
+
+#[test]
+fn cloudflare_r2_publisher_uploads_immutable_assets_before_latest_metadata() {
+    let path = project_path("scripts/publish-cloudflare-r2.sh");
+    let publisher = fs::read_to_string(&path).expect("R2 publisher should be readable");
+
+    assert_eq!(mode(&path), 0o755);
+    for required in [
+        "ratash-releases",
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "max-age=31536000, immutable",
+        "max-age=300",
+        "max-age=60",
+        "application/vnd.apple.installer+xml",
+        "application/json",
+        "--remote",
+    ] {
+        assert!(
+            publisher.contains(required),
+            "R2 publisher is missing {required}"
+        );
+    }
+
+    let package = publisher
+        .find("upload_release_asset \"$package\"")
+        .expect("R2 publisher should upload versioned packages");
+    let installer = publisher
+        .find("upload_public_file \"$distribution_directory/install.sh\"")
+        .expect("R2 publisher should upload the bootstrap installer");
+    let latest = publisher
+        .rfind("releases/latest.json")
+        .expect("R2 publisher should upload latest metadata");
+    assert!(package < installer && installer < latest);
+
+    let fixture = TempDirectory::new("r2-publisher");
+    let distribution = fixture.path.join("dist");
+    fs::create_dir(&distribution).expect("distribution directory should be created");
+    for target in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
+        let package = distribution.join(format!("ratash-9.8.7-{target}.pkg"));
+        fs::write(&package, format!("package:{target}")).expect("package should be written");
+        fs::write(
+            package.with_extension("pkg.sha256"),
+            format!("digest:{target}"),
+        )
+        .expect("checksum should be written");
+    }
+    fs::write(distribution.join("install.sh"), "#!/bin/sh\n").expect("installer should be written");
+
+    let trace = fixture.path.join("trace");
+    let wrangler = fixture.path.join("wrangler");
+    fs::write(
+        &wrangler,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >>"$TRACE_FILE"
+case "$4" in
+    */releases/latest.json) printf 'latest:%s\n' "$(cat "$7")" >>"$TRACE_FILE" ;;
+esac
+"#,
+    )
+    .expect("Wrangler fixture should be written");
+    set_mode(&wrangler, 0o755);
+
+    let output = Command::new(&path)
+        .args(["9.8.7", distribution.to_str().unwrap()])
+        .env("WRANGLER_BIN", &wrangler)
+        .env("TRACE_FILE", &trace)
+        .env("CLOUDFLARE_ACCOUNT_ID", "fixture-account")
+        .env("CLOUDFLARE_API_TOKEN", "fixture-token")
+        .output()
+        .expect("R2 publisher fixture should run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let calls = fs::read_to_string(trace).expect("Wrangler calls should be recorded");
+    let immutable = calls
+        .find("ratash-releases/releases/v9.8.7/ratash-9.8.7-aarch64-apple-darwin.pkg")
+        .expect("versioned package should be uploaded");
+    let bootstrap = calls
+        .find("ratash-releases/install.sh")
+        .expect("bootstrap installer should be uploaded");
+    let latest = calls
+        .find("ratash-releases/releases/latest.json")
+        .expect("latest metadata should be uploaded");
+    assert!(immutable < bootstrap && bootstrap < latest);
+    assert!(calls.contains("latest:{\"version\":\"9.8.7\"}"));
 }
 
 #[test]
@@ -721,6 +812,7 @@ fn package_scripts_are_valid_posix_shell() {
         "packaging/macos/install-local.sh",
         "packaging/macos/scripts/postinstall",
         "packaging/macos/uninstall.sh",
+        "scripts/publish-cloudflare-r2.sh",
     ] {
         let output = Command::new("sh")
             .args(["-n"])
@@ -890,7 +982,7 @@ fn readme_stays_user_facing_and_documents_the_installed_workflow() {
         "ratash status",
         "ratash proxy select",
         "ratash help agent",
-        "curl -fsSL https://github.com/zoubingwu/ratash/releases/latest/download/install.sh | sh",
+        "curl -fsSL https://ratash.zoubingwu.com/install.sh | sh",
         "sh -s -- update",
         "sh -s -- uninstall",
     ] {

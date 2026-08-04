@@ -7,7 +7,7 @@ Apple Silicon and Intel Macs are supported.
 ## Install
 
 ```sh
-curl -fsSL https://github.com/zoubingwu/ratash/releases/latest/download/install.sh | sh
+curl -fsSL https://ratash.zoubingwu.com/install.sh | sh
 ```
 
 The installer selects the package for your Mac, requests `sudo`, installs Ratash, and starts it.
@@ -49,13 +49,13 @@ ratash stop
 ## Update
 
 ```sh
-curl -fsSL https://github.com/zoubingwu/ratash/releases/latest/download/install.sh | sh -s -- update
+curl -fsSL https://ratash.zoubingwu.com/install.sh | sh -s -- update
 ```
 
 ## Uninstall
 
 ```sh
-curl -fsSL https://github.com/zoubingwu/ratash/releases/latest/download/install.sh | sh -s -- uninstall
+curl -fsSL https://ratash.zoubingwu.com/install.sh | sh -s -- uninstall
 ```
 
 Saved Profiles and Local Rules are preserved.

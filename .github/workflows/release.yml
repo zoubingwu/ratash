@@ -163,7 +163,7 @@ jobs:
             echo 'Install or update the current Mac architecture:'
             echo
             echo '```sh'
-            echo 'curl -fsSL https://github.com/zoubingwu/ratash/releases/latest/download/install.sh | sh'
+            echo 'curl -fsSL https://ratash.zoubingwu.com/install.sh | sh'
             echo '```'
           } >release-notes.md
       - name: Publish the corresponding GPL sources
@@ -203,3 +203,26 @@ jobs:
             dist/mihomo-v1.19.28-source.tar.gz.sha256
             dist/meta-rules-dat-*-source.tar.gz
             dist/meta-rules-dat-*-source.tar.gz.sha256
+
+  publish-cloudflare:
+    name: Publish Cloudflare R2 mirror
+    needs: publish
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+      - name: Download release bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ratash-*
+          path: dist
+          merge-multiple: true
+      - name: Attach the lifecycle installer
+        run: cp install.sh dist/install.sh
+      - name: Install Wrangler
+        run: npm install --global wrangler@4.118.0
+      - name: Publish the R2 mirror
+        env:
+          CLOUDFLARE_ACCOUNT_ID: 49f76aa38e951698872cb77926d235e2
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: ./scripts/publish-cloudflare-r2.sh "${GITHUB_REF_NAME#v}" dist

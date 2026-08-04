@@ -1,8 +1,7 @@
 #!/bin/sh
 set -eu
 
-repository='zoubingwu/ratash'
-releases_url="https://github.com/$repository/releases"
+download_url='https://ratash.zoubingwu.com'
 package_identifier='io.ratash'
 ratash_binary='/usr/local/bin/ratash'
 installed_uninstaller='/usr/local/share/ratash/uninstall.sh'
@@ -71,31 +70,16 @@ is_release_version() {
 }
 
 latest_release() {
-    effective_url=$(
-        /usr/bin/curl \
-            --fail \
-            --silent \
-            --show-error \
-            --location \
-            --proto '=https' \
-            --proto-redir '=https' \
-            --tlsv1.2 \
-            --retry 3 \
-            --output /dev/null \
-            --write-out '%{url_effective}' \
-            "$releases_url/latest"
+    manifest=$1
+    download "$download_url/releases/latest.json" "$manifest"
+    version=$(
+        /usr/bin/sed -n 's/^{"version":"\([0-9][0-9.]*\)"}$/\1/p' "$manifest"
     )
-    effective_url=${effective_url%/}
-    tag=${effective_url##*/}
-    case "$effective_url" in
-        "$releases_url/tag/$tag") ;;
-        *) fail 'GitHub returned an unexpected latest-release URL.' ;;
-    esac
-    version=${tag#v}
-    if [ "$tag" = "$version" ] || ! is_release_version "$version"; then
-        fail 'The latest Ratash release tag is invalid.'
+    if [ "$(/usr/bin/wc -l <"$manifest")" -ne 1 ] \
+        || ! is_release_version "$version"; then
+        fail 'The latest Ratash release metadata is invalid.'
     fi
-    echo "$tag"
+    echo "v$version"
 }
 
 require_macos_user() {
@@ -177,12 +161,12 @@ install_release() {
     fi
 
     target=$(release_target)
-    tag=$(latest_release)
+    temporary_directory=$(make_temporary_directory)
+    tag=$(latest_release "$temporary_directory/latest.json")
     version=${tag#v}
 
     package_name="ratash-$version-$target.pkg"
-    asset_url="$releases_url/download/$tag/$package_name"
-    temporary_directory=$(make_temporary_directory)
+    asset_url="$download_url/releases/$tag/$package_name"
     package="$temporary_directory/$package_name"
     checksum="$package.sha256"
 
