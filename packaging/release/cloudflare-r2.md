@@ -2,7 +2,7 @@
 
 Ratash publishes macOS installers to the `ratash-releases` R2 bucket after the GitHub Release succeeds. The public custom domain is `ratash.zoubingwu.com`; its `r2.dev` URL remains disabled.
 
-The release workflow stores immutable assets under `releases/vVERSION/`, uploads the bootstrap installer at `install.sh`, and updates `releases/latest.json` last. This ordering keeps the public latest pointer on a complete release.
+The release workflow stores immutable assets under `releases/vVERSION/`, uploads the bootstrap installer at `install.sh`, and updates `releases/latest.json` last. The publisher accepts an existing versioned object only when its content is identical and rejects conflicting content. This ordering keeps the public latest pointer on a complete release.
 
 ## Cloudflare resources
 

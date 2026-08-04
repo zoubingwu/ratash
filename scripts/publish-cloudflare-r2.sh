@@ -50,9 +50,27 @@ put_object() {
 upload_release_asset() {
     source=$1
     content_type=$2
+    key="releases/v$version/${source##*/}"
+    existing="$temporary_directory/existing"
+    get_error="$temporary_directory/get-error"
+
+    if "$wrangler_bin" r2 object get "$bucket/$key" \
+        --remote \
+        --file "$existing" 2>"$get_error"; then
+        if /usr/bin/cmp -s "$source" "$existing"; then
+            return
+        fi
+        echo "Refusing to replace immutable object $bucket/$key" >&2
+        exit 1
+    fi
+    if ! /usr/bin/grep -Fq 'The specified key does not exist.' "$get_error"; then
+        /bin/cat "$get_error" >&2
+        exit 1
+    fi
+
     put_object \
         "$source" \
-        "releases/v$version/${source##*/}" \
+        "$key" \
         "$content_type" \
         'public, max-age=31536000, immutable'
 }

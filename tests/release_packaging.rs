@@ -498,6 +498,12 @@ fn cloudflare_r2_publisher_uploads_immutable_assets_before_latest_metadata() {
         &wrangler,
         r#"#!/bin/sh
 printf '%s\n' "$*" >>"$TRACE_FILE"
+if [ "$3" = get ]; then
+    case "$4" in
+        *"${EXISTING_SUFFIX:-__never__}") printf '%s' "${EXISTING_CONTENT:-existing}" >"$7"; exit 0 ;;
+        *) echo 'The specified key does not exist.' >&2; exit 1 ;;
+    esac
+fi
 case "$4" in
     */releases/latest.json) printf 'latest:%s\n' "$(cat "$7")" >>"$TRACE_FILE" ;;
 esac
@@ -520,7 +526,7 @@ esac
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let calls = fs::read_to_string(trace).expect("Wrangler calls should be recorded");
+    let calls = fs::read_to_string(&trace).expect("Wrangler calls should be recorded");
     let immutable = calls
         .find("ratash-releases/releases/v9.8.7/ratash-9.8.7-aarch64-apple-darwin.pkg")
         .expect("versioned package should be uploaded");
@@ -532,6 +538,23 @@ esac
         .expect("latest metadata should be uploaded");
     assert!(immutable < bootstrap && bootstrap < latest);
     assert!(calls.contains("latest:{\"version\":\"9.8.7\"}"));
+
+    fs::write(&trace, "").expect("Wrangler trace should be reset");
+    let output = Command::new(&path)
+        .args(["9.8.7", distribution.to_str().unwrap()])
+        .env("WRANGLER_BIN", &wrangler)
+        .env("TRACE_FILE", &trace)
+        .env("EXISTING_SUFFIX", "ratash-9.8.7-aarch64-apple-darwin.pkg")
+        .env("CLOUDFLARE_ACCOUNT_ID", "fixture-account")
+        .env("CLOUDFLARE_API_TOKEN", "fixture-token")
+        .output()
+        .expect("R2 publisher conflict fixture should run");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Refusing to replace immutable object")
+    );
+    let calls = fs::read_to_string(trace).expect("Wrangler conflict calls should be recorded");
+    assert!(!calls.contains("r2 object put"));
 }
 
 #[test]
