@@ -31,14 +31,18 @@ fn personal_package_uses_the_local_unsigned_runtime_identity() {
 }
 
 #[test]
-fn release_workflow_keeps_the_developer_id_trust_policy() {
+fn release_workflow_uses_the_local_unsigned_runtime_identity() {
     let workflow = fs::read_to_string(project_path(".github/workflows/release.yml"))
         .expect("release workflow should be readable");
 
-    assert!(workflow.contains("MACOS_APPLICATION_IDENTITY"));
-    assert!(workflow.contains("MACOS_INSTALLER_IDENTITY"));
     assert!(workflow.contains("--no-default-features"));
-    assert!(!workflow.contains("--features local-unsigned"));
+    assert!(workflow.contains("--features local-unsigned"));
+    assert!(workflow.contains("--identifier 'ratash' --sign -"));
+    assert!(workflow.contains("--identifier 'mihomo' --sign -"));
+    assert!(!workflow.contains("MACOS_CERTIFICATE_P12"));
+    assert!(!workflow.contains("MACOS_APPLICATION_IDENTITY"));
+    assert!(!workflow.contains("MACOS_INSTALLER_IDENTITY"));
+    assert!(!workflow.contains("notarytool"));
 }
 
 #[test]

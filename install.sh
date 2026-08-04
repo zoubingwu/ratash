@@ -11,8 +11,8 @@ temporary_directory=''
 usage() {
     echo 'Usage: install.sh [install|update|uninstall]'
     echo
-    echo '  install     Install the latest signed release or update an existing installation.'
-    echo '  update      Update an existing installation to the latest signed release.'
+    echo '  install     Install the latest release or update an existing installation.'
+    echo '  update      Update an existing installation to the latest release.'
     echo '  uninstall   Remove Ratash while preserving user Profiles and rules.'
 }
 
@@ -117,15 +117,12 @@ make_temporary_directory() {
 }
 
 verify_package() {
-    package=$1
-    package_name=$2
-    package_directory=$3
+    package_name=$1
+    package_directory=$2
     (
         CDPATH= cd -- "$package_directory"
         /usr/bin/shasum -a 256 -c "$package_name.sha256"
     )
-    /usr/sbin/pkgutil --check-signature "$package" >/dev/null
-    /usr/sbin/spctl --assess --type install "$package"
 }
 
 acquire_privileges() {
@@ -143,6 +140,7 @@ install_package() {
     owner_uid=$(/usr/bin/id -u)
     /usr/bin/sudo /usr/bin/env RATASH_OWNER_UID="$owner_uid" \
         /usr/sbin/installer \
+        -allowUntrusted \
         -pkg "$package" \
         -target /
 }
@@ -191,7 +189,7 @@ install_release() {
     echo "Downloading Ratash $version for $target..."
     download "$asset_url" "$package"
     download "$asset_url.sha256" "$checksum"
-    verify_package "$package" "$package_name" "$temporary_directory"
+    verify_package "$package_name" "$temporary_directory"
     acquire_privileges
     stop_ratash
     install_package "$package"

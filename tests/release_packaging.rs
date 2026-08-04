@@ -411,10 +411,9 @@ fn public_installer_owns_install_update_and_uninstall_lifecycle() {
         "--tlsv1.2",
         "--retry 3",
         "/usr/bin/shasum -a 256 -c",
-        "/usr/sbin/pkgutil --check-signature",
-        "/usr/sbin/spctl --assess --type install",
         "/usr/local/bin/ratash stop --json",
         "/usr/sbin/installer",
+        "-allowUntrusted",
         "/usr/local/bin/ratash start --json",
         "RATASH_OWNER_UID",
         "/usr/local/share/ratash/uninstall.sh",
@@ -428,13 +427,12 @@ fn public_installer_owns_install_update_and_uninstall_lifecycle() {
     let checksum = installer
         .find("/usr/bin/shasum -a 256 -c")
         .expect("public installer should verify the package checksum");
-    let signature = installer
-        .find("/usr/sbin/pkgutil --check-signature")
-        .expect("public installer should verify the package signature");
-    let assessment = installer
-        .find("/usr/sbin/spctl --assess --type install")
-        .expect("public installer should assess the package signature");
-    assert!(checksum < signature && signature < assessment);
+    let stop = installer
+        .find("/usr/local/bin/ratash stop --json")
+        .expect("public installer should stop the current Supervisor");
+    assert!(checksum < stop);
+    assert!(!installer.contains("/usr/sbin/pkgutil --check-signature"));
+    assert!(!installer.contains("/usr/sbin/spctl --assess --type install"));
     assert!(!installer.contains("stop --json || true"));
 }
 
