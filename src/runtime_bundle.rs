@@ -8,6 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use crate::config::{EffectiveConfiguration, ProviderKind};
 use crate::constants::{
     EFFECTIVE_CONFIGURATION_MAX_BYTES, MIHOMO_BINARY_MAX_BYTES, PROFILE_RESPONSE_MAX_BYTES,
+    RUNTIME_CORE_EXECUTABLE_NAME,
 };
 use crate::core::RuntimeBundle;
 use crate::digest::is_lower_sha256_hex;
@@ -577,7 +578,11 @@ impl RuntimeBundleStager {
         manifest: &[u8],
         providers: &ProviderStagingPlan,
     ) -> Result<(), RuntimeBundleStageError> {
-        write_new(&pending_root.join("mihomo"), binary, 0o500)?;
+        write_new(
+            &pending_root.join(RUNTIME_CORE_EXECUTABLE_NAME),
+            binary,
+            0o500,
+        )?;
         write_new(
             &pending_root.join("config.yaml"),
             configuration_bytes,
@@ -746,7 +751,7 @@ fn validate_relative_path(path: &Path) -> Result<&Path, RuntimeBundleStageError>
         || path.is_absolute()
         || matches!(
             path.to_str(),
-            Some("manifest.json" | "config.yaml" | "mihomo")
+            Some("manifest.json" | "config.yaml" | RUNTIME_CORE_EXECUTABLE_NAME)
         )
         || path
             .components()
@@ -785,7 +790,12 @@ fn verify_existing(
             EFFECTIVE_CONFIGURATION_MAX_BYTES,
             false,
         ),
-        (root.join("mihomo"), binary, MIHOMO_BINARY_MAX_BYTES, true),
+        (
+            root.join(RUNTIME_CORE_EXECUTABLE_NAME),
+            binary,
+            MIHOMO_BINARY_MAX_BYTES,
+            true,
+        ),
     ] {
         let actual = read_existing_file(&path, limit, executable).map_err(|_| {
             RuntimeBundleStageError::new(RuntimeBundleStageErrorKind::ExistingGenerationMismatch)

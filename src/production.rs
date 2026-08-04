@@ -108,7 +108,7 @@ use foreground::expect_status;
 
 pub const INTERNAL_CORE_SERVICE_MODE: &str = "__core-service";
 pub const CORE_SERVICE_SOCKET_PATH: &str = "/var/run/ratash/core-service.sock";
-pub const BUNDLED_MIHOMO_PATH: &str = "/Library/Application Support/ratash/bin/mihomo";
+pub const BUNDLED_MIHOMO_PATH: &str = "/Library/Application Support/ratash/bin/ratash-mihomo";
 pub const BUNDLED_GEODATA_PATH: &str = "/Library/Application Support/ratash/share/geodata";
 
 #[cfg(target_os = "macos")]

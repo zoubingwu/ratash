@@ -2249,8 +2249,11 @@ fn runtime_bundle_checks_root_manifest_policy_binary_and_configuration_identity(
     assert_invalid_bundle(&harness.service, &session.proof, &bad_manifest);
 
     let changed_binary = harness.bundle(3);
-    fs::write(changed_binary.generation_root.join("mihomo"), b"changed")
-        .expect("the binary fixture should change");
+    fs::write(
+        changed_binary.generation_root.join("ratash-mihomo"),
+        b"changed",
+    )
+    .expect("the binary fixture should change");
     assert_invalid_bundle(&harness.service, &session.proof, &changed_binary);
 
     let changed_config = harness.bundle(4);
@@ -2320,7 +2323,7 @@ fn runtime_bundle_requires_an_executable_mihomo_binary() {
     let harness = Harness::new();
     let session = harness.open();
     let bundle = harness.bundle(1);
-    let executable = bundle.generation_root.join("mihomo");
+    let executable = bundle.generation_root.join("ratash-mihomo");
     let mut permissions = fs::metadata(&executable)
         .expect("the Mihomo fixture metadata should load")
         .permissions();
@@ -2880,7 +2883,7 @@ fn write_bundle(
     let configuration = format!("mode: rule\ngeneration: {}\n", generation.0);
     fs::write(root.join("config.yaml"), configuration.as_bytes())
         .expect("the fixture configuration should be written");
-    let executable = root.join("mihomo");
+    let executable = root.join("ratash-mihomo");
     fs::write(&executable, binary).expect("the fixture binary should be written");
     #[cfg(unix)]
     {

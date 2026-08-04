@@ -11,6 +11,7 @@ SERVICE_LABEL='io.ratash.core-runtime'
 
 /bin/rm -f -- \
     '/usr/local/bin/ratash' \
+    '/Library/PrivilegedHelperTools/ratash-core-runtime' \
     '/Library/PrivilegedHelperTools/io.ratash.core-runtime' \
     '/Library/LaunchDaemons/io.ratash.core-runtime.plist' \
     '/usr/local/share/bash-completion/completions/ratash' \

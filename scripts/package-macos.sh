@@ -202,8 +202,8 @@ package_scripts="$stage/scripts"
     "$package_scripts"
 
 /usr/bin/install -m 0755 "$ratash" "$payload/usr/local/bin/ratash"
-/usr/bin/install -m 0755 "$ratash" "$payload/Library/PrivilegedHelperTools/io.ratash.core-runtime"
-/usr/bin/install -m 0755 "$mihomo" "$payload/Library/Application Support/ratash/bin/mihomo"
+/usr/bin/install -m 0755 "$ratash" "$payload/Library/PrivilegedHelperTools/ratash-core-runtime"
+/usr/bin/install -m 0755 "$mihomo" "$payload/Library/Application Support/ratash/bin/ratash-mihomo"
 /usr/bin/install -m 0644 "$geodata_directory/ASN.mmdb" "$payload/Library/Application Support/ratash/share/geodata/ASN.mmdb"
 /usr/bin/install -m 0644 "$geodata_directory/Country.mmdb" "$payload/Library/Application Support/ratash/share/geodata/Country.mmdb"
 /usr/bin/install -m 0644 "$geodata_directory/GeoIP.dat" "$payload/Library/Application Support/ratash/share/geodata/GeoIP.dat"
@@ -230,11 +230,11 @@ done
 
 if [ -n "$application_identity" ]; then
     /usr/bin/codesign --force --options runtime --timestamp --identifier 'ratash' --sign "$application_identity" "$payload/usr/local/bin/ratash"
-    /usr/bin/codesign --force --options runtime --timestamp --sign "$application_identity" "$payload/Library/PrivilegedHelperTools/io.ratash.core-runtime"
-    /usr/bin/codesign --force --options runtime --timestamp --sign "$application_identity" "$payload/Library/Application Support/ratash/bin/mihomo"
+    /usr/bin/codesign --force --options runtime --timestamp --identifier 'io.ratash.core-runtime' --sign "$application_identity" "$payload/Library/PrivilegedHelperTools/ratash-core-runtime"
+    /usr/bin/codesign --force --options runtime --timestamp --identifier 'mihomo' --sign "$application_identity" "$payload/Library/Application Support/ratash/bin/ratash-mihomo"
     /usr/bin/codesign --verify --strict --verbose=2 "$payload/usr/local/bin/ratash"
-    /usr/bin/codesign --verify --strict --verbose=2 "$payload/Library/PrivilegedHelperTools/io.ratash.core-runtime"
-    /usr/bin/codesign --verify --strict --verbose=2 "$payload/Library/Application Support/ratash/bin/mihomo"
+    /usr/bin/codesign --verify --strict --verbose=2 "$payload/Library/PrivilegedHelperTools/ratash-core-runtime"
+    /usr/bin/codesign --verify --strict --verbose=2 "$payload/Library/Application Support/ratash/bin/ratash-mihomo"
 fi
 
 if [ -n "$stage_only" ]; then

@@ -948,10 +948,10 @@ fn bundle_ingress_upgrades_a_pre_geodata_generation_and_cleans_interrupted_stagi
         .open_owner_session(&harness.owner_request())
         .expect("the owner session should open");
     let bundle = harness.source_bundle(12);
-    let generation_root = write_legacy_service_generation(&harness.runtime_root, &bundle);
+    let generation_root = write_pre_geodata_service_generation(&harness.runtime_root, &bundle);
     let preserved = [
         "manifest.json",
-        "mihomo",
+        "ratash-mihomo",
         "config.yaml",
         "providers/local.yaml",
     ]
@@ -959,7 +959,7 @@ fn bundle_ingress_upgrades_a_pre_geodata_generation_and_cleans_interrupted_stagi
         (
             path,
             fs::read(generation_root.join(path))
-                .expect("the legacy Runtime Generation file should be readable"),
+                .expect("the pre-Geo-data Runtime Generation file should be readable"),
         )
     });
     let interrupted = generation_root.join(".ratash-geodata-Country.mmdb.pending");
@@ -971,7 +971,7 @@ fn bundle_ingress_upgrades_a_pre_geodata_generation_and_cleans_interrupted_stagi
     harness
         .client
         .apply_candidate(&session.proof, &bundle)
-        .expect("the legacy Runtime Generation should gain bundled Geo data");
+        .expect("the pre-Geo-data Runtime Generation should gain bundled Geo data");
 
     for (path, expected) in preserved {
         assert_eq!(
@@ -998,21 +998,21 @@ fn bundle_ingress_upgrades_a_pre_geodata_generation_and_cleans_interrupted_stagi
 }
 
 #[test]
-fn bundle_ingress_rejects_an_unsafe_legacy_generation_root() {
+fn bundle_ingress_rejects_an_unsafe_pre_geodata_generation_root() {
     let harness = Harness::with_installed_geo_data(|_| {});
     let session = harness
         .client
         .open_owner_session(&harness.owner_request())
         .expect("the owner session should open");
     let bundle = harness.source_bundle(12);
-    let generation_root = write_legacy_service_generation(&harness.runtime_root, &bundle);
+    let generation_root = write_pre_geodata_service_generation(&harness.runtime_root, &bundle);
     fs::set_permissions(&generation_root, fs::Permissions::from_mode(0o755))
-        .expect("the legacy Runtime Generation mode should be changed");
+        .expect("the pre-Geo-data Runtime Generation mode should be changed");
 
     let error = harness
         .client
         .apply_candidate(&session.proof, &bundle)
-        .expect_err("an unsafe legacy Runtime Generation root should be rejected");
+        .expect_err("an unsafe pre-Geo-data Runtime Generation root should be rejected");
 
     assert_eq!(error.kind, CoreRuntimeErrorKind::InvalidBundle);
     assert_eq!(harness.runtime.state().apply_count, 0);
@@ -1020,30 +1020,30 @@ fn bundle_ingress_rejects_an_unsafe_legacy_generation_root() {
 }
 
 #[test]
-fn bundle_ingress_rejects_an_unsafe_legacy_geodata_destination() {
+fn bundle_ingress_rejects_an_unsafe_pre_geodata_destination() {
     let harness = Harness::with_installed_geo_data(|_| {});
     let session = harness
         .client
         .open_owner_session(&harness.owner_request())
         .expect("the owner session should open");
     let bundle = harness.source_bundle(12);
-    let generation_root = write_legacy_service_generation(&harness.runtime_root, &bundle);
+    let generation_root = write_pre_geodata_service_generation(&harness.runtime_root, &bundle);
     let outside = harness.directory.path.join("outside-country.mmdb");
     fs::write(&outside, TEST_GEO_DATA[1].2)
         .expect("the outside Geo-data fixture should be written");
     symlink(&outside, generation_root.join("Country.mmdb"))
-        .expect("the unsafe legacy Geo-data symlink should be created");
+        .expect("the unsafe pre-Geo-data symlink should be created");
 
     let error = harness
         .client
         .apply_candidate(&session.proof, &bundle)
-        .expect_err("an unsafe legacy Geo-data destination should be rejected");
+        .expect_err("an unsafe pre-Geo-data destination should be rejected");
 
     assert_eq!(error.kind, CoreRuntimeErrorKind::InvalidBundle);
     assert_eq!(harness.runtime.state().apply_count, 0);
     assert!(
         fs::symlink_metadata(generation_root.join("Country.mmdb"))
-            .expect("the unsafe legacy Geo-data destination should remain present")
+            .expect("the unsafe pre-Geo-data destination should remain present")
             .file_type()
             .is_symlink()
     );
@@ -1541,9 +1541,12 @@ fn write_bundle(root: &Path, generation: RuntimeGeneration) -> RuntimeBundle {
     let configuration_sha256 = sha256(configuration);
     let provider_sha256 = sha256(provider);
     let policy_sha256 = sha256(b"fixture-compiler-policy");
-    fs::write(root.join("mihomo"), binary).expect("the fixture binary should be written");
-    fs::set_permissions(root.join("mihomo"), fs::Permissions::from_mode(0o500))
-        .expect("the fixture binary should be executable");
+    fs::write(root.join("ratash-mihomo"), binary).expect("the fixture binary should be written");
+    fs::set_permissions(
+        root.join("ratash-mihomo"),
+        fs::Permissions::from_mode(0o500),
+    )
+    .expect("the fixture binary should be executable");
     fs::write(root.join("config.yaml"), configuration)
         .expect("the fixture configuration should be written");
     fs::write(root.join("providers/local.yaml"), provider)
@@ -1554,7 +1557,7 @@ fn write_bundle(root: &Path, generation: RuntimeGeneration) -> RuntimeBundle {
         "compiler_policy_sha256": policy_sha256,
         "mihomo_binary_sha256": binary_sha256,
         "configuration_sha256": configuration_sha256,
-        "executable": "mihomo",
+        "executable": "ratash-mihomo",
         "configuration": "config.yaml",
         "provider_files": [{
             "path": "providers/local.yaml",
@@ -1580,20 +1583,20 @@ fn write_bundle(root: &Path, generation: RuntimeGeneration) -> RuntimeBundle {
     }
 }
 
-fn write_legacy_service_generation(runtime_root: &Path, bundle: &RuntimeBundle) -> PathBuf {
+fn write_pre_geodata_service_generation(runtime_root: &Path, bundle: &RuntimeBundle) -> PathBuf {
     let generation_root = runtime_root.join(format!("generation-{:020}", bundle.generation.0));
     fs::create_dir_all(generation_root.join("providers"))
-        .expect("the legacy Runtime Generation directories should be created");
+        .expect("the pre-Geo-data Runtime Generation directories should be created");
     fs::set_permissions(&generation_root, fs::Permissions::from_mode(0o700))
-        .expect("the legacy Runtime Generation mode should be private");
+        .expect("the pre-Geo-data Runtime Generation mode should be private");
     fs::set_permissions(
         generation_root.join("providers"),
         fs::Permissions::from_mode(0o700),
     )
-    .expect("the legacy provider directory mode should be private");
+    .expect("the pre-Geo-data provider directory mode should be private");
     for (path, mode) in [
         ("manifest.json", 0o400),
-        ("mihomo", 0o500),
+        ("ratash-mihomo", 0o500),
         ("config.yaml", 0o400),
         ("providers/local.yaml", 0o400),
     ] {
@@ -1601,9 +1604,9 @@ fn write_legacy_service_generation(runtime_root: &Path, bundle: &RuntimeBundle) 
             bundle.generation_root.join(path),
             generation_root.join(path),
         )
-        .expect("the legacy Runtime Generation file should be copied");
+        .expect("the pre-Geo-data Runtime Generation file should be copied");
         fs::set_permissions(generation_root.join(path), fs::Permissions::from_mode(mode))
-            .expect("the legacy Runtime Generation file mode should be private");
+            .expect("the pre-Geo-data Runtime Generation file mode should be private");
     }
     generation_root
 }

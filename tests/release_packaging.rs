@@ -101,8 +101,12 @@ fn release_contract_pins_both_macos_installers_and_core_artifacts() {
     assert_eq!(package["service_label"], "io.ratash.core-runtime");
     assert_eq!(package["mihomo_version"], product["mihomo_version"]);
     assert_eq!(
+        package["paths"]["service_executable"],
+        "/Library/PrivilegedHelperTools/ratash-core-runtime"
+    );
+    assert_eq!(
         package["paths"]["mihomo"],
-        "/Library/Application Support/ratash/bin/mihomo"
+        "/Library/Application Support/ratash/bin/ratash-mihomo"
     );
     assert_eq!(
         package["paths"]["service_socket"],
@@ -200,8 +204,8 @@ fn package_staging_contains_the_complete_installation_contract() {
 
     for executable in [
         "payload/usr/local/bin/ratash",
-        "payload/Library/PrivilegedHelperTools/io.ratash.core-runtime",
-        "payload/Library/Application Support/ratash/bin/mihomo",
+        "payload/Library/PrivilegedHelperTools/ratash-core-runtime",
+        "payload/Library/Application Support/ratash/bin/ratash-mihomo",
         "payload/usr/local/share/ratash/uninstall.sh",
     ] {
         let path = stage.join(executable);
@@ -259,7 +263,7 @@ fn package_staging_contains_the_complete_installation_contract() {
         "--runtime-root",
         "/Library/Application Support/ratash/runtime",
         "--mihomo",
-        "/Library/Application Support/ratash/bin/mihomo",
+        "/Library/Application Support/ratash/bin/ratash-mihomo",
         "<key>ExitTimeOut</key>",
         "<integer>50</integer>",
     ] {
@@ -349,11 +353,14 @@ fn postinstall_waits_for_a_booted_out_service_before_bootstrap() {
     let wait = script
         .find("while /bin/launchctl print")
         .expect("postinstall should wait for launchd to remove the previous service");
+    let legacy_cleanup = script
+        .find("/bin/rm -f -- \"$LEGACY_SERVICE_EXECUTABLE\" \"$LEGACY_MIHOMO_EXECUTABLE\"")
+        .expect("postinstall should remove legacy executable names");
     let bootstrap = script
         .find("/bin/launchctl bootstrap")
         .expect("postinstall should bootstrap the replacement service");
 
-    assert!(bootout < wait && wait < bootstrap);
+    assert!(bootout < wait && wait < legacy_cleanup && legacy_cleanup < bootstrap);
     assert!(script.contains("SERVICE_REMOVAL_ATTEMPTS=600"));
     assert!(script.contains("/bin/sleep 0.1"));
     assert!(script.contains("timed out waiting for the previous Core service to stop"));
@@ -854,6 +861,19 @@ fn package_builder_rejects_partial_signing_configuration_before_staging() {
         String::from_utf8_lossy(&output.stderr)
             .contains("Application and installer signing identities must be provided together.")
     );
+}
+
+#[test]
+fn signed_payload_preserves_stable_code_identifiers() {
+    let builder = fs::read_to_string(project_path("scripts/package-macos.sh"))
+        .expect("package builder should be readable");
+
+    assert!(builder.contains(
+        "--identifier 'io.ratash.core-runtime' --sign \"$application_identity\" \"$payload/Library/PrivilegedHelperTools/ratash-core-runtime\""
+    ));
+    assert!(builder.contains(
+        "--identifier 'mihomo' --sign \"$application_identity\" \"$payload/Library/Application Support/ratash/bin/ratash-mihomo\""
+    ));
 }
 
 #[test]

@@ -74,6 +74,7 @@ pub const JSON_OUTPUT_MAX_BYTES: usize = 128 * 1024 * 1024;
 pub const IPC_FRAME_MAX_BYTES: usize = JSON_OUTPUT_MAX_BYTES + 4 * 1024 * 1024;
 pub const IPC_REQUEST_FRAME_MAX_BYTES: usize = 256 * 1024;
 pub const IPC_LIST_PAGE_SIZE: usize = 128;
+pub const RUNTIME_CORE_EXECUTABLE_NAME: &str = "ratash-mihomo";
 
 pub const MINIMUM_TERMINAL_WIDTH: u16 = 80;
 pub const MINIMUM_TERMINAL_HEIGHT: u16 = 24;

@@ -5,11 +5,11 @@
   "mihomo_version": "v1.19.28",
   "paths": {
     "cli": "/usr/local/bin/ratash",
-    "service_executable": "/Library/PrivilegedHelperTools/io.ratash.core-runtime",
+    "service_executable": "/Library/PrivilegedHelperTools/ratash-core-runtime",
     "service_plist": "/Library/LaunchDaemons/io.ratash.core-runtime.plist",
     "service_socket": "/var/run/ratash/core-service.sock",
     "service_runtime_root": "/Library/Application Support/ratash/runtime",
-    "mihomo": "/Library/Application Support/ratash/bin/mihomo",
+    "mihomo": "/Library/Application Support/ratash/bin/ratash-mihomo",
     "geodata": "/Library/Application Support/ratash/share/geodata",
     "shared_assets": "/usr/local/share/ratash"
   },
@@ -34,7 +34,7 @@
       "--runtime-root",
       "/Library/Application Support/ratash/runtime",
       "--mihomo",
-      "/Library/Application Support/ratash/bin/mihomo"
+      "/Library/Application Support/ratash/bin/ratash-mihomo"
     ]
   },
   "targets": {

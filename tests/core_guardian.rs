@@ -32,7 +32,7 @@ impl TestRuntime {
             uuid::Uuid::new_v4().simple()
         ));
         fs::create_dir_all(&root).expect("the fixture runtime should be created");
-        let executable = root.join("mihomo");
+        let executable = root.join("ratash-mihomo");
         fs::write(&executable, script).expect("the fixture Core should be written");
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
             .expect("the fixture Core should be executable");

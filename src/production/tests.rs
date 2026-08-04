@@ -356,7 +356,7 @@ fn core_service_mode_requires_exact_absolute_arguments() {
         "--runtime-root",
         "/private/var/db/ratash/runtime",
         "--mihomo",
-        "/Library/Application Support/ratash/bin/mihomo",
+        "/Library/Application Support/ratash/bin/ratash-mihomo",
     ]))
     .expect("the fixture invocation should parse")
     .expect("the Core service mode should be detected");
@@ -388,7 +388,7 @@ fn internal_core_service_arguments_reject_relative_paths() {
         "--runtime-root",
         "/private/var/db/ratash/runtime",
         "--mihomo",
-        "/Library/Application Support/ratash/bin/mihomo",
+        "/Library/Application Support/ratash/bin/ratash-mihomo",
     ]))
     .expect_err("relative service paths must fail closed");
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);

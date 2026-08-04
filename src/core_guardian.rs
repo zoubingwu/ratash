@@ -20,7 +20,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 
-use crate::constants::MIHOMO_BINARY_MAX_BYTES;
+use crate::constants::{MIHOMO_BINARY_MAX_BYTES, RUNTIME_CORE_EXECUTABLE_NAME};
 use crate::digest::is_lower_sha256_hex;
 use crate::lifecycle::{ProcessInspector, PsProcessInspector};
 use crate::mihomo_command::enforce_managed_runtime;
@@ -239,7 +239,7 @@ impl CoreGuardianInvocation {
             || !self.working_directory.is_absolute()
             || !self.configuration.is_absolute()
             || !self.control_socket.is_absolute()
-            || self.mihomo != self.working_directory.join("mihomo")
+            || self.mihomo != self.working_directory.join(RUNTIME_CORE_EXECUTABLE_NAME)
             || self.configuration != self.working_directory.join("config.yaml")
             || !is_lower_sha256_hex(&self.mihomo_sha256)
         {
@@ -639,7 +639,7 @@ mod tests {
             "ratash",
             INTERNAL_CORE_GUARDIAN_MODE,
             "--mihomo",
-            "/private/tmp/g1/mihomo",
+            "/private/tmp/g1/ratash-mihomo",
             "--mihomo-sha256",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--working-directory",
@@ -668,7 +668,7 @@ mod tests {
             "ratash",
             INTERNAL_CORE_GUARDIAN_MODE,
             "--mihomo",
-            "/private/tmp/other/mihomo",
+            "/private/tmp/other/ratash-mihomo",
             "--mihomo-sha256",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--working-directory",
@@ -710,7 +710,7 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         fs::create_dir_all(&root).expect("the fixture root should be created");
-        let executable = root.join("mihomo");
+        let executable = root.join(RUNTIME_CORE_EXECUTABLE_NAME);
         let script = b"#!/bin/sh\nexec /bin/sleep 30\n";
         fs::write(&executable, script).expect("the fixture Core should be written");
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))

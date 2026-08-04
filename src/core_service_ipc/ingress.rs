@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 
 use crate::constants::{
     EFFECTIVE_CONFIGURATION_MAX_BYTES, MIHOMO_BINARY_MAX_BYTES, PROFILE_RESPONSE_MAX_BYTES,
+    RUNTIME_CORE_EXECUTABLE_NAME,
 };
 use crate::core::{CoreRuntimeError, CoreRuntimeErrorKind, RuntimeBundle};
 use crate::digest::is_lower_sha256_hex;
@@ -179,7 +180,7 @@ fn validate_ingress_manifest(
         || manifest.compiler_policy_sha256 != bundle.compiler_policy_sha256
         || manifest.mihomo_binary_sha256 != bundle.mihomo_binary_sha256
         || !is_lower_sha256_hex(&manifest.configuration_sha256)
-        || manifest.executable != "mihomo"
+        || manifest.executable != RUNTIME_CORE_EXECUTABLE_NAME
         || manifest.configuration != "config.yaml"
         || manifest.provider_files.len() > RUNTIME_PROVIDER_FILE_MAX
     {
@@ -211,8 +212,8 @@ fn stage_pending_bundle(
         source_root,
         owner_uid,
         BundleFileCopy {
-            relative_path: Path::new("mihomo"),
-            destination: &pending_root.join("mihomo"),
+            relative_path: Path::new(RUNTIME_CORE_EXECUTABLE_NAME),
+            destination: &pending_root.join(RUNTIME_CORE_EXECUTABLE_NAME),
             limit: MIHOMO_BINARY_MAX_BYTES,
             expected_size: None,
             expected_sha256: &manifest.mihomo_binary_sha256,

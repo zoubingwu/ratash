@@ -3,8 +3,11 @@ set -eu
 
 SERVICE_LABEL='io.ratash.core-runtime'
 SERVICE_PLIST='/Library/LaunchDaemons/io.ratash.core-runtime.plist'
-SERVICE_EXECUTABLE='/Library/PrivilegedHelperTools/io.ratash.core-runtime'
+SERVICE_EXECUTABLE='/Library/PrivilegedHelperTools/ratash-core-runtime'
 SERVICE_ROOT='/Library/Application Support/ratash'
+MIHOMO_EXECUTABLE="$SERVICE_ROOT/bin/ratash-mihomo"
+LEGACY_SERVICE_EXECUTABLE='/Library/PrivilegedHelperTools/io.ratash.core-runtime'
+LEGACY_MIHOMO_EXECUTABLE="$SERVICE_ROOT/bin/mihomo"
 GEODATA_ROOT="$SERVICE_ROOT/share/geodata"
 CLI_EXECUTABLE='/usr/local/bin/ratash'
 SERVICE_REMOVAL_ATTEMPTS=600
@@ -24,8 +27,8 @@ if [ "$owner_uid" -eq 0 ]; then
     exit 1
 fi
 
-/bin/chmod 0755 "$CLI_EXECUTABLE" "$SERVICE_EXECUTABLE" "$SERVICE_ROOT/bin/mihomo"
-/usr/sbin/chown root:wheel "$CLI_EXECUTABLE" "$SERVICE_EXECUTABLE" "$SERVICE_ROOT/bin/mihomo"
+/bin/chmod 0755 "$CLI_EXECUTABLE" "$SERVICE_EXECUTABLE" "$MIHOMO_EXECUTABLE"
+/usr/sbin/chown root:wheel "$CLI_EXECUTABLE" "$SERVICE_EXECUTABLE" "$MIHOMO_EXECUTABLE"
 /bin/chmod 0755 "$SERVICE_ROOT/share" "$GEODATA_ROOT"
 /usr/sbin/chown root:wheel "$SERVICE_ROOT/share" "$GEODATA_ROOT"
 /bin/chmod 0644 "$GEODATA_ROOT/ASN.mmdb" "$GEODATA_ROOT/Country.mmdb" "$GEODATA_ROOT/GeoIP.dat" "$GEODATA_ROOT/GeoSite.dat"
@@ -45,6 +48,7 @@ while /bin/launchctl print "system/$SERVICE_LABEL" >/dev/null 2>&1; do
     fi
     /bin/sleep 0.1
 done
+/bin/rm -f -- "$LEGACY_SERVICE_EXECUTABLE" "$LEGACY_MIHOMO_EXECUTABLE"
 /bin/launchctl bootstrap system "$SERVICE_PLIST"
 /bin/launchctl enable "system/$SERVICE_LABEL"
 /bin/launchctl kickstart -k "system/$SERVICE_LABEL"

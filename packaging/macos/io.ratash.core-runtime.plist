@@ -6,7 +6,7 @@
   <string>io.ratash.core-runtime</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Library/PrivilegedHelperTools/io.ratash.core-runtime</string>
+    <string>/Library/PrivilegedHelperTools/ratash-core-runtime</string>
     <string>__core-service</string>
     <string>--owner-uid</string>
     <string>@OWNER_UID@</string>
@@ -15,7 +15,7 @@
     <string>--runtime-root</string>
     <string>/Library/Application Support/ratash/runtime</string>
     <string>--mihomo</string>
-    <string>/Library/Application Support/ratash/bin/mihomo</string>
+    <string>/Library/Application Support/ratash/bin/ratash-mihomo</string>
   </array>
   <key>RunAtLoad</key>
   <true/>

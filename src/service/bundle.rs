@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::constants::{
     EFFECTIVE_CONFIGURATION_MAX_BYTES, MIHOMO_BINARY_MAX_BYTES, PROFILE_RESPONSE_MAX_BYTES,
+    RUNTIME_CORE_EXECUTABLE_NAME,
 };
 use crate::core::{CoreControlEndpoint, CoreRuntimeError, RuntimeBundle};
 use crate::digest::is_lower_sha256_hex;
@@ -56,7 +57,7 @@ impl RuntimeManifestV1 {
             compiler_policy_sha256: compiler_policy_sha256.into(),
             mihomo_binary_sha256: mihomo_binary_sha256.into(),
             configuration_sha256: configuration_sha256.into(),
-            executable: "mihomo".to_owned(),
+            executable: RUNTIME_CORE_EXECUTABLE_NAME.to_owned(),
             configuration: "config.yaml".to_owned(),
             provider_files: Vec::new(),
         }
@@ -156,13 +157,13 @@ pub(super) fn verify_runtime_bundle(
         || manifest.compiler_policy_sha256 != bundle.compiler_policy_sha256
         || manifest.mihomo_binary_sha256 != bundle.mihomo_binary_sha256
         || !is_lower_sha256_hex(&manifest.configuration_sha256)
-        || manifest.executable != "mihomo"
+        || manifest.executable != RUNTIME_CORE_EXECUTABLE_NAME
         || manifest.configuration != "config.yaml"
     {
         return Err(invalid_bundle("runtime manifest fields mismatch"));
     }
 
-    let executable_path = generation_root.join("mihomo");
+    let executable_path = generation_root.join(RUNTIME_CORE_EXECUTABLE_NAME);
     let binary =
         read_bounded_executable(&generation_root, &executable_path, MIHOMO_BINARY_MAX_BYTES)?;
     if crate::digest::sha256_hex(&binary) != bundle.mihomo_binary_sha256 {
@@ -229,7 +230,10 @@ fn valid_manifest_relative_path(value: &str) -> bool {
     let path = Path::new(value);
     !value.is_empty()
         && !path.is_absolute()
-        && !matches!(value, "manifest.json" | "config.yaml" | "mihomo")
+        && !matches!(
+            value,
+            "manifest.json" | "config.yaml" | RUNTIME_CORE_EXECUTABLE_NAME
+        )
         && path
             .components()
             .all(|component| matches!(component, Component::Normal(_)))

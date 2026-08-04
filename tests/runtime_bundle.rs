@@ -61,7 +61,7 @@ fn stages_a_private_complete_and_idempotent_runtime_generation() {
     assert_eq!(first, second);
     assert_eq!(mode(&runtime_root), 0o700);
     assert_eq!(mode(&first.generation_root), 0o700);
-    assert_eq!(mode(&first.generation_root.join("mihomo")), 0o500);
+    assert_eq!(mode(&first.generation_root.join("ratash-mihomo")), 0o500);
     assert_eq!(mode(&first.generation_root.join("config.yaml")), 0o400);
     assert_eq!(
         mode(&first.generation_root.join("providers/nested/local.yaml")),
@@ -77,6 +77,7 @@ fn stages_a_private_complete_and_idempotent_runtime_generation() {
     assert_eq!(first.manifest_sha256, sha256(&manifest_bytes));
     let manifest: RuntimeManifestV1 =
         serde_json::from_slice(&manifest_bytes).expect("the manifest should decode");
+    assert_eq!(manifest.executable, "ratash-mihomo");
     assert_eq!(manifest.provider_files.len(), 1);
     assert_eq!(
         manifest.provider_files[0].path,

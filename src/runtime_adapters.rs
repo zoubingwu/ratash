@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config::BUNDLED_CORE_VERSION;
+use crate::constants::RUNTIME_CORE_EXECUTABLE_NAME;
 use crate::core::{
     CoreRuntimeError, CoreRuntimeErrorKind, ManagedCoreHandle, MihomoAdapter, MihomoReadiness,
     RuntimeBundle,
@@ -117,7 +118,7 @@ impl StagedRuntimeBundleResolver {
             || decoded.compiler_policy_sha256 != self.compiler_policy_sha256
             || decoded.mihomo_binary_sha256 != self.mihomo_binary_sha256
             || decoded.configuration != "config.yaml"
-            || decoded.executable != "mihomo"
+            || decoded.executable != RUNTIME_CORE_EXECUTABLE_NAME
             || decoded.provider_files.len() > RUNTIME_PROVIDER_FILE_MAX
         {
             return Err(RuntimeBundleResolveError);
