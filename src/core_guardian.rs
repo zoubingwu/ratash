@@ -614,6 +614,12 @@ fn invalid_handshake() -> io::Error {
 mod tests {
     use super::*;
 
+    const TEST_TMP: &str = if cfg!(target_os = "macos") {
+        "/private/tmp"
+    } else {
+        "/tmp"
+    };
+
     struct FixtureChild(Child);
 
     impl Drop for FixtureChild {
@@ -698,7 +704,7 @@ mod tests {
 
     #[test]
     fn handshake_write_failure_reaps_the_exact_core_and_preserves_unrelated_processes() {
-        let root = PathBuf::from("/private/tmp").join(format!(
+        let root = PathBuf::from(TEST_TMP).join(format!(
             "ratash-guardian-write-failure-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()

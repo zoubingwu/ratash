@@ -763,9 +763,15 @@ mod accept_loop_tests {
     use super::*;
     use crate::service::CORE_RUNTIME_PROTOCOL_VERSION;
 
+    const TEST_TMP: &str = if cfg!(target_os = "macos") {
+        "/private/tmp"
+    } else {
+        "/tmp"
+    };
+
     #[test]
     fn client_timeout_is_shared_across_request_write_and_response_read() {
-        let root = Path::new("/private/tmp").join(format!(
+        let root = Path::new(TEST_TMP).join(format!(
             "hcs-deadline-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
@@ -825,7 +831,7 @@ mod accept_loop_tests {
 
     #[test]
     fn idle_poll_blocks_without_periodic_wakes_and_shutdown_bypasses_the_worker_queue() {
-        let root = Path::new("/private/tmp").join(format!(
+        let root = Path::new(TEST_TMP).join(format!(
             "hcs-accept-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
@@ -871,7 +877,7 @@ mod accept_loop_tests {
 
     #[test]
     fn private_waker_stops_accept_after_path_replacement_and_preserves_the_replacement() {
-        let root = Path::new("/private/tmp").join(format!(
+        let root = Path::new(TEST_TMP).join(format!(
             "hcs-wake-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()

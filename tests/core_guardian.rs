@@ -10,6 +10,12 @@ use ratash::core_guardian::{INTERNAL_CORE_GUARDIAN_MODE, read_handshake};
 use ratash::lifecycle::{ProcessInspector, PsProcessInspector};
 use sha2::{Digest, Sha256};
 
+const TEST_TMP: &str = if cfg!(target_os = "macos") {
+    "/private/tmp"
+} else {
+    "/tmp"
+};
+
 struct TestRuntime {
     root: PathBuf,
     executable: PathBuf,
@@ -20,7 +26,7 @@ struct TestRuntime {
 
 impl TestRuntime {
     fn new(label: &str, script: &[u8]) -> Self {
-        let root = Path::new("/private/tmp").join(format!(
+        let root = Path::new(TEST_TMP).join(format!(
             "ratash-guardian-{label}-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()

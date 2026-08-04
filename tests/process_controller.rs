@@ -30,11 +30,17 @@ use ratash::service::{
 };
 use sha2::{Digest, Sha256};
 
+const TEST_TMP: &str = if cfg!(target_os = "macos") {
+    "/private/tmp"
+} else {
+    "/tmp"
+};
+
 struct TestDirectory(PathBuf);
 
 impl TestDirectory {
     fn new(label: &str) -> Self {
-        let path = Path::new("/private/tmp").join(format!(
+        let path = Path::new(TEST_TMP).join(format!(
             "hpc-{label}-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()

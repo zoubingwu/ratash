@@ -546,9 +546,15 @@ mod deadline_tests {
     use super::*;
     use crate::lifecycle::ProcessIdentity;
 
+    const TEST_TMP: &str = if cfg!(target_os = "macos") {
+        "/private/tmp"
+    } else {
+        "/tmp"
+    };
+
     #[test]
     fn client_timeout_is_shared_across_request_write_and_response_read() {
-        let root = Path::new("/private/tmp").join(format!(
+        let root = Path::new(TEST_TMP).join(format!(
             "hsi-deadline-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()

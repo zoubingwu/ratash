@@ -26,6 +26,11 @@ use ratash::ipc::{bind_private_listener, read_frame, write_frame};
 use sha2::{Digest, Sha256};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+const TEST_TMP: &str = if cfg!(target_os = "macos") {
+    "/private/tmp"
+} else {
+    "/tmp"
+};
 
 struct RejectPeer {
     calls: Arc<AtomicUsize>,
@@ -50,7 +55,7 @@ struct TestDirectory {
 impl TestDirectory {
     fn new() -> Self {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-        let path = Path::new("/private/tmp").join(format!("hcs-{}-{sequence}", std::process::id()));
+        let path = Path::new(TEST_TMP).join(format!("hcs-{}-{sequence}", std::process::id()));
         fs::create_dir(&path).expect("the fixture root should be created");
         Self { path }
     }
