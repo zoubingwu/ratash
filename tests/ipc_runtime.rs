@@ -1748,6 +1748,14 @@ fn connection_closed_or_pending(stream: &mut UnixStream) -> io::Result<bool> {
         Err(error)
             if matches!(
                 error.kind(),
+                io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            Ok(true)
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
                 io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
             ) =>
         {
